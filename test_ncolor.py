@@ -2,7 +2,7 @@ import pytest
 import os
 from pathlib import Path
 import skimage.io
-import ncolor.ncolor as ncolor
+import ncolor
 
 
 def test_ncolor():

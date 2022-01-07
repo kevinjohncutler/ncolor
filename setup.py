@@ -2,7 +2,7 @@ import setuptools
 from setuptools import setup
 
 install_deps = ['numpy>=1.20.0', 'scipy', 'numba', 
-                'edt','fastremap','scikit-image']
+                'fastremap','scikit-image']
 
 with open("README.md", "r") as fh:
     long_description = fh.read()
@@ -23,9 +23,9 @@ setup(
     packages=setuptools.find_packages(),
     use_scm_version=True,
     install_requires = install_deps,
-    # tests_require=[
-    #   'pytest'
-    # ],
+    tests_require=[
+      'pytest'
+    ],
     include_package_data=True,
     classifiers=(
         "Programming Language :: Python :: 3",
