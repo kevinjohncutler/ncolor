@@ -5,14 +5,14 @@ from numba import njit
 import scipy 
 from .format_labels import format_labels
 
-def label(lab,n=4,conn=2):
+def label(lab,n=4,conn=2,max_depth=5, offset=0):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
     # puts it into the smallest datatype to save space 
     lab = format_labels(lab).astype(np.int32) 
     idx = connect(lab, conn)
     idx = mapidx(idx)
-    colors = render_net(idx, n=n, rand=10)
+    colors = render_net(idx, n=n, rand=10, max_depth=max_depth, offset=offset)
     lut = np.ones(lab.max()+1, dtype=np.uint8)
     for i in colors: lut[i] = colors[i]
     lut[0] = 0
@@ -67,11 +67,11 @@ def mapidx(idx):
     return dic
 
 # create a connection mapping 
-def render_net(conmap, n=4, rand=12, depth=0, max_depth=5):
+def render_net(conmap, n=4, rand=12, depth=0, max_depth=5, offset=0):
     thresh = 1e4
     if depth<max_depth:
         nodes = list(conmap.keys())
-        np.random.seed(depth+1)
+        np.random.seed(depth+1+offset)
         np.random.shuffle(nodes)
         colors = dict(zip(nodes, [0]*len(nodes)))
         counter = dict(zip(nodes, [0]*len(nodes)))
@@ -99,7 +99,7 @@ def render_net(conmap, n=4, rand=12, depth=0, max_depth=5):
                     nodes.append(p)
         if count==thresh:
             print(n,'-color algorthm failed,trying again with',n+1,'colors. Depth',depth)
-            colors = render_net(conmap,n+1,rand,depth+1,max_depth)
+            colors = render_net(conmap,n+1,rand,depth+1,max_depth, offset)
         return colors
     else:
         print('N-color algorthm exceeded max depth of',max_depth)
