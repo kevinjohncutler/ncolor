@@ -45,7 +45,8 @@ def format_labels(labels, clean=False, min_area=9):
                 labels[rg0.coords[:,0], rg0.coords[:,1]] = 0
                 print('Warning - found mask area less than', min_area)
                 print('Removing it.')
-        
-    fastremap.renumber(labels,in_place=True) # convenient to have unit increments from 1 to N cells
-    labels = fastremap.refit(labels) # put into smaller data type if possible 
+    
+    if np.any(labels):
+        fastremap.renumber(labels,in_place=True) # convenient to have unit increments from 1 to N cells
+        labels = fastremap.refit(labels) # put into smaller data type if possible 
     return labels
