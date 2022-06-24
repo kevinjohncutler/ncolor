@@ -5,10 +5,14 @@ from numba import njit
 import scipy 
 from .format_labels import format_labels
 
-def label(lab,n=4,conn=2,max_depth=5, offset=0):
+def label(lab, n=4, conn=2, max_depth=5, offset=0):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
     # puts it into the smallest datatype to save space 
+    lut = get_lut(lab,n,conn,max_depth,offset)
+    return lut[lab]
+
+def get_lut(lab, n=4, conn=2, max_depth=5, offset=0):
     lab = format_labels(lab).astype(np.int32) 
     idx = connect(lab, conn)
     idx = mapidx(idx)
@@ -16,8 +20,8 @@ def label(lab,n=4,conn=2,max_depth=5, offset=0):
     lut = np.ones(lab.max()+1, dtype=np.uint8)
     for i in colors: lut[i] = colors[i]
     lut[0] = 0
-    return lut[lab]
-
+    return lut
+    
 def neighbors(shape, conn=1):
     dim = len(shape)
     block = scipy.ndimage.generate_binary_structure(dim, conn)
