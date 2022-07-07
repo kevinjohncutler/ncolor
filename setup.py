@@ -1,8 +1,8 @@
 import setuptools
 from setuptools import setup
 
-install_deps = ['numpy>=1.20.0', 'scipy', 'numba', 
-                'fastremap','scikit-image']
+install_deps = ['numpy>=1.22.0', 'scipy', 'numba', 
+                'fastremap','scikit-image','mahotas==1.4.12']
 
 with open("README.md", "r") as fh:
     long_description = fh.read()
