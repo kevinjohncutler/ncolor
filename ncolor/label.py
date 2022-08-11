@@ -2,13 +2,16 @@
 
 import numpy as np
 from numba import njit
-import scipy 
-from .format_labels import format_labels
+import scipy
+from .format_labels import format_labels, is_sequential
 
 def label(lab, n=4, conn=2, max_depth=5, offset=0):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
     # puts it into the smallest datatype to save space 
+    if not is_sequential(lab):
+        lab = format_labels(lab)
+    
     lut = get_lut(lab,n,conn,max_depth,offset)
     return lut[lab]
 
