@@ -9,6 +9,9 @@ try:
     SKIMAGE_ENABLED = True 
 except:
     SKIMAGE_ENABLED = False
+    
+def is_sequential(labels):
+        return np.all(np.diff(fastremap.unique(labels))==1)
 
 def format_labels(labels, clean=False, min_area=9, despur=False, verbose=False, ignore=False):
     """
