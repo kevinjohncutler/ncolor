@@ -2,7 +2,8 @@ import setuptools
 from setuptools import setup
 
 install_deps = ['numpy>=1.22.4', 'scipy', 'numba', 
-                'fastremap','scikit-image','mahotas==1.4.12']
+                'fastremap','scikit-image',
+                'mahotas@git+https://github.com/luispedro/mahotas#egg=mahotas']
 
 with open("README.md", "r") as fh:
     long_description = fh.read()
