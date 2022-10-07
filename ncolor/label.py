@@ -4,16 +4,28 @@ import numpy as np
 from numba import njit
 import scipy
 from .format_labels import format_labels, is_sequential
+from skimage.segmentation import expand_labels as skimage_expand_labels
+import edt
+from scipy.ndimage import distance_transform_edt
 
-def label(lab, n=4, conn=2, max_depth=5, offset=0):
+
+def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=True):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
-    # puts it into the smallest datatype to save space 
-    if not is_sequential(lab):
-        lab = format_labels(lab)
-    
+    # puts it into the smallest datatype to save space
+
+    # if not is_sequential(lab):
+    #     lab = format_labels(lab)
+    pad = 1
+    unpad = tuple([slice(pad,-pad)]*lab.ndim)
+    mask = lab!=0
+    # print('ggggg',expand,lab.squeeze().ndim,lab.squeeze().shape)
+    if lab.squeeze().ndim==2 and expand:
+        lab = expand_labels(lab)
+    # lab = np.pad(format_labels(lab),pad)
+    lab = format_labels(np.pad(lab,pad),background=0)
     lut = get_lut(lab,n,conn,max_depth,offset)
-    return lut[lab]
+    return lut[lab][unpad]*mask
 
 def get_lut(lab, n=4, conn=2, max_depth=5, offset=0):
     lab = format_labels(lab).astype(np.int32) 
@@ -111,3 +123,13 @@ def render_net(conmap, n=4, rand=12, depth=0, max_depth=5, offset=0):
     else:
         print('N-color algorthm exceeded max depth of',max_depth)
         return None
+    
+def expand_labels(label_image):
+    """
+    Sped-up version of the scikit-image function just by dropping the distance thresholding. 
+    Here we expand the labels into every background pixel. Can be over 40% faster. 
+    """
+    nearest_label_coords = distance_transform_edt(label_image==0, 
+                                                  return_distances=False, 
+                                                  return_indices=True)
+    return  label_image[tuple(nearest_label_coords)]

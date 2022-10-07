@@ -13,7 +13,8 @@ except:
 def is_sequential(labels):
         return np.all(np.diff(fastremap.unique(labels))==1)
 
-def format_labels(labels, clean=False, min_area=9, despur=False, verbose=False, ignore=False):
+def format_labels(labels, clean=False, min_area=9, despur=False, 
+                  verbose=False, background=None, ignore=False):
     """
     Puts labels into 'standard form', i.e. background=0 and cells 1,2,3,...,N-1,N.
     Optional clean flag: disconnect and disjoint masks and discard small masks beflow min_area. 
@@ -25,8 +26,13 @@ def format_labels(labels, clean=False, min_area=9, despur=False, verbose=False, 
     # some people also use -1 as background, so we must cast to the signed integar class. We
     # can safely assume no 2D or 3D image will have more than 2^31 cells. Finally, cv2 does not
     # play well with unsigned integers (saves to default uint8), so we cast to uint32. 
+    
     labels = labels.astype('int32')
-    background = np.min(labels) 
+    if background is None:
+        background = np.min(labels)
+    else:
+        background = 0       
+        
     if not ignore:
         if verbose:
             print('minimum value is {}, shifting to 0'.format(background))
@@ -40,8 +46,10 @@ def format_labels(labels, clean=False, min_area=9, despur=False, verbose=False, 
         for j in inds[inds>background]:
             mask = labels==j
             if despur:
+                labels[mask] = 0 #clear old label
                 mask = delete_spurs(mask) #needs updating for ND 
-            
+                labels[mask] = j # put label bakc in
+                
             if SKIMAGE_ENABLED:
                 lbl = measure.label(mask)                       
                 regions = measure.regionprops(lbl)
@@ -79,7 +87,6 @@ def delete_spurs(mask):
     pad = 1
     #must fill single holes in image to avoid cusps causing issues. Will limit to holes of size ___
     skel = remove_small_holes(np.pad(mask,pad,mode='constant'),5)
-
     nbad = 1
     niter = 0
     while (nbad > 0):
