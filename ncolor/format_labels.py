@@ -11,7 +11,7 @@ except:
     SKIMAGE_ENABLED = False
     
 def is_sequential(labels):
-        return np.all(np.diff(fastremap.unique(labels))==1)
+    return np.all(np.diff(fastremap.unique(labels))==1)
 
 def format_labels(labels, clean=False, min_area=9, despur=False, 
                   verbose=False, background=None, ignore=False):
@@ -26,8 +26,8 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
     # some people also use -1 as background, so we must cast to the signed integar class. We
     # can safely assume no 2D or 3D image will have more than 2^31 cells. Finally, cv2 does not
     # play well with unsigned integers (saves to default uint8), so we cast to uint32. 
-    
-    labels = labels.astype('int32')
+    labels = labels.copy()
+    labels = labels.astype('int32') #uint vs int
     if background is None:
         background = np.min(labels)
     else:

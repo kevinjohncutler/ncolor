@@ -52,7 +52,7 @@ def search(img, nbs):
     s, line = 0, img.ravel()
     rst = np.zeros((len(line),2), img.dtype)
     for i in range(len(line)):
-        if line[i]==0:continue
+        if line[i]==0: continue
         for d in nbs:
             if line[i+d]==0: continue
             if line[i]==line[i+d]: continue
@@ -77,6 +77,7 @@ def connect(img, conn=1):
     idx = np.hstack(([0], idx))
     return rst[order][idx]
 
+# maybe replace this with fastremap
 def mapidx(idx):
     dic = {}
     for i in np.unique(idx): dic[i] = []
@@ -132,4 +133,4 @@ def expand_labels(label_image):
     nearest_label_coords = distance_transform_edt(label_image==0, 
                                                   return_distances=False, 
                                                   return_indices=True)
-    return  label_image[tuple(nearest_label_coords)]
+    return label_image[tuple(nearest_label_coords)]
