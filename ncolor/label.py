@@ -9,7 +9,7 @@ import edt
 from scipy.ndimage import distance_transform_edt
 
 
-def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=True):
+def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
     # puts it into the smallest datatype to save space
@@ -19,15 +19,23 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=True):
     pad = 1
     unpad = tuple([slice(pad,-pad)]*lab.ndim)
     mask = lab!=0
-    # print('ggggg',expand,lab.squeeze().ndim,lab.squeeze().shape)
-    if lab.squeeze().ndim==2 and expand:
+    
+    # by default, 2D images should be expanded, 3D should not
+    # this allows expand to override either with True or False
+    if expand or (lab.squeeze().ndim==2 and expand is None):
         lab = expand_labels(lab)
     # lab = np.pad(format_labels(lab),pad)
     lab = format_labels(np.pad(lab,pad),background=0)
-    lut = get_lut(lab,n,conn,max_depth,offset)
-    return lut[lab][unpad]*mask
+    lut = get_lut(lab,n,conn,max_depth,offset,return_n)
+    
+    nc = lut[lab][unpad]*mask
+    
+    if return_n: 
+        return nc, np.max(lut)
+    else:    
+        return nc
 
-def get_lut(lab, n=4, conn=2, max_depth=5, offset=0):
+def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, return_n=False):
     lab = format_labels(lab).astype(np.int32) 
     idx = connect(lab, conn)
     idx = mapidx(idx)
@@ -68,13 +76,13 @@ def connect(img, conn=1):
     if len(rst)<2:
         return rst
     rst.sort(axis=1)
-    key = (rst[:,0]<<16)
+    key = (rst[:,0]<<16) #zero out
     key += rst[:,1]
     order = np.argsort(key)
     key[:] = key[order]
     diff = key[:-1]!=key[1:]
     idx = np.where(diff)[0]+1
-    idx = np.hstack(([0], idx))
+    idx = np.hstack(([0], idx))  
     return rst[order][idx]
 
 # maybe replace this with fastremap
