@@ -8,10 +8,25 @@ Fast remapping of instance labels 1,2,3,...,M to a smaller set of repeating, dis
 ### Usage
 If you have an integer array called `masks`, you may transform it into an N-color representation as follows:
 
-```js
-import ncolor.ncolor as ncolor
+```python
+import ncolor 
 ncolor_masks = ncolor.label(masks)
 ```
-    
-The integer array `ncolor_masks` can then be visualized using any color map you prefer. The example in this README uses the viridis colormap. See `example.ipynb` for more details.
 
+If you need the number of unique labels returned:
+```python
+ncolor_masks, num_labels = ncolor.label(masks,return_n=True)
+
+```
+If you need to convert back to `0,...,N` object labels:
+```python
+labels = ncolor.format_labels(ncolor_masks,clean=True)
+
+```
+
+Note that `format_labels` with ```clean=True``` will also remove small labels (<9px) by default. This behavior can be changed with the `min_area` parameter. 
+
+    
+The integer array `ncolor_masks` can be visualized using any color map you prefer. The example in this README uses the viridis colormap. See `example.ipynb` for more details.
+
+Thanks to Ryan Peters ([@ryanirl](https://github.com/ryanirl)) for suggesting the `expand_labels` function. This is applied by default to 2D images (optionally for 3D images with `expand=True`, but this can give bad results since objects in 3D have a lot more wiggle room to make contact when expanded). This preprocessing step eliminates cases where close (but not touching) or dispersed objects previously received the same label. I dug a layer back to use `ndimage.distance_transform_edt` for a speed boost. If undesired for 2D images, use `expand=False`. 
