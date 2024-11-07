@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "setuptools_scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ncolor"
+dynamic = ["version", "description", "readme", "authors", "classifiers", "dependencies", "optional-dependencies", "license"]
+
+[project.scripts]
+# Add entry point if any; otherwise, leave empty
+# ncolor = "ncolor.__main__:main"
+
+[tool.setuptools_scm]
+write_to = "ncolor/_version.py"
