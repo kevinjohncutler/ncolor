@@ -3,37 +3,55 @@
 import numpy as np
 from numba import njit
 import scipy
-from .format_labels import format_labels, is_sequential
-# from skimage.segmentation import expand_labels as skimage_expand_labels
-import edt
+from .format_labels import format_labels
+import fastremap
+
+# import edt # does not yet support return_indices
 from scipy.ndimage import distance_transform_edt
 
 
-def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, greedy=False):
+def is_sequential(labels):
+    return np.all(np.diff(fastremap.unique(labels))==1)
+    
+def unique_nonzero(labels):
+    """
+    Get unique nonzero labels
+    """
+    # return np.sort(np.array(list(set(fastremap.unique(labels))-set((0,)))))
+    return fastremap.unique(labels[labels > 0])
+
+
+def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, greedy=False, verbose=False):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
     # puts it into the smallest datatype to save space
-
     # if not is_sequential(lab):
     #     lab = format_labels(lab)
     pad = 1
     unpad = tuple([slice(pad,-pad)]*lab.ndim)
     mask = lab!=0
+    unique = unique_nonzero(lab)
+    if verbose: print('number of masks', unique.size)
     
-    # by default, 2D images should be expanded, 3D should not
-    # this allows expand to override either with True or False
-    if expand or (lab.squeeze().ndim==2 and expand is None):
-        lab = expand_labels(lab)
-    # lab = np.pad(format_labels(lab),pad)
-    lab = format_labels(np.pad(lab,pad),background=0)
-    lut = get_lut(lab,n,conn,max_depth,offset,greedy)
-    
-    nc = lut[lab][unpad]*mask
+    if unique.size==1:
+        ncl = mask.astype(int)
+        nc = 1
+    else:
+        # by default, 2D images should be expanded, 3D should not
+        # this allows expand to override either with True or False
+        if expand or (lab.squeeze().ndim==2 and expand is None):
+            lab = expand_labels(lab)
+        # lab = np.pad(format_labels(lab),pad)
+        lab = format_labels(np.pad(lab,pad),background=0)
+        lut = get_lut(lab,n,conn,max_depth,offset,greedy)
+        
+        ncl = lut[lab][unpad]*mask
+        nc = np.max(lut)
     
     if return_n: 
-        return nc, np.max(lut)
+        return ncl, nc
     else:    
-        return nc
+        return ncl
 
 def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False):
     # lab = format_labels(lab).astype(np.int32)
@@ -79,7 +97,6 @@ def search(img, nbs):
 def connect(img, conn=1):
     buf = np.pad(img, 1, 'constant')
     nbs = neighbors(buf.shape, conn)
-    # rst = search(buf, nbs)
     rst = search(buf, nbs)
     if len(rst)<2:
         return rst
@@ -165,65 +182,20 @@ def render_net(conmap, n=4, rand=12, depth=0, max_depth=5, offset=0):
             colors = render_net(conmap,n+1,rand,depth+1,max_depth, offset)
         return colors
         
-import numpy as np
-from collections import deque
-# slightly faster
-def render_net(conmap, n=4, rand=12, depth=0, max_depth=5, offset=0):
-    LARGE_INT = len(conmap) * 2
-    thresh = LARGE_INT
-    if depth < max_depth:
-        nodes = deque(conmap.keys())
-        np.random.seed(depth + 1 + offset)
-        nodes = deque(np.random.permutation(list(nodes)))
-        colors = dict.fromkeys(nodes, 0)
-        counter = dict.fromkeys(nodes, 0)
-        count = 0
 
-        # Preallocate hist outside the loop
-        hist = [-1] + [0] * (n)
 
-        while nodes and count < thresh:
-            count += 1
-            k = nodes.popleft()
-            counter_k = counter[k] = counter[k] + 1
+# Example usage:
+if __name__ == '__main__':
+    # Create a simple connection map (graph) for demonstration.
+    conmap = {
+        0: [1, 2],
+        1: [0, 2, 3],
+        2: [0, 1],
+        3: [1]
+    }
+    color_map = render_net_vectorized(conmap)
+    print(color_map)
 
-            # Reset hist inside the loop
-            hist = [hist[0]] + [0] * n
-            
-            for p in conmap[k]:
-                hist[colors[p]] += 1                
-
-            # this seems to be the key block distinguishing it from greedy-like coloring
-            min_hist = min(hist)
-            if min_hist == 0:
-                min_color = hist.index(min_hist)
-                colors[k] = min_color
-                counter[k] = 0
-                continue
-
-            hist[colors[k]] = LARGE_INT
-            min_hist = min(hist)
-            minc = hist.index(min_hist)
-
-            if counter_k == rand:
-                counter[k] = 0
-                minc = np.random.randint(1, n + 1)
-
-            colors[k] = minc
-
-            for p in conmap[k]:
-                if colors[p] == minc:
-                    nodes.append(p)
-
-        if count == thresh:
-            # Recursive call with increased colors
-            colors = render_net(conmap, n + 1, rand, depth + 1, max_depth, offset)
-        return colors
-    else:
-        print(f"N-color algorithm exceeded max depth of {max_depth}")
-        return None
-
-    
 def greedy_coloring(conmap):
     # faster and uses fewer colors than render_net
     colors = {}
