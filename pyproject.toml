@@ -11,4 +11,5 @@ dynamic = ["version", "description", "readme", "authors", "classifiers", "depend
 # ncolor = "ncolor.__main__:main"
 
 [tool.setuptools_scm]
-write_to = "ncolor/_version.py"
+write_to = "src/ncolor/_version.py"
+
