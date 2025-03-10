@@ -1,7 +1,7 @@
 import setuptools
 from setuptools import setup
 
-install_deps = ['numba>=0.61.0', 
+install_deps = ['numba>=0.60.0', 
                 # 'numpy>=1.22.4', 
                 'scipy',
                 'fastremap','scikit-image',
