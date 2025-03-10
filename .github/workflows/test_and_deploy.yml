@@ -32,6 +32,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e .
 
+      - name: Install tox
+        run: pip install tox
+
       - name: Run tests with tox
         run: tox
         env:
