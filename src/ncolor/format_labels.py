@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.ndimage.morphology import binary_dilation, binary_erosion
 import mahotas as mh
 import fastremap
 
@@ -147,3 +146,7 @@ def endpoints(skel):
     unpad =  tuple([slice(pad,-pad)]*ep.ndim)
     ep = ep[unpad]
     return ep
+    
+
+# import sys
+# sys.modules[__name__] = format_labels

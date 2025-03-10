@@ -4,6 +4,8 @@ import numpy as np
 from numba import njit
 import scipy
 from .format_labels import format_labels
+# from . import format_labels
+
 import fastremap
 
 # import edt # does not yet support return_indices
@@ -326,3 +328,6 @@ def expand_labels(label_image):
 #     # Use np.unique to find unique rows (label pairs)
 #     rst_unique = fastremap.unique(rst, axis=0)
 #     return rst_unique
+
+# import sys
+# sys.modules[__name__] = label

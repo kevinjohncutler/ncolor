@@ -1,7 +1,9 @@
 import setuptools
 from setuptools import setup
 
-install_deps = ['numpy>=1.22.4', 'scipy', 'numba', 
+install_deps = ['numba>=0.61.0', 
+                # 'numpy>=1.22.4', 
+                'scipy',
                 'fastremap','scikit-image',
                 'mahotas>=1.4.13']
 
@@ -17,11 +19,12 @@ setup(
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/kevinjohncutler/ncolor",
+    packages=setuptools.find_packages(where="src"),
+    package_dir={"": "src"},
     setup_requires=[
       'pytest-runner',
       'setuptools_scm',
     ],
-    packages=setuptools.find_packages(),
     use_scm_version=True,
     install_requires = install_deps,
     tests_require=[
