@@ -1,14 +1,11 @@
-# This workflows will upload a Python Package using Twine when a release is created
-# For more information see: https://help.github.com/en/actions/language-and-framework-guides/using-python-with-github-actions#publishing-to-package-registries
+name: CI/CD
 
-name: tests
-
-on: 
+on:
   push:
     branches:
       - main
     tags:
-      - "v*" # Push events to matching v*, i.e. v1.0, v20.15.10
+      - "v*" # e.g. v1.0, v2.0
   pull_request:
     branches:
       - main
@@ -16,77 +13,73 @@ on:
 
 jobs:
   test:
-    name: ${{ matrix.platform }} py${{ matrix.python-version }}
-    runs-on: ${{ matrix.platform }}
+    name: ${{ matrix.os }} (Python ${{ matrix.python_version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        platform: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: [3.8]
-
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python_version: [3.9]
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.python_version }}
 
-      # these libraries, along with pytest-xvfb (added in the `deps` in tox.ini),
-      # enable testing on Qt on linux
-      - name: Install Linux libraries
+      - name: Install OS-specific dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
+          sudo apt-get update -y
           sudo apt-get install -y libdbus-1-3 libxkbcommon-x11-0 libxcb-icccm4 \
             libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
             libxcb-xinerama0 libxcb-xinput0 libxcb-xfixes0 pkg-config \
             libhdf5-dev libhdf5-hl-dev
-      # strategy borrowed from vispy for installing opengl libs on windows
-      - name: Install Windows OpenGL
+
+      - name: Install Windows OpenGL Dependencies
         if: runner.os == 'Windows'
         run: |
-          git clone --depth 1 git://github.com/pyvista/gl-ci-helpers.git
+          git clone --depth 1 https://github.com/pyvista/gl-ci-helpers.git
           powershell gl-ci-helpers/appveyor/install_opengl.ps1
-      # note: if you need dependencies from conda, considering using
-      # setup-miniconda: https://github.com/conda-incubator/setup-miniconda
-      # and
-      # tox-conda: https://github.com/tox-dev/tox-conda
-      - name: Install dependencies
+
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install dask dask_image scikit-learn
-          pip install wheel setuptools tox tox-gh-actions
-      # this runs the platform-specific tests declared in tox.ini
-      - name: Test with tox
+          pip install dask dask_image scikit-learn wheel setuptools tox tox-gh-actions
+
+      - name: Run tests with tox
         run: tox
         env:
-          PLATFORM: ${{ matrix.platform }}
+          PLATFORM: ${{ matrix.os }}
 
-      - name: Coverage
-        uses: codecov/codecov-action@v1
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
 
   deploy:
-    # this will run when you have tagged a commit, starting with "v*"
-    # and requires that you have put your twine API key in your 
-    # github secrets (see readme for details)
-    needs: [test]
+    name: Deploy Package
     runs-on: ubuntu-latest
-    if: contains(github.ref, 'tags')
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
+
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.x"
-      - name: Install dependencies
+          python-version: 3.9
+
+      - name: Install build tools
         run: |
           python -m pip install --upgrade pip
-          pip install -U setuptools setuptools_scm wheel twine
-      - name: Build and publish
+          pip install build twine setuptools setuptools_scm wheel
+
+      - name: Build distribution
+        run: |
+          python -m build --sdist --wheel
+
+      - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.TWINE_API_KEY }}
         run: |
-          git tag
-          python setup.py sdist bdist_wheel
-          twine upload dist/*
+          python -m twine upload dist/*
