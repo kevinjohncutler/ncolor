@@ -15,12 +15,16 @@ from scipy.ndimage import distance_transform_edt
 def is_sequential(labels):
     return np.all(np.diff(fastremap.unique(labels))==1)
     
+
 def unique_nonzero(labels):
     """
-    Get unique nonzero labels
+    Get unique nonzero labels.
     """
-    # return np.sort(np.array(list(set(fastremap.unique(labels))-set((0,)))))
-    return fastremap.unique(labels[labels > 0])
+    sub = labels[labels > 0]
+    if sub.size:
+        return fastremap.unique(sub)
+    else:
+        return np.array([0], dtype=labels.dtype)
 
 
 def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, greedy=False, verbose=False):
