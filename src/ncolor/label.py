@@ -21,10 +21,24 @@ def unique_nonzero(labels):
     Get unique nonzero labels.
     """
     sub = labels[labels > 0]
+    if not sub.flags.writeable:
+        sub = sub.copy()
     if sub.size:
         return fastremap.unique(sub)
     else:
         return np.array([0], dtype=labels.dtype)
+        
+# def unique_nonzero(labels):
+#     """
+#     Get unique nonzero labels. 
+#     """
+#     if np.any(labels):
+#         sub = labels[labels > 0]
+#         if not sub.flags.writeable:
+#             sub = sub.copy()
+#         return fastremap.unique(sub)
+#     else:
+#         return np.array([0])
 
 
 def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, greedy=False, verbose=False):
