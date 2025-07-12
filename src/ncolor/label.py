@@ -79,10 +79,19 @@ def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False):
      
     idx = connect(lab, conn)
     idx = mapidx(idx)
+    # Handle case where no masks touch one another.
+    # When the connection map is empty, assign the same color to every label.
+    if not idx:
+        lut = np.ones(lab.max() + 1, dtype=np.uint8)
+        lut[0] = 0
+        return lut
     if greedy:
         colors = greedy_coloring(idx)
     else:
         colors = render_net(idx, n=n, rand=10, max_depth=max_depth, offset=offset)
+        
+        if colors is None:
+            raise ValueError(f"Failed to color the labels with {n} colors. Try increasing n or max_depth.")
         
     lut = np.ones(lab.max()+1, dtype=np.uint8)
     for i in colors: lut[i] = colors[i]
@@ -203,18 +212,6 @@ def render_net(conmap, n=4, rand=12, depth=0, max_depth=5, offset=0):
         return colors
         
 
-
-# Example usage:
-if __name__ == '__main__':
-    # Create a simple connection map (graph) for demonstration.
-    conmap = {
-        0: [1, 2],
-        1: [0, 2, 3],
-        2: [0, 1],
-        3: [1]
-    }
-    color_map = render_net_vectorized(conmap)
-    print(color_map)
 
 def greedy_coloring(conmap):
     # faster and uses fewer colors than render_net
