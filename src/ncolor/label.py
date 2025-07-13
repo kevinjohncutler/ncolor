@@ -140,15 +140,15 @@ def connect(img, conn=1):
     return rst[order][idx]
 
 # maybe replace this with fastremap
-import fastremap
-def mapidx(idx):
-    dic = {}
-    # for i in np.unique(idx): dic[i] = []
-    for i in fastremap.unique(idx): dic[i] = [] # marginally faster 
-    for i,j in idx:
-        dic[i].append(j)
-        dic[j].append(i)
-    return dic
+# import fastremap
+# def mapidx(idx):
+#     dic = {}
+#     # for i in np.unique(idx): dic[i] = []
+#     for i in fastremap.unique(idx): dic[i] = [] # marginally faster 
+#     for i,j in idx:
+#         dic[i].append(j)
+#         dic[j].append(i)
+#     return dic
     
 def mapidx(idx):
     # Stack idx and its reversed version to account for both directions

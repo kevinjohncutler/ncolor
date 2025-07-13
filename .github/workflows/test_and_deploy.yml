@@ -40,8 +40,16 @@ jobs:
         env:
           PLATFORM: ${{ matrix.os }}
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+      - name: Build badges via tox
+        if: matrix.os == 'ubuntu-latest'
+        run: tox -e badges
+
+      - name: Commit badges
+        if: matrix.os == 'ubuntu-latest' && github.ref == 'refs/heads/main'
+        uses: EndBug/add-and-commit@v9
+        with:
+          add: 'badges/*.svg'
+          message: 'CI: update coverage and test badges'
 
   deploy:
     name: Deploy Package
@@ -68,4 +76,4 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.TWINE_API_KEY }}
-        run: python -m twine upload dist/* 
+        run: python -m twine upload dist/*
