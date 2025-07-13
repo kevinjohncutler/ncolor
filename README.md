@@ -1,5 +1,8 @@
 [![PyPI version](https://badge.fury.io/py/ncolor.svg)](https://badge.fury.io/py/ncolor)
+
 [![Downloads](https://static.pepy.tech/personalized-badge/ncolor?period=total&units=international_system&left_color=grey&right_color=green&left_text=Downloads)](https://pepy.tech/project/ncolor)
+[![Tests](badges/tests.svg)](badges/tests.svg)
+[![Coverage](badges/coverage.svg)](badges/coverage.svg)
 
 # ncolor <img src="https://github.com/kevinjohncutler/ncolor/blob/main/logo.png?raw=true" width="400" title="bacteria" alt="bacteria" align="right" vspace = "0">
 
