@@ -20,13 +20,13 @@ def unique_nonzero(labels):
     """
     Get unique nonzero labels.
     """
-    sub = labels[labels > 0]
+    sub = labels[labels > 0].astype(int)
     if not sub.flags.writeable:
         sub = sub.copy()
     if sub.size:
         return fastremap.unique(sub)
     else:
-        return np.array([0], dtype=labels.dtype)
+        return np.array([], dtype=labels.dtype)
         
 # def unique_nonzero(labels):
 #     """
