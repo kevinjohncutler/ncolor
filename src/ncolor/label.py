@@ -111,18 +111,35 @@ def neighbors(shape, conn=1):
     acc = np.cumprod((1,)+shape[::-1][:-1])
     return np.dot(idx, acc[::-1])
 
-@njit(fastmath=True)
+# @njit(fastmath=True, cache=True)
+@njit(cache=True)
 def search(img, nbs):
-    s, line = 0, img.ravel()
-    rst = np.zeros((len(line),2), img.dtype)
-    for i in range(len(line)):
-        if line[i]==0: continue
+    line = img.ravel()
+    total = len(line)
+    D = len(nbs)
+
+    # Worst case: every pixel connects to every neighbor
+    rst = np.empty((total * D, 2), img.dtype)
+    s = 0
+
+    for i in range(total):
+        vi = line[i]
+        if vi == 0:
+            continue
         for d in nbs:
-            if line[i+d]==0: continue
-            if line[i]==line[i+d]: continue
-            rst[s,0] = line[i]
-            rst[s,1] = line[i+d]
+            j = i + d
+            # Guard out-of-bounds indices (NumPy negative wraps; disallow here)
+            if j < 0 or j >= total:
+                continue
+            vj = line[j]
+            if vj == 0:
+                continue
+            if vi == vj:
+                continue
+            rst[s, 0] = vi
+            rst[s, 1] = vj
             s += 1
+
     return rst[:s]
                             
 def connect(img, conn=1):
