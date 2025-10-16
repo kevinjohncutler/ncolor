@@ -1,8 +1,14 @@
 import numpy as np
-import mahotas as mh
 import fastremap
-from skimage import measure
-from skimage.morphology import remove_small_holes
+
+# Lazy imports for heavy dependencies - only import when functions are called
+def _lazy_import_skimage_measure():
+    from skimage import measure
+    return measure
+
+def _lazy_import_skimage_morphology():
+    from skimage.morphology import remove_small_holes
+    return remove_small_holes
 
 
 def format_labels(labels, clean=False, min_area=9, despur=False, 
@@ -42,7 +48,8 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                 mask = delete_spurs(mask) #needs updating for ND 
                 labels[mask] = j # put label back in
                 
-            lbl = measure.label(mask)                       
+            measure = _lazy_import_skimage_measure()
+            lbl = measure.label(mask)
             regions = measure.regionprops(lbl)
             regions.sort(key=lambda x: x.area, reverse=True)
             
@@ -79,6 +86,7 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
 def delete_spurs(mask):
     pad = 1
     #must fill single holes in image to avoid cusps causing issues. Will limit to holes of size ___
+    remove_small_holes = _lazy_import_skimage_morphology()
     skel = remove_small_holes(np.pad(mask,pad,mode='constant'),5)
     nbad = 1
     niter = 0
@@ -93,8 +101,99 @@ def delete_spurs(mask):
 
     return skel
 
-# this still  only works for 2D
+def endpoints_nd(skel):
+    """
+    Detect endpoints in an N-dimensional skeleton.
+
+    An endpoint is a foreground pixel that has exactly one foreground neighbor
+    in its connectivity neighborhood.
+
+    For 2D: Uses 8-connectivity (includes diagonal neighbors) to match original behavior
+    For 3D+: Uses face connectivity (more appropriate for higher dimensions)
+
+    Parameters
+    ----------
+    skel : ndarray
+        Binary skeleton image of any dimensionality
+
+    Returns
+    -------
+    endpoints : ndarray
+        Binary image with endpoints marked as True
+    """
+    from scipy import ndimage
+
+    ndim = skel.ndim
+
+    # Choose connectivity based on dimensionality
+    # For 2D, use 8-connectivity to match the original mahotas implementation
+    # For higher dimensions, use face connectivity
+    if ndim == 2:
+        connectivity = ndimage.generate_binary_structure(ndim, 2)  # 8-connectivity
+    else:
+        connectivity = ndimage.generate_binary_structure(ndim, 1)  # face connectivity
+
+    # Create kernel (exclude center pixel)
+    kernel = connectivity.astype(np.float32)
+    center_idx = tuple(np.array(kernel.shape) // 2)
+    kernel[center_idx] = 0
+
+    # Count neighbors
+    neighbor_count = ndimage.convolve(skel.astype(np.float32), kernel,
+                                     mode='constant', cval=0)
+
+    # Endpoints are foreground pixels with exactly 1 neighbor
+    endpoints = (skel > 0) & (neighbor_count == 1)
+
+    return endpoints
+
+def endpoints_nd_alternative(skel):
+    """
+    Alternative implementation using labeled components approach.
+    This might be more accurate for complex skeleton structures.
+    """
+    from scipy import ndimage
+
+    # Create connectivity structure
+    ndim = skel.ndim
+    connectivity = ndimage.generate_binary_structure(ndim, 1)
+
+    # For each foreground pixel, count connected foreground neighbors
+    # We'll use a more sophisticated approach with binary_dilation
+
+    # Dilate by 1 pixel to get neighborhood
+    dilated = ndimage.binary_dilation(skel, connectivity)
+
+    # The difference gives us the boundary
+    boundary = dilated & ~skel
+
+    # For each foreground pixel, count how many boundary pixels it touches
+    # This is equivalent to counting neighbors
+
+    # Use distance transform to find pixels with minimal connectivity
+    # Actually, let's use a simpler approach with convolution
+
+    # Create a kernel that counts neighbors
+    kernel = connectivity.astype(np.float32)
+    kernel[tuple(np.array(kernel.shape) // 2)] = 0  # Don't count center
+
+    # Count neighbors
+    neighbor_count = ndimage.convolve(skel.astype(np.float32), kernel, mode='constant', cval=0)
+
+    # Endpoints have exactly 1 neighbor
+    endpoints = (skel > 0) & (neighbor_count == 1)
+
+    return endpoints
+
+# Current endpoints function - uses the ND version
 def endpoints(skel):
+    """
+    Detect endpoints in a skeleton. Now uses the N-dimensional implementation.
+    """
+    return endpoints_nd(skel)
+
+# Keep the original function for comparison (renamed)
+def endpoints_original_2d(skel):
     pad = 1 # appears to require padding to work properly....
     skel = np.pad(skel,pad)
     endpoint1=np.array([[0, 0, 0],
@@ -129,6 +228,7 @@ def endpoints(skel):
                         [2, 1, 0],
                         [1, 2, 0]])
     
+    import mahotas as mh
     ep1=mh.morph.hitmiss(skel,endpoint1)
     ep2=mh.morph.hitmiss(skel,endpoint2)
     ep3=mh.morph.hitmiss(skel,endpoint3)
