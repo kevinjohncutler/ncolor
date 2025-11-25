@@ -15,7 +15,7 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                   verbose=False, background=None, ignore=False):
     """
     Puts labels into 'standard form', i.e. background=0 and cells 1,2,3,...,N-1,N.
-    Optional clean flag: disconnect and disjoint masks and discard small masks beflow min_area. 
+    Optional clean flag: disconnect and disjoint masks and discard small masks below min_area. 
     min_area default is 9px. 
     Optional ignore flag: 0 is now 'ignore' and 1 is background. We do not want to shift 1->0 in that case. 
     """
@@ -62,7 +62,7 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                 if verbose:
                     print('Warning - found mask with disjoint label.')
                 for rg in regions[1:]:
-                    if rg.area <= min_area:
+                    if rg.area < min_area:
                         labels[tuple(rg.coords.T)] = background
                         if verbose:
                             print('secondary disjoint part smaller than min_area. Removing it.')

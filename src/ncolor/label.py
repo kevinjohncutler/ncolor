@@ -10,32 +10,9 @@ import scipy
 from scipy.ndimage import distance_transform_edt
 from .format_labels import format_labels
 
-# Precomputed 2D neighbor deltas (int8) for fast wavefront expansion
-DY4 = np.array([-1, 0, 0, 1], dtype=np.int8)
-DX4 = np.array([0, -1, 1, 0], dtype=np.int8)
-DY8 = np.array([-1, -1, -1, 0, 0, 1, 1, 1], dtype=np.int8)
-DX8 = np.array([-1, 0, 1, -1, 1, -1, 0, 1], dtype=np.int8)
-
-# Simple workspace cache for 2D wavefront queues, keyed by (H, W)
-_WAVE_WS_2D = {}
-
-def _get_wavefront_ws_2d(shape):
-    H, W = int(shape[0]), int(shape[1])
-    key = (H, W)
-    n = H * W
-    ws = _WAVE_WS_2D.get(key)
-    if ws is not None and ws[0].size >= n and ws[1].size >= n:
-        return ws
-    qy = np.empty(n, dtype=np.int32)
-    qx = np.empty(n, dtype=np.int32)
-    _WAVE_WS_2D[key] = (qy, qx)
-    return _WAVE_WS_2D[key]
-
-
 def is_sequential(labels):
     return np.all(np.diff(fastremap.unique(labels))==1)
     
-
 def unique_nonzero(labels):
     """
     Get unique nonzero labels.
@@ -69,6 +46,8 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
     # puts it into the smallest datatype to save space
     # if not is_sequential(lab):
     #     lab = format_labels(lab)
+
+    if verbose: print('verbose')
     pad = 1
     unpad = tuple([slice(pad,-pad)]*lab.ndim)
     mask = lab!=0
@@ -79,16 +58,15 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
         ncl = mask.astype(int)
         nc = 1
     else:
-        # by default, 2D images should be expanded, 3D should not
-        # this allows expand to override either with True/False or a fast mode string
-        if expand or (lab.squeeze().ndim==2 and expand is None):
+        # Expand only when explicitly requested
+        if expand:
             if isinstance(expand, str) and expand.lower() in ("fast", "wave", "approx", "wavefront"):
                 lab = expand_labels_wavefront(lab, conn=2)
             else:
                 lab = expand_labels(lab)
         # lab = np.pad(format_labels(lab),pad)
         lab = format_labels(np.pad(lab,pad),background=0) # is this necessary? 
-        lut = get_lut(lab,n,conn,max_depth,offset,greedy)
+        lut = get_lut(lab,n,conn,max_depth,offset,greedy, verbose)
         
         ncl = lut[lab][unpad]*mask
         nc = np.max(lut)
@@ -98,7 +76,7 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
     else:    
         return ncl
 
-def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False):
+def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False, verbose=False):
     lab = format_labels(lab).astype(np.int32)
 
     pairs = connect(lab, conn)
@@ -114,8 +92,8 @@ def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False):
         conmap = mapidx(pairs)
         colors = greedy_coloring(conmap)
     else:
-        # Fast path: pass edge list directly to render_net
-        colors = render_net(pairs, n=n, rand=10, max_depth=max_depth, offset=offset)
+        # Use CSR coloring (fast) with repairs
+        colors = render_net(pairs, n=n, rand=0, max_depth=max_depth, offset=offset, verbose=verbose)
         if colors is None:
             raise ValueError(f"Failed to color the labels with {n} colors. Try increasing n or max_depth.")
 
@@ -149,105 +127,7 @@ def neighbors(shape, conn=1, unique=True):
     acc = np.cumprod((1,) + shape[::-1][:-1])
     return np.dot(idx, acc[::-1])
 
-# Caches for ND helpers
-_NBS_CACHE = {}
-_ND_BUF_CACHE = {}
-_ND_Q_CACHE = {}
 
-def _get_neighbors_cached(shape, conn, unique):
-    key = (tuple(shape), int(conn), bool(unique))
-    nbs = _NBS_CACHE.get(key)
-    if nbs is None:
-        nbs = neighbors(shape, conn, unique)
-        nbs = np.asarray(nbs, dtype=np.int64)
-        _NBS_CACHE[key] = nbs
-    return nbs
-
-def _get_nd_workspace(shape, dtype):
-    pad_shape = tuple(int(s) + 2 for s in shape)
-    key_buf = (pad_shape, np.dtype(dtype).str)
-    buf = _ND_BUF_CACHE.get(key_buf)
-    if (buf is None) or (buf.shape != pad_shape) or (buf.dtype != dtype):
-        buf = np.zeros(pad_shape, dtype=dtype)
-        _ND_BUF_CACHE[key_buf] = buf
-    total = int(np.prod(pad_shape))
-    q = _ND_Q_CACHE.get(pad_shape)
-    if (q is None) or (q.size < total):
-        q = np.empty(total, dtype=np.int64)
-        _ND_Q_CACHE[pad_shape] = q
-    return buf, q
-
-@njit(cache=True)
-def _expand_wavefront_nd(line, nbs, q):
-    total = line.size
-    head = 0
-    tail = 0
-    # Seed only boundary-labeled indices (adjacent to zero)
-    for i in range(total):
-        vi = line[i]
-        if vi == 0:
-            continue
-        for d in nbs:
-            j = i + d
-            if j < 0 or j >= total:
-                continue
-            if line[j] == 0:
-                q[tail] = i
-                tail += 1
-                break
-    if head == tail:
-        return tail
-
-    # Frontier BFS: process layer by layer
-    front_start = 0
-    front_end = tail
-    while front_start < front_end:
-        for pos in range(front_start, front_end):
-            i = q[pos]
-            vi = line[i]
-            for d in nbs:
-                j = i + d
-                if j < 0 or j >= total:
-                    continue
-                if line[j] == 0:
-                    line[j] = vi
-                    q[tail] = j
-                    tail += 1
-        front_start = front_end
-        front_end = tail
-    return tail
-
-@njit(cache=True)
-def _edges_from_queue(line, q, qlen, bgmask, nbs_half):
-    total = line.size
-    cap = max(qlen * max(len(nbs_half), 1), 1)
-    edges = np.empty((cap, 2), np.int64)
-    e = 0
-    for t in range(qlen):
-        i = q[t]
-        if not bgmask[i]:
-            continue
-        vi = line[i]
-        if vi == 0:
-            continue
-        for d in nbs_half:
-            j = i + d
-            if j < 0 or j >= total:
-                continue
-            if not bgmask[j]:
-                continue
-            vj = line[j]
-            if vj == 0 or vj == vi:
-                continue
-            a = vi
-            b = vj
-            if a > b:
-                a, b = b, a
-            if e < cap:
-                edges[e, 0] = a
-                edges[e, 1] = b
-                e += 1
-    return edges[:e]
 
 # @njit(fastmath=True, cache=True)
 @njit(cache=True)
@@ -342,10 +222,11 @@ def mapidx(idx):
 def _color_graph_csr(indptr, indices, n, rand, max_iter):
     N = indptr.size - 1
     colors = np.zeros(N, np.uint8)
+    color_counts = np.zeros(n + 1, np.int32)  # global usage to balance distribution
     counter = np.zeros(N, np.int32)
 
-    # queue as a simple ring buffer
-    qcap = max(N * 4, 1)
+    # queue as a (growable) ring buffer; start large enough to hold all edges
+    qcap = max(indices.size + N, N * 8, 1)
     q = np.empty(qcap, np.int32)
     head = 0
     tail = N
@@ -376,11 +257,16 @@ def _color_graph_csr(indptr, indices, n, rand, max_iter):
                     break
 
         if not all_present:
-            # choose the smallest missing color
-            csel = 1
-            while (mask & (1 << csel)) != 0 and csel <= n:
-                csel += 1
-            if csel > n:
+            # choose the missing color with lowest global usage to balance distribution
+            csel = 0
+            best_count = 2147483647
+            for c in range(1, n + 1):
+                if (mask & (1 << c)) == 0:
+                    cnt = color_counts[c]
+                    if cnt < best_count:
+                        best_count = cnt
+                        csel = c
+            if csel == 0:
                 csel = n  # fallback (should not happen)
         else:
             # Second pass only when needed: count frequencies
@@ -404,14 +290,24 @@ def _color_graph_csr(indptr, indices, n, rand, max_iter):
                 csel = 1 + (seed % n)
 
         if colors[u] != csel:
+            oldc = colors[u]
             colors[u] = csel
+            if oldc != 0:
+                color_counts[oldc] -= 1
+            color_counts[csel] += 1
             # re-enqueue only neighbors that now conflict
             for k in range(row_beg, row_end):
                 v = indices[k]
                 if colors[v] == csel:
-                    if tail < qcap:
-                        q[tail] = v
-                        tail += 1
+                    if tail >= qcap:
+                        # grow queue to avoid silently dropping conflicts
+                        newcap = max(qcap * 2, tail + 1)
+                        q_new = np.empty(newcap, np.int32)
+                        q_new[:tail] = q[:tail]
+                        q = q_new
+                        qcap = newcap
+                    q[tail] = v
+                    tail += 1
 
     return colors, (head < tail)
 
@@ -627,21 +523,36 @@ def _kempe_repair_csr(indptr, indices, colors, n, max_passes=2):
     return colors, conflict
 
 
-def render_net(conmap, n=4, rand=12, depth=0, max_depth=5, offset=0):
-    # Accept either dict-of-arrays (adjacency) or ndarray of edges (M,2)
-    if isinstance(conmap, dict):
-        N = len(conmap)
-        if N == 0:
-            return {}
-
-        nodes = np.fromiter(conmap.keys(), dtype=np.int64, count=N)
-        degrees = np.fromiter((len(conmap[int(nid)]) for nid in nodes), dtype=np.int32, count=N)
+def render_net(conmap, n=4, rand=0, depth=0, max_depth=5, offset=0, verbose=False):
+    """
+    Fast DSATUR-style coloring on CSR without post cleanup.
+    """
+    def build_csr_from_pairs(pairs_arr):
+        pairs_sym = np.vstack((pairs_arr, pairs_arr[:, [1, 0]]))
+        order = np.argsort(pairs_sym[:, 0], kind='mergesort')
+        src = pairs_sym[order, 0]
+        dst = pairs_sym[order, 1]
+        unique_src, counts = fastremap.unique(src, return_counts=True)
+        N = unique_src.size
         indptr = np.empty(N + 1, dtype=np.int32)
+        indptr[0] = 0
+        np.cumsum(counts, out=indptr[1:])
+        id2idx = {int(v): i for i, v in enumerate(unique_src.tolist())}
+        indices = fastremap.remap(dst, id2idx, preserve_missing_labels=False).astype(np.int32, copy=False)
+        return unique_src, indptr, indices
+
+    # Build CSR
+    if isinstance(conmap, dict):
+        if verbose: print('using dict')
+        if len(conmap) == 0:
+            return {}
+        nodes = np.fromiter(conmap.keys(), dtype=np.int64, count=len(conmap))
+        degrees = np.fromiter((len(conmap[int(nid)]) for nid in nodes), dtype=np.int32, count=len(conmap))
+        indptr = np.empty(len(conmap) + 1, dtype=np.int32)
         indptr[0] = 0
         np.cumsum(degrees, out=indptr[1:])
         if indptr[-1] == 0:
             return {int(nid): 1 for nid in nodes}
-
         concat_neighbors = np.empty(indptr[-1], dtype=np.int64)
         pos = 0
         for nid in nodes:
@@ -649,109 +560,51 @@ def render_net(conmap, n=4, rand=12, depth=0, max_depth=5, offset=0):
             ln = len(arr)
             concat_neighbors[pos:pos + ln] = arr
             pos += ln
-
         id2idx = {int(v): i for i, v in enumerate(nodes.tolist())}
         indices = fastremap.remap(concat_neighbors, id2idx, preserve_missing_labels=False).astype(np.int32, copy=False)
-
-        max_iter = max(2 * N, 1)
-        colors_arr, unfinished = _color_graph_csr(indptr, indices, int(n), int(rand), int(max_iter))
-        # Validate coloring: no adjacent nodes share a color
-        conflict = False
-        for u in range(N):
-            c = colors_arr[u]
-            if c == 0:
-                continue
-            row_beg = indptr[u]
-            row_end = indptr[u + 1]
-            for k in range(row_beg, row_end):
-                v = indices[k]
-                if v == u:
-                    continue
-                if colors_arr[v] == c:
-                    conflict = True
-                    break
-            if conflict:
-                break
-
-        # Try a quick local repair in CSR
-        if conflict:
-            colors_arr, conflict = _repair_coloring(indptr, indices, colors_arr, int(n), max_passes=4)
-        # Try Kempe-chain style recoloring to keep colors ≤ n
-        if conflict:
-            colors_arr, conflict = _kempe_repair_csr(indptr, indices, colors_arr, int(n), max_passes=2)
-
-        if unfinished and depth < max_depth:
-            return render_net(conmap, n + 1, rand, depth + 1, max_depth, offset)
-
-        if conflict:
-            # As a last resort, use CSR greedy on the same graph
-            colors_arr = _greedy_coloring_csr(indptr, indices, int(n))
-            # No need to validate; greedy guarantees validity
-            return {int(nodes[i]): int(colors_arr[i]) for i in range(N)}
-
-        return {int(nodes[i]): int(colors_arr[i]) for i in range(N)}
-
-    # ndarray edge-list path
-    pairs = np.asarray(conmap, dtype=np.int64)
-    if pairs.size == 0:
-        return {}
-
-    # Make adjacency symmetric without Python loops
-    pairs_sym = np.vstack((pairs, pairs[:, [1, 0]]))
-
-    # Group by source using a stable sort, then build CSR
-    order = np.argsort(pairs_sym[:, 0], kind='mergesort')
-    src = pairs_sym[order, 0]
-    dst = pairs_sym[order, 1]
-
-    unique_src, counts = fastremap.unique(src, return_counts=True) # about the same as np.unique
+        unique_src = nodes
+    else:
+        pairs = np.asarray(conmap, dtype=np.int64)
+        if pairs.size == 0:
+            return {}
+        unique_src, indptr, indices = build_csr_from_pairs(pairs)
+        nodes = unique_src
 
     N = unique_src.size
-    indptr = np.empty(N + 1, dtype=np.int32)
-    indptr[0] = 0
-    np.cumsum(counts, out=indptr[1:])
+    colors = np.zeros(N, np.uint8)
+    sat_mask = np.zeros(N, np.uint64)
+    degrees = indptr[1:] - indptr[:-1]
 
-    # Map node ids → [0..N-1] and remap dst
-    id2idx = {int(v): i for i, v in enumerate(unique_src.tolist())}
-    indices = fastremap.remap(dst, id2idx, preserve_missing_labels=False).astype(np.int32, copy=False)
-
-    max_iter = max(2 * N, 1)
-    colors_arr, unfinished = _color_graph_csr(indptr, indices, int(n), int(rand), int(max_iter))
-
-    # Validate coloring: no adjacent nodes share a color
-    conflict = False
-    for u in range(N):
-        c = colors_arr[u]
-        if c == 0:
+    import heapq
+    heap = []
+    for i in range(N):
+        heapq.heappush(heap, (-0, -int(degrees[i]), i))
+    while heap:
+        _, _, u = heapq.heappop(heap)
+        if colors[u] != 0:
             continue
-        row_beg = indptr[u]
-        row_end = indptr[u + 1]
-        for k in range(row_beg, row_end):
-            v = indices[k]
-            if v == u:
-                continue
-            if colors_arr[v] == c:
-                conflict = True
+        used = sat_mask[u]
+        csel = 0
+        for c in range(1, n + 1):
+            if (used & (np.uint64(1) << np.uint64(c))) == 0:
+                csel = c
                 break
-        if conflict:
-            break
+        if csel == 0:
+            raise ValueError(f"Failed to color graph with {n} colors without conflicts.")
+        colors[u] = np.uint8(csel)
+        bit = np.uint64(1) << np.uint64(csel)
+        rb = indptr[u]; re = indptr[u + 1]
+        for k in range(rb, re):
+            v = indices[k]
+            if colors[v] == 0:
+                sat_mask[v] |= bit
+                sat = bin(sat_mask[v]).count("1")
+                heapq.heappush(heap, (-sat, -int(degrees[v]), v))
 
-    # Try a quick local repair in CSR
-    if conflict:
-        colors_arr, conflict = _repair_coloring(indptr, indices, colors_arr, int(n), max_passes=4)
-    # Try Kempe-chain style recoloring to keep colors ≤ n
-    if conflict:
-        colors_arr, conflict = _kempe_repair_csr(indptr, indices, colors_arr, int(n), max_passes=2)
+    if (colors == 0).any():
+        raise ValueError(f"Failed to color graph with {n} colors without conflicts.")
 
-    if unfinished and depth < max_depth:
-        return render_net(pairs, n + 1, rand, depth + 1, max_depth, offset)
-
-    if conflict:
-        # Fallback to CSR greedy coloring (should be rare)
-        colors_arr = _greedy_coloring_csr(indptr, indices, int(n))
-        return {int(unique_src[i]): int(colors_arr[i]) for i in range(N)}
-
-    return {int(unique_src[i]): int(colors_arr[i]) for i in range(N)}
+    return {int(nodes[i]): int(colors[i]) for i in range(N)}
     
 def greedy_coloring(conmap):
     # faster and uses fewer colors than render_net, much uglier 
@@ -823,8 +676,8 @@ def expand_labels_wavefront(label_image, conn=2):
     return buf[unpad]
 
 
-#################### get_lut_expanded here 
-def get_lut_expanded(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False):
+#################### experiments
+def get_lut_expanded(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False, verbose=False):
     """
     Compute a color LUT as if labels were expanded into background, without
     materializing the expanded array. Works by expanding ownership only across
@@ -919,7 +772,7 @@ def get_lut_expanded(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False):
     if greedy:
         colors = greedy_coloring(mapidx(pairs))
     else:
-        colors = render_net(pairs, n=n, rand=10, max_depth=max_depth, offset=offset)
+        colors = render_net(pairs, n=n, rand=10, max_depth=max_depth, offset=offset, verbose=verbose)
 
     lut = np.ones(lab0.max() + 1, dtype=np.uint8)
     for i in colors:
