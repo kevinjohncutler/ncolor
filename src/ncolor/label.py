@@ -523,6 +523,29 @@ def _kempe_repair_csr(indptr, indices, colors, n, max_passes=2):
     return colors, conflict
 
 
+def _csr_color_with_repairs(indptr, indices, n, max_depth=5, verbose=False):
+    """
+    Try the CSR solver and apply deterministic repair steps when needed.
+    """
+    max_depth = max(1, max_depth)
+    max_iter = max((indices.size + int(indptr.size)) * max_depth, 512)
+    colors, unfinished = _color_graph_csr(indptr, indices, n, rand=0, max_iter=max_iter)
+    needs_repair = unfinished or (colors == 0).any()
+    if needs_repair:
+        if verbose:
+            print("CSR solver incomplete, running conflict repair.")
+        colors, conflict = _repair_coloring(indptr, indices, colors, n, max_passes=max(4, max_depth))
+        needs_repair = conflict or (colors == 0).any()
+    if needs_repair:
+        if verbose:
+            print("CSR conflict repair left unresolved, attempting Kempe swaps.")
+        colors, conflict = _kempe_repair_csr(indptr, indices, colors, n, max_passes=max(2, max_depth))
+        needs_repair = conflict or (colors == 0).any()
+    if needs_repair:
+        return None
+    return colors
+
+
 def render_net(conmap, n=4, rand=0, depth=0, max_depth=5, offset=0, verbose=False):
     """
     Fast DSATUR-style coloring on CSR without post cleanup.
@@ -579,6 +602,7 @@ def render_net(conmap, n=4, rand=0, depth=0, max_depth=5, offset=0, verbose=Fals
     heap = []
     for i in range(N):
         heapq.heappush(heap, (-0, -int(degrees[i]), i))
+    failed = False
     while heap:
         _, _, u = heapq.heappop(heap)
         if colors[u] != 0:
@@ -590,7 +614,10 @@ def render_net(conmap, n=4, rand=0, depth=0, max_depth=5, offset=0, verbose=Fals
                 csel = c
                 break
         if csel == 0:
-            raise ValueError(f"Failed to color graph with {n} colors without conflicts.")
+            failed = True
+            if verbose:
+                print(f"DSATUR failed to assign a color using {n} colors, triggering CSR repair.")
+            break
         colors[u] = np.uint8(csel)
         bit = np.uint64(1) << np.uint64(csel)
         rb = indptr[u]; re = indptr[u + 1]
@@ -601,8 +628,13 @@ def render_net(conmap, n=4, rand=0, depth=0, max_depth=5, offset=0, verbose=Fals
                 sat = bin(sat_mask[v]).count("1")
                 heapq.heappush(heap, (-sat, -int(degrees[v]), v))
 
-    if (colors == 0).any():
-        raise ValueError(f"Failed to color graph with {n} colors without conflicts.")
+    if failed or (colors == 0).any():
+        if verbose:
+            print("Switching to CSR solver with deterministic repairs.")
+        csr_colors = _csr_color_with_repairs(indptr, indices, n, max_depth, verbose=verbose)
+        if csr_colors is None:
+            raise ValueError(f"Failed to color graph with {n} colors after deterministic repairs.")
+        colors = csr_colors
 
     return {int(nodes[i]): int(colors[i]) for i in range(N)}
     
