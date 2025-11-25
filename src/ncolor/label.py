@@ -2,7 +2,7 @@
 
 import numpy as np
 import fastremap
-from collections import deque
+import heapq
 
 # Import heavy dependencies but defer JIT compilation
 from numba import njit
@@ -40,7 +40,7 @@ def unique_nonzero(labels):
 #         return np.array([0])
 
 
-def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, greedy=False, verbose=False):
+def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, greedy=False, experimental=False, verbose=False):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
     # puts it into the smallest datatype to save space
@@ -66,7 +66,7 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
                 lab = expand_labels(lab)
         # lab = np.pad(format_labels(lab),pad)
         lab = format_labels(np.pad(lab,pad),background=0) # is this necessary? 
-        lut = get_lut(lab,n,conn,max_depth,offset,greedy, verbose)
+        lut = get_lut(lab,n,conn,max_depth,offset,greedy, experimental, verbose)
         
         ncl = lut[lab][unpad]*mask
         nc = np.max(lut)
@@ -76,7 +76,7 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
     else:    
         return ncl
 
-def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False, verbose=False):
+def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False, experimental=False, verbose=False):
     lab = format_labels(lab).astype(np.int32)
 
     pairs = connect(lab, conn)
@@ -87,12 +87,12 @@ def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False, verbose=False
         lut[0] = 0
         return lut
 
-    if greedy:
-        # Greedy expects a dict-of-arrays; build only when needed
+    if experimental:
+        colors = render_net_experimental(pairs, n=n, rand=0, max_depth=max_depth, offset=offset, verbose=verbose)
+    elif greedy:
         conmap = mapidx(pairs)
         colors = greedy_coloring(conmap)
     else:
-        # Use CSR coloring (fast) with repairs
         colors = render_net(pairs, n=n, rand=0, max_depth=max_depth, offset=offset, verbose=verbose)
         if colors is None:
             raise ValueError(f"Failed to color the labels with {n} colors. Try increasing n or max_depth.")
@@ -546,59 +546,181 @@ def _csr_color_with_repairs(indptr, indices, n, max_depth=5, verbose=False):
     return colors
 
 
-def render_net(conmap, n=4, rand=0, depth=0, max_depth=5, offset=0, verbose=False):
-    """
-    Fast DSATUR-style coloring on CSR without post cleanup.
-    """
-    def build_csr_from_pairs(pairs_arr):
-        pairs_sym = np.vstack((pairs_arr, pairs_arr[:, [1, 0]]))
-        order = np.argsort(pairs_sym[:, 0], kind='mergesort')
-        src = pairs_sym[order, 0]
-        dst = pairs_sym[order, 1]
-        unique_src, counts = fastremap.unique(src, return_counts=True)
-        N = unique_src.size
-        indptr = np.empty(N + 1, dtype=np.int32)
-        indptr[0] = 0
-        np.cumsum(counts, out=indptr[1:])
-        id2idx = {int(v): i for i, v in enumerate(unique_src.tolist())}
-        indices = fastremap.remap(dst, id2idx, preserve_missing_labels=False).astype(np.int32, copy=False)
-        return unique_src, indptr, indices
+def _build_csr_from_pairs(pairs_arr):
+    pairs_sym = np.vstack((pairs_arr, pairs_arr[:, [1, 0]]))
+    order = np.argsort(pairs_sym[:, 0], kind='mergesort')
+    src = pairs_sym[order, 0]
+    dst = pairs_sym[order, 1]
+    unique_src, counts = fastremap.unique(src, return_counts=True)
+    N = unique_src.size
+    indptr = np.empty(N + 1, dtype=np.int32)
+    indptr[0] = 0
+    np.cumsum(counts, out=indptr[1:])
+    id2idx = {int(v): i for i, v in enumerate(unique_src.tolist())}
+    indices = fastremap.remap(dst, id2idx, preserve_missing_labels=False).astype(np.int32, copy=False)
+    return unique_src, indptr, indices
 
-    # Build CSR
+
+def _csr_from_dict(conmap):
+    nodes = np.fromiter(conmap.keys(), dtype=np.int64, count=len(conmap))
+    degrees = np.fromiter((len(conmap[int(nid)]) for nid in nodes), dtype=np.int32, count=len(conmap))
+    indptr = np.empty(len(conmap) + 1, dtype=np.int32)
+    indptr[0] = 0
+    np.cumsum(degrees, out=indptr[1:])
+    if indptr[-1] == 0:
+        return nodes, indptr, np.empty(0, dtype=np.int32)
+    concat_neighbors = np.empty(indptr[-1], dtype=np.int64)
+    pos = 0
+    for nid in nodes:
+        arr = conmap[int(nid)]
+        ln = len(arr)
+        concat_neighbors[pos:pos + ln] = arr
+        pos += ln
+    id2idx = {int(v): i for i, v in enumerate(nodes.tolist())}
+    indices = fastremap.remap(concat_neighbors, id2idx, preserve_missing_labels=False).astype(np.int32, copy=False)
+    return nodes, indptr, indices
+
+
+@njit(cache=True)
+def _degeneracy_order_jit(indptr, indices):
+    N = indptr.size - 1
+    if N == 0:
+        return np.empty(0, dtype=np.int32)
+    degrees = np.empty(N, dtype=np.int32)
+    max_deg = 0
+    for i in range(N):
+        d = int(indptr[i + 1] - indptr[i])
+        degrees[i] = d
+        if d > max_deg:
+            max_deg = d
+    head = np.full(max_deg + 1, -1, dtype=np.int32)
+    next_ptr = np.full(N, -1, dtype=np.int32)
+    for u in range(N):
+        d = degrees[u]
+        next_ptr[u] = head[d]
+        head[d] = u
+    removed = np.zeros(N, dtype=np.uint8)
+    order = np.empty(N, dtype=np.int32)
+    current = 0
+    count = 0
+    while count < N:
+        while current <= max_deg and head[current] == -1:
+            current += 1
+        if current > max_deg:
+            break
+        u = head[current]
+        head[current] = next_ptr[u]
+        if removed[u] or degrees[u] != current:
+            continue
+        removed[u] = 1
+        order[count] = u
+        count += 1
+        for k in range(indptr[u], indptr[u + 1]):
+            v = indices[k]
+            if removed[v]:
+                continue
+            degrees[v] -= 1
+            nd = degrees[v]
+            next_ptr[v] = head[nd]
+            head[nd] = v
+            if nd < current:
+                current = nd
+    if count < N:
+        out = np.empty(count, dtype=np.int32)
+        for i in range(count):
+            out[i] = order[i]
+        return out
+    return order
+
+
+@njit(cache=True)
+def _experimental_color_from_order_jit(indptr, indices, n):
+    order = _degeneracy_order_jit(indptr, indices)
+    N = indptr.size - 1
+    colors = np.zeros(N, dtype=np.uint8)
+    fullmask = (1 << (n + 1)) - 2
+    K = order.size
+    for idx in range(K - 1, -1, -1):
+        u = order[idx]
+        mask = 0
+        row_beg = indptr[u]
+        row_end = indptr[u + 1]
+        for k in range(row_beg, row_end):
+            v = indices[k]
+            cv = colors[v]
+            if cv != 0:
+                mask |= (1 << cv)
+                if mask == fullmask:
+                    break
+        csel = 0
+        for c in range(1, n + 1):
+            if (mask & (1 << c)) == 0:
+                csel = c
+                break
+        if csel == 0:
+            return np.empty(0, dtype=np.uint8)
+        colors[u] = np.uint8(csel)
+    return colors
+
+
+def _experimental_color_from_order(indptr, indices, n, verbose=False):
+    colors = _experimental_color_from_order_jit(indptr, indices, n)
+    if colors.size == 0:
+        if verbose:
+            print("Experimental degeneracy ordering could not fit within the color budget.")
+        return None
+    return colors
+
+
+def render_net_experimental(conmap, n=4, rand=0, depth=0, max_depth=5, offset=0, verbose=False):
     if isinstance(conmap, dict):
-        if verbose: print('using dict')
+        if verbose:
+            print("experimental dict path")
         if len(conmap) == 0:
             return {}
-        nodes = np.fromiter(conmap.keys(), dtype=np.int64, count=len(conmap))
-        degrees = np.fromiter((len(conmap[int(nid)]) for nid in nodes), dtype=np.int32, count=len(conmap))
-        indptr = np.empty(len(conmap) + 1, dtype=np.int32)
-        indptr[0] = 0
-        np.cumsum(degrees, out=indptr[1:])
+        nodes, indptr, indices = _csr_from_dict(conmap)
         if indptr[-1] == 0:
             return {int(nid): 1 for nid in nodes}
-        concat_neighbors = np.empty(indptr[-1], dtype=np.int64)
-        pos = 0
-        for nid in nodes:
-            arr = conmap[int(nid)]
-            ln = len(arr)
-            concat_neighbors[pos:pos + ln] = arr
-            pos += ln
-        id2idx = {int(v): i for i, v in enumerate(nodes.tolist())}
-        indices = fastremap.remap(concat_neighbors, id2idx, preserve_missing_labels=False).astype(np.int32, copy=False)
-        unique_src = nodes
     else:
         pairs = np.asarray(conmap, dtype=np.int64)
         if pairs.size == 0:
             return {}
-        unique_src, indptr, indices = build_csr_from_pairs(pairs)
-        nodes = unique_src
+        nodes, indptr, indices = _build_csr_from_pairs(pairs)
 
-    N = unique_src.size
+    N = nodes.size
+    colors = _experimental_color_from_order(indptr, indices, n, verbose=verbose)
+    if colors is None:
+        if verbose:
+            print("Experimental solver failed, falling back to CSR/DSATUR.")
+        # Fall back to the stable baseline solver for full coverage.
+        return render_net(conmap, n=n, rand=rand, depth=depth, max_depth=max_depth, offset=offset, verbose=verbose)
+
+    return {int(nodes[i]): int(colors[i]) for i in range(N)}
+
+
+def render_net(conmap, n=4, rand=0, depth=0, max_depth=5, offset=0, verbose=False):
+    """
+    Fast DSATUR-style coloring on CSR without post cleanup.
+    """
+    if isinstance(conmap, dict):
+        if verbose:
+            print("using dict")
+        if len(conmap) == 0:
+            return {}
+        nodes, indptr, indices = _csr_from_dict(conmap)
+        if indptr[-1] == 0:
+            return {int(nid): 1 for nid in nodes}
+    else:
+        pairs = np.asarray(conmap, dtype=np.int64)
+        if pairs.size == 0:
+            return {}
+        nodes, indptr, indices = _build_csr_from_pairs(pairs)
+
+    N = nodes.size
     colors = np.zeros(N, np.uint8)
     sat_mask = np.zeros(N, np.uint64)
     degrees = indptr[1:] - indptr[:-1]
 
-    import heapq
     heap = []
     for i in range(N):
         heapq.heappush(heap, (-0, -int(degrees[i]), i))
