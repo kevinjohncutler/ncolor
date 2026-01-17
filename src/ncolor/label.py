@@ -48,6 +48,23 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
     #     lab = format_labels(lab)
 
     if verbose: print('verbose')
+    # Use label_old as the default solver.
+    if not greedy and not experimental:
+        from . import label_old as label_old_impl
+        if expand:
+            if isinstance(expand, str) and expand.lower() in ("fast", "wave", "approx", "wavefront"):
+                lab_exp = expand_labels_wavefront(lab, conn=2)
+            else:
+                lab_exp = expand_labels(lab)
+        else:
+            lab_exp = lab
+        colored = label_old_impl.label(lab_exp, n=n, conn=conn, max_depth=max_depth, offset=offset)
+        if expand:
+            colored = colored * (lab != 0)
+        if return_n:
+            return colored, int(colored.max())
+        return colored
+
     pad = 1
     unpad = tuple([slice(pad,-pad)]*lab.ndim)
     mask = lab!=0
@@ -65,7 +82,11 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
             else:
                 lab = expand_labels(lab)
         # lab = np.pad(format_labels(lab),pad)
-        lab = format_labels(np.pad(lab,pad),background=0) # is this necessary? 
+        lab_padded = np.pad(lab, pad)
+        if np.issubdtype(lab_padded.dtype, np.integer) and lab_padded.min() == 0 and is_sequential(lab_padded):
+            lab = lab_padded.astype(np.int32, copy=False)
+        else:
+            lab = format_labels(lab_padded, background=0)
         lut = get_lut(lab,n,conn,max_depth,offset,greedy, experimental, verbose)
         
         ncl = lut[lab][unpad]*mask
@@ -93,9 +114,15 @@ def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False, experimental=
         conmap = mapidx(pairs)
         colors = greedy_coloring(conmap)
     else:
-        colors = render_net(pairs, n=n, rand=0, max_depth=max_depth, offset=offset, verbose=verbose)
-        if colors is None:
-            raise ValueError(f"Failed to color the labels with {n} colors. Try increasing n or max_depth.")
+        try:
+            from . import label_experimental_archive as archive
+            colors = archive.render_net_experimental_cccsr(
+                pairs, n=n, rand=0, max_depth=max_depth, offset=offset, verbose=verbose
+            )
+        except Exception:
+            colors = render_net(pairs, n=n, rand=0, max_depth=max_depth, offset=offset, verbose=verbose)
+            if colors is None:
+                raise ValueError(f"Failed to color the labels with {n} colors. Try increasing n or max_depth.")
 
     lut = np.ones(lab.max() + 1, dtype=np.uint8)
     for i in colors:
