@@ -1,4 +1,4 @@
-[![PyPI version](https://badge.fury.io/py/ncolor.svg)](https://badge.fury.io/py/ncolor)
+[![PyPI version](https://img.shields.io/pypi/v/ncolor.svg?color=green)](https://pypi.org/project/ncolor/)
 [![Downloads](https://static.pepy.tech/personalized-badge/ncolor?period=total&units=international_system&left_color=grey&right_color=green&left_text=Downloads)](https://pepy.tech/project/ncolor)
 [![Tests](badges/tests.svg)](badges/tests.svg)
 [![Coverage](badges/coverage.svg)](badges/coverage.svg)
