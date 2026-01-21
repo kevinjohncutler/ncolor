@@ -40,7 +40,7 @@ def unique_nonzero(labels):
 #         return np.array([0])
 
 
-def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=None, return_n=False, greedy=False, experimental=False, verbose=False, check_conflicts=False, return_conflicts=False):
+def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False, greedy=False, experimental=False, verbose=False, check_conflicts=False, return_conflicts=False):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
     # puts it into the smallest datatype to save space
