@@ -40,7 +40,7 @@ def unique_nonzero(labels):
 #         return np.array([0])
 
 
-def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, greedy=False, experimental=False, verbose=False):
+def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=None, return_n=False, greedy=False, experimental=False, verbose=False, check_conflicts=False, return_conflicts=False):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
     # puts it into the smallest datatype to save space
@@ -48,7 +48,7 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
     #     lab = format_labels(lab)
 
     if verbose: print('verbose')
-    # Use label_old as the default solver.
+    # Use label_old as the default solver (legacy fast path).
     if not greedy and not experimental:
         from . import label_old as label_old_impl
         if expand:
@@ -58,13 +58,27 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
                 lab_exp = expand_labels(lab)
         else:
             lab_exp = lab
-        colored = label_old_impl.label(lab_exp, n=n, conn=conn, max_depth=max_depth, offset=offset)
-        if expand:
-            colored = colored * (lab != 0)
+        colored_exp = label_old_impl.label(lab_exp, n=n, conn=conn, max_depth=max_depth, offset=offset)
+        if colored_exp is None:
+            raise ValueError("label_old failed to produce a valid coloring.")
+        colored = colored_exp * (lab != 0) if expand else colored_exp
+        conflicts = 0
+        if check_conflicts or return_conflicts:
+            lab_fmt = format_labels(lab_exp).astype(np.int32)
+            pairs = connect(lab_fmt, conn)
+            if pairs.size:
+                lut = np.zeros(lab_fmt.max() + 1, dtype=colored_exp.dtype)
+                lut[lab_fmt] = colored_exp
+                conflicts = int(np.count_nonzero(lut[pairs[:, 0]] == lut[pairs[:, 1]]))
+            if check_conflicts and conflicts:
+                raise ValueError(f"Coloring conflict detected: {conflicts} adjacent pairs share a color.")
+        if return_n and return_conflicts:
+            return colored, int(colored.max()), conflicts
         if return_n:
             return colored, int(colored.max())
+        if return_conflicts:
+            return colored, conflicts
         return colored
-
     pad = 1
     unpad = tuple([slice(pad,-pad)]*lab.ndim)
     mask = lab!=0
@@ -74,6 +88,7 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
     if unique.size==1:
         ncl = mask.astype(int)
         nc = 1
+        conflicts = 0
     else:
         # Expand only when explicitly requested
         if expand:
@@ -88,17 +103,33 @@ def label(lab, n=4, conn=2, max_depth=5, offset=0, expand=None, return_n=False, 
         else:
             lab = format_labels(lab_padded, background=0)
         lut = get_lut(lab,n,conn,max_depth,offset,greedy, experimental, verbose)
-        
+
+        conflicts = 0
+        if check_conflicts or return_conflicts:
+            pairs = connect(lab, conn)
+            if pairs.size:
+                a = pairs[:, 0]
+                b = pairs[:, 1]
+                conflicts = int(np.count_nonzero(lut[a] == lut[b]))
+            if check_conflicts and conflicts:
+                raise ValueError(f"Coloring conflict detected: {conflicts} adjacent pairs share a color.")
+
         ncl = lut[lab][unpad]*mask
         nc = np.max(lut)
     
-    if return_n: 
+    if return_n and return_conflicts:
+        return ncl, nc, conflicts
+    if return_n:
         return ncl, nc
-    else:    
-        return ncl
+    if return_conflicts:
+        return ncl, conflicts
+    return ncl
 
-def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False, experimental=False, verbose=False):
-    lab = format_labels(lab).astype(np.int32)
+def get_lut(lab, n=4, conn=2, max_depth=30, offset=0, greedy=False, experimental=False, verbose=False):
+    if np.issubdtype(lab.dtype, np.integer) and lab.min() == 0 and is_sequential(lab):
+        lab = lab.astype(np.int32, copy=False)
+    else:
+        lab = format_labels(lab).astype(np.int32)
 
     pairs = connect(lab, conn)
 
@@ -114,15 +145,13 @@ def get_lut(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False, experimental=
         conmap = mapidx(pairs)
         colors = greedy_coloring(conmap)
     else:
-        try:
-            from . import label_experimental_archive as archive
-            colors = archive.render_net_experimental_cccsr(
-                pairs, n=n, rand=0, max_depth=max_depth, offset=offset, verbose=verbose
-            )
-        except Exception:
-            colors = render_net(pairs, n=n, rand=0, max_depth=max_depth, offset=offset, verbose=verbose)
-            if colors is None:
-                raise ValueError(f"Failed to color the labels with {n} colors. Try increasing n or max_depth.")
+        conmap = mapidx(pairs)
+        colors = _render_net_legacy(conmap, n=n, rand=10, max_depth=max_depth, offset=offset)
+        if colors is None:
+            raise ValueError(f"Failed to color the labels with {n} colors. Try increasing n or max_depth.")
+        colors = _legacy_color_with_repairs(pairs, colors, n, max_depth)
+        if colors is None:
+            raise ValueError(f"Failed to repair legacy coloring with {n} colors. Try increasing n or max_depth.")
 
     lut = np.ones(lab.max() + 1, dtype=np.uint8)
     for i in colors:
@@ -573,6 +602,22 @@ def _csr_color_with_repairs(indptr, indices, n, max_depth=5, verbose=False):
     return colors
 
 
+def _legacy_color_with_repairs(pairs, colors, n, max_depth):
+    nodes, indptr, indices = _build_csr_from_pairs(pairs)
+    if nodes.size == 0:
+        return {}
+    color_arr = np.zeros(nodes.size, dtype=np.uint8)
+    for i, node in enumerate(nodes):
+        color_arr[i] = np.uint8(colors.get(int(node), 0))
+    color_arr, conflict = _repair_coloring(indptr, indices, color_arr, n, max_passes=max(4, max_depth))
+    needs_repair = conflict or (color_arr == 0).any()
+    if needs_repair:
+        color_arr, conflict = _kempe_repair_csr(indptr, indices, color_arr, n, max_passes=max(2, max_depth))
+        needs_repair = conflict or (color_arr == 0).any()
+    if needs_repair:
+        return None
+    return {int(nodes[i]): int(color_arr[i]) for i in range(nodes.size)}
+
 def _build_csr_from_pairs(pairs_arr):
     pairs_sym = np.vstack((pairs_arr, pairs_arr[:, [1, 0]]))
     order = np.argsort(pairs_sym[:, 0], kind='mergesort')
@@ -724,6 +769,41 @@ def render_net_experimental(conmap, n=4, rand=0, depth=0, max_depth=5, offset=0,
 
     return {int(nodes[i]): int(colors[i]) for i in range(N)}
 
+
+def _render_net_legacy(conmap, n=4, rand=12, depth=0, max_depth=30, offset=0):
+    node_count = len(conmap)
+    thresh = max(10000, node_count * 20)
+    if depth < max_depth:
+        nodes = sorted(conmap.keys())
+        rng = np.random.default_rng(depth + 1 + offset)
+        rng.shuffle(nodes)
+        colors = dict(zip(nodes, [0] * len(nodes)))
+        counter = dict(zip(nodes, [0] * len(nodes)))
+        count = 0
+        while len(nodes) > 0 and count < thresh:
+            count += 1
+            k = nodes.pop(0)
+            counter[k] += 1
+            hist = [1e4] + [0] * n
+            for p in conmap[k]:
+                hist[colors[p]] += 1
+            if min(hist) == 0:
+                colors[k] = hist.index(min(hist))
+                counter[k] = 0
+                continue
+            hist[colors[k]] = 1e4
+            minc = hist.index(min(hist))
+            if counter[k] == rand:
+                counter[k] = 0
+                minc = int(rng.integers(1, n + 1))
+            colors[k] = minc
+            for p in conmap[k]:
+                if colors[p] == minc:
+                    nodes.append(p)
+        if count == thresh:
+            return _render_net_legacy(conmap, n + 1, rand, depth + 1, max_depth, offset)
+        return colors
+    return None
 
 def render_net(conmap, n=4, rand=0, depth=0, max_depth=5, offset=0, verbose=False):
     """
