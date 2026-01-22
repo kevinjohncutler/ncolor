@@ -40,7 +40,7 @@ def unique_nonzero(labels):
 #         return np.array([0])
 
 
-def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False, greedy=False, experimental=False, verbose=False, check_conflicts=False, return_conflicts=False):
+def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False, greedy=False, experimental=False, verbose=False, check_conflicts=False, return_conflicts=False, format_input=True):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
     # puts it into the smallest datatype to save space
@@ -48,30 +48,19 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False,
     #     lab = format_labels(lab)
 
     if verbose: print('verbose')
-    # Use label_old as the default solver (legacy fast path).
+    # Use the default solver (legacy fast path).
     if not greedy and not experimental:
-        from . import label_old as label_old_impl
-        if expand:
-            if isinstance(expand, str) and expand.lower() in ("fast", "wave", "approx", "wavefront"):
-                lab_exp = expand_labels_wavefront(lab, conn=2)
-            else:
-                lab_exp = expand_labels(lab)
-        else:
-            lab_exp = lab
-        colored_exp = label_old_impl.label(lab_exp, n=n, conn=conn, max_depth=max_depth, offset=offset)
-        if colored_exp is None:
-            raise ValueError("label_old failed to produce a valid coloring.")
-        colored = colored_exp * (lab != 0) if expand else colored_exp
-        conflicts = 0
-        if check_conflicts or return_conflicts:
-            lab_fmt = format_labels(lab_exp).astype(np.int32)
-            pairs = connect(lab_fmt, conn)
-            if pairs.size:
-                lut = np.zeros(lab_fmt.max() + 1, dtype=colored_exp.dtype)
-                lut[lab_fmt] = colored_exp
-                conflicts = int(np.count_nonzero(lut[pairs[:, 0]] == lut[pairs[:, 1]]))
-            if check_conflicts and conflicts:
-                raise ValueError(f"Coloring conflict detected: {conflicts} adjacent pairs share a color.")
+        colored, conflicts = _label_default(
+            lab,
+            n=n,
+            conn=conn,
+            max_depth=max_depth,
+            offset=offset,
+            expand=expand,
+            format_input=format_input,
+            check_conflicts=check_conflicts,
+            return_conflicts=return_conflicts,
+        )
         if return_n and return_conflicts:
             return colored, int(colored.max()), conflicts
         if return_n:
@@ -124,6 +113,73 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False,
     if return_conflicts:
         return ncl, conflicts
     return ncl
+
+def _label_default(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, format_input=True, check_conflicts=False, return_conflicts=False):
+    if expand:
+        if isinstance(expand, str) and expand.lower() in ("fast", "wave", "approx", "wavefront"):
+            lab_exp = expand_labels_wavefront(lab, conn=2)
+        else:
+            lab_exp = expand_labels(lab)
+    else:
+        lab_exp = lab
+
+    colored_exp = _label_default_solver(lab_exp, n=n, conn=conn, max_depth=max_depth, offset=offset, format_input=format_input)
+    if colored_exp is None:
+        raise ValueError("Default solver failed to produce a valid coloring.")
+    colored = colored_exp * (lab != 0) if expand else colored_exp
+
+    conflicts = 0
+    if check_conflicts or return_conflicts:
+        lab_fmt = format_labels(lab_exp).astype(np.int32) if format_input else lab_exp.astype(np.int32, copy=False)
+        pairs = connect(lab_fmt, conn)
+        if pairs.size:
+            lut = np.zeros(lab_fmt.max() + 1, dtype=colored_exp.dtype)
+            lut[lab_fmt] = colored_exp
+            conflicts = int(np.count_nonzero(lut[pairs[:, 0]] == lut[pairs[:, 1]]))
+        if check_conflicts and conflicts:
+            raise ValueError(f"Coloring conflict detected: {conflicts} adjacent pairs share a color.")
+
+    return colored, conflicts
+
+
+def _label_default_solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
+    lab = format_labels(lab).astype(np.int32) if format_input else lab.astype(np.int32, copy=False)
+    idx = connect(lab, conn)
+    max_label = int(lab.max())
+    if idx.size == 0:
+        lut = np.ones(max_label + 1, dtype=np.uint8)
+        lut[0] = 0
+        return lut[lab]
+    nodes, indptr, indices = _build_csr_from_pairs(idx)
+    if nodes.size == 0:
+        lut = np.ones(max_label + 1, dtype=np.uint8)
+        lut[0] = 0
+        return lut[lab]
+
+    attempts_per_n = 4
+    cur_n = int(n)
+    max_iter = max((indices.size + int(indptr.size)) * max_depth, 512)
+    for _ in range(max_depth):
+        for attempt in range(attempts_per_n):
+            attempt_offset = offset + attempt
+            colors, unfinished = _color_graph_csr_legacy(indptr, indices, cur_n, rand=10, offset=attempt_offset, max_iter=max_iter)
+            needs_repair = unfinished or (colors == 0).any()
+            if needs_repair:
+                colors, conflict = _repair_coloring(indptr, indices, colors, cur_n, max_passes=max(4, max_depth))
+                needs_repair = conflict or (colors == 0).any()
+            if needs_repair:
+                colors, conflict = _kempe_repair_csr(indptr, indices, colors, cur_n, max_passes=max(2, max_depth))
+                needs_repair = conflict or (colors == 0).any()
+            if not needs_repair:
+                if _has_conflict_csr(indptr, indices, colors):
+                    continue
+                lut = np.ones(max_label + 1, dtype=np.uint8)
+                lut[nodes] = colors
+                lut[0] = 0
+                return lut[lab]
+        cur_n += 1
+    return None
+
 
 def get_lut(lab, n=4, conn=2, max_depth=30, offset=0, greedy=False, experimental=False, verbose=False):
     if np.issubdtype(lab.dtype, np.integer) and lab.min() == 0 and is_sequential(lab):
@@ -366,6 +422,104 @@ def _color_graph_csr(indptr, indices, n, rand, max_iter):
                     tail += 1
 
     return colors, (head < tail)
+
+
+@njit(cache=True)
+def _color_graph_csr_legacy(indptr, indices, n, rand, offset, max_iter):
+    N = indptr.size - 1
+    colors = np.zeros(N, np.uint8)
+    counter = np.zeros(N, np.int32)
+
+    qcap = max(indices.size + N, N * 8, 1)
+    q = np.empty(qcap, np.int32)
+    head = 0
+    tail = N
+    for i in range(N):
+        q[i] = i
+
+    fullmask = (1 << (n + 1)) - 2
+    count = 0
+    while head < tail and count < max_iter:
+        u = q[head]
+        head += 1
+        count += 1
+        counter[u] += 1
+
+        row_beg = indptr[u]
+        row_end = indptr[u + 1]
+        mask = 0
+        all_present = False
+        for k in range(row_beg, row_end):
+            cv = colors[indices[k]]
+            if cv != 0:
+                mask |= (1 << cv)
+                if mask == fullmask:
+                    all_present = True
+                    break
+
+        if not all_present:
+            csel = 0
+            for c in range(1, n + 1):
+                if (mask & (1 << c)) == 0:
+                    csel = c
+                    break
+            counter[u] = 0
+        else:
+            cnt = np.zeros(n + 1, np.int32)
+            for k in range(row_beg, row_end):
+                cv = colors[indices[k]]
+                if cv != 0:
+                    cnt[cv] += 1
+            csel = 1
+            minv = cnt[1]
+            cu = colors[u]
+            if cu != 0:
+                minv = 2147483647
+            for c in range(1, n + 1):
+                if c == cu:
+                    continue
+                if cnt[c] < minv:
+                    minv = cnt[c]
+                    csel = c
+
+            if rand > 0 and counter[u] == rand:
+                counter[u] = 0
+                seed = (1103515245 * (u + count + offset) + 12345) & 0x7FFFFFFF
+                csel = 1 + (seed % n)
+
+        if colors[u] != csel:
+            colors[u] = csel
+            for k in range(row_beg, row_end):
+                v = indices[k]
+                if colors[v] == csel:
+                    if tail >= qcap:
+                        newcap = max(qcap * 2, tail + 1)
+                        q_new = np.empty(newcap, np.int32)
+                        q_new[:tail] = q[:tail]
+                        q = q_new
+                        qcap = newcap
+                    q[tail] = v
+                    tail += 1
+
+    return colors, (head < tail)
+
+
+@njit(cache=True)
+def _has_conflict_csr(indptr, indices, colors):
+    N = indptr.size - 1
+    for u in range(N):
+        cu = colors[u]
+        if cu == 0:
+            continue
+        row_beg = indptr[u]
+        row_end = indptr[u + 1]
+        for k in range(row_beg, row_end):
+            v = indices[k]
+            if v == u:
+                continue
+            if colors[v] == cu:
+                return True
+    return False
 
 
 @njit(cache=True)
@@ -938,6 +1092,73 @@ def expand_labels_wavefront(label_image, conn=2):
 
 
 #################### experiments
+def _label_default(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, format_input=True, check_conflicts=False, return_conflicts=False):
+    if expand:
+        if isinstance(expand, str) and expand.lower() in ("fast", "wave", "approx", "wavefront"):
+            lab_exp = expand_labels_wavefront(lab, conn=2)
+        else:
+            lab_exp = expand_labels(lab)
+    else:
+        lab_exp = lab
+
+    colored_exp = _label_default_solver(lab_exp, n=n, conn=conn, max_depth=max_depth, offset=offset, format_input=format_input)
+    if colored_exp is None:
+        raise ValueError("Default solver failed to produce a valid coloring.")
+    colored = colored_exp * (lab != 0) if expand else colored_exp
+
+    conflicts = 0
+    if check_conflicts or return_conflicts:
+        lab_fmt = format_labels(lab_exp).astype(np.int32) if format_input else lab_exp.astype(np.int32, copy=False)
+        pairs = connect(lab_fmt, conn)
+        if pairs.size:
+            lut = np.zeros(lab_fmt.max() + 1, dtype=colored_exp.dtype)
+            lut[lab_fmt] = colored_exp
+            conflicts = int(np.count_nonzero(lut[pairs[:, 0]] == lut[pairs[:, 1]]))
+        if check_conflicts and conflicts:
+            raise ValueError(f"Coloring conflict detected: {conflicts} adjacent pairs share a color.")
+
+    return colored, conflicts
+
+
+def _label_default_solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
+    lab = format_labels(lab).astype(np.int32) if format_input else lab.astype(np.int32, copy=False)
+    idx = connect(lab, conn)
+    max_label = int(lab.max())
+    if idx.size == 0:
+        lut = np.ones(max_label + 1, dtype=np.uint8)
+        lut[0] = 0
+        return lut[lab]
+    nodes, indptr, indices = _build_csr_from_pairs(idx)
+    if nodes.size == 0:
+        lut = np.ones(max_label + 1, dtype=np.uint8)
+        lut[0] = 0
+        return lut[lab]
+
+    attempts_per_n = 4
+    cur_n = int(n)
+    max_iter = max((indices.size + int(indptr.size)) * max_depth, 512)
+    for _ in range(max_depth):
+        for attempt in range(attempts_per_n):
+            attempt_offset = offset + attempt
+            colors, unfinished = _color_graph_csr_legacy(indptr, indices, cur_n, rand=10, offset=attempt_offset, max_iter=max_iter)
+            needs_repair = unfinished or (colors == 0).any()
+            if needs_repair:
+                colors, conflict = _repair_coloring(indptr, indices, colors, cur_n, max_passes=max(4, max_depth))
+                needs_repair = conflict or (colors == 0).any()
+            if needs_repair:
+                colors, conflict = _kempe_repair_csr(indptr, indices, colors, cur_n, max_passes=max(2, max_depth))
+                needs_repair = conflict or (colors == 0).any()
+            if not needs_repair:
+                if _has_conflict_csr(indptr, indices, colors):
+                    continue
+                lut = np.ones(max_label + 1, dtype=np.uint8)
+                lut[nodes] = colors
+                lut[0] = 0
+                return lut[lab]
+        cur_n += 1
+    return None
+
+
 def get_lut_expanded(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False, verbose=False):
     """
     Compute a color LUT as if labels were expanded into background, without
@@ -1040,6 +1261,73 @@ def get_lut_expanded(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False, verb
         lut[i] = colors[i]
     lut[0] = 0
     return lut
+
+
+def _label_default(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, format_input=True, check_conflicts=False, return_conflicts=False):
+    if expand:
+        if isinstance(expand, str) and expand.lower() in ("fast", "wave", "approx", "wavefront"):
+            lab_exp = expand_labels_wavefront(lab, conn=2)
+        else:
+            lab_exp = expand_labels(lab)
+    else:
+        lab_exp = lab
+
+    colored_exp = _label_default_solver(lab_exp, n=n, conn=conn, max_depth=max_depth, offset=offset, format_input=format_input)
+    if colored_exp is None:
+        raise ValueError("Default solver failed to produce a valid coloring.")
+    colored = colored_exp * (lab != 0) if expand else colored_exp
+
+    conflicts = 0
+    if check_conflicts or return_conflicts:
+        lab_fmt = format_labels(lab_exp).astype(np.int32) if format_input else lab_exp.astype(np.int32, copy=False)
+        pairs = connect(lab_fmt, conn)
+        if pairs.size:
+            lut = np.zeros(lab_fmt.max() + 1, dtype=colored_exp.dtype)
+            lut[lab_fmt] = colored_exp
+            conflicts = int(np.count_nonzero(lut[pairs[:, 0]] == lut[pairs[:, 1]]))
+        if check_conflicts and conflicts:
+            raise ValueError(f"Coloring conflict detected: {conflicts} adjacent pairs share a color.")
+
+    return colored, conflicts
+
+
+def _label_default_solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
+    lab = format_labels(lab).astype(np.int32) if format_input else lab.astype(np.int32, copy=False)
+    idx = connect(lab, conn)
+    max_label = int(lab.max())
+    if idx.size == 0:
+        lut = np.ones(max_label + 1, dtype=np.uint8)
+        lut[0] = 0
+        return lut[lab]
+    nodes, indptr, indices = _build_csr_from_pairs(idx)
+    if nodes.size == 0:
+        lut = np.ones(max_label + 1, dtype=np.uint8)
+        lut[0] = 0
+        return lut[lab]
+
+    attempts_per_n = 4
+    cur_n = int(n)
+    max_iter = max((indices.size + int(indptr.size)) * max_depth, 512)
+    for _ in range(max_depth):
+        for attempt in range(attempts_per_n):
+            attempt_offset = offset + attempt
+            colors, unfinished = _color_graph_csr_legacy(indptr, indices, cur_n, rand=10, offset=attempt_offset, max_iter=max_iter)
+            needs_repair = unfinished or (colors == 0).any()
+            if needs_repair:
+                colors, conflict = _repair_coloring(indptr, indices, colors, cur_n, max_passes=max(4, max_depth))
+                needs_repair = conflict or (colors == 0).any()
+            if needs_repair:
+                colors, conflict = _kempe_repair_csr(indptr, indices, colors, cur_n, max_passes=max(2, max_depth))
+                needs_repair = conflict or (colors == 0).any()
+            if not needs_repair:
+                if _has_conflict_csr(indptr, indices, colors):
+                    continue
+                lut = np.ones(max_label + 1, dtype=np.uint8)
+                lut[nodes] = colors
+                lut[0] = 0
+                return lut[lab]
+        cur_n += 1
+    return None
 
 
 def get_lut_expanded_components(lab, n=4, conn=2, max_depth=5, offset=0, greedy=False):
