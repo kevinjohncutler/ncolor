@@ -73,11 +73,11 @@ def generate_mask(kind):
 # -------- parametrised test ------------------------------------------------
 
 @pytest.mark.parametrize("mask_kind", ["example", "empty", "single", "two_disjoint", "memmap", "disjoint_same"])
-@pytest.mark.parametrize("expand, greedy, return_n", list(itertools.product([0, 1], [0, 1], [0, 1])))
-def test_ncolor_all_variants(mask_kind, expand, greedy, return_n):
+@pytest.mark.parametrize("expand, return_n", list(itertools.product([0, 1], [0, 1])))
+def test_ncolor_all_variants(mask_kind, expand, return_n):
     masks = generate_mask(mask_kind)
     # call ncolor.label; when return_n is True it returns (masks, n_colors)
-    result = ncolor.label(masks, expand=expand, greedy=greedy, return_n=return_n)
+    result = ncolor.label(masks, expand=expand, return_n=return_n)
     if return_n:
         ncolor_masks, nc = result
     else:
@@ -88,6 +88,12 @@ def test_ncolor_all_variants(mask_kind, expand, greedy, return_n):
     assert ncolor_masks.dtype.kind in "iu"           # integer type
     
     
+def test_ncolor_no_conflicts_example_expand():
+    masks = generate_mask("example")
+    # Ensure expanded adjacency has no color conflicts.
+    ncolor.label(masks, expand=True, check_conflicts=True)
+
+
 # may not be needed, used in ncolor.label 
 # def test_unique_nonzero():
 #     masks = generate_mask("example")   # simple single‑object case
