@@ -41,13 +41,20 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False,
     else:
         lab_exp = lab
 
+    # Pre-format once here so _solver doesn't duplicate the work and the
+    # lut-building branch below can reuse the same formatted array.
+    if format_input:
+        lab_fmt = format_labels(lab_exp).astype(np.int32)
+    else:
+        lab_fmt = lab_exp.astype(np.int32, copy=False)
+
     colored_expanded = _solver(
-        lab_exp,
+        lab_fmt,
         n=n,
         conn=conn,
         max_depth=max_depth,
         offset=offset,
-        format_input=format_input,
+        format_input=False,  # already formatted above
     )
     if colored_expanded is None:
         raise ValueError("Default solver failed to produce a valid coloring.")
@@ -56,7 +63,6 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False,
     conflicts = 0
     lut = None
     if check_conflicts or return_conflicts or return_lut:
-        lab_fmt = format_labels(lab_exp).astype(np.int32) if format_input else lab_exp.astype(np.int32, copy=False)
         lut = np.zeros(lab_fmt.max() + 1, dtype=colored_expanded.dtype)
         lut[lab_fmt] = colored_expanded
         if check_conflicts or return_conflicts:
@@ -168,7 +174,6 @@ def neighbors(shape, conn=1, unique=True):
 
 
 
-# @njit(fastmath=True, cache=True)
 @njit(cache=True)
 def search(img, nbs):
     line = img.ravel()
@@ -430,8 +435,7 @@ def _kempe_repair_csr(indptr, indices, colors, n, max_passes=2):
                     continue
 
                 # BFS in {cu, a} starting from u
-                for i in range(N):
-                    visited[i] = 0
+                # visited is clean on entry (reset after previous BFS)
                 head = 0
                 tail = 0
                 q[tail] = u
@@ -462,6 +466,10 @@ def _kempe_repair_csr(indptr, indices, colors, n, max_passes=2):
                                 break
                     if reachable_conf:
                         break
+
+                # Reset only the nodes we actually visited (O(visited) not O(N))
+                for k in range(tail):
+                    visited[q[k]] = 0
 
                 if reachable_conf:
                     continue
@@ -512,8 +520,9 @@ def _build_csr_from_pairs(pairs_arr):
     indptr = np.empty(N + 1, dtype=np.int32)
     indptr[0] = 0
     np.cumsum(counts, out=indptr[1:])
-    id2idx = {int(v): i for i, v in enumerate(unique_src.tolist())}
-    indices = fastremap.remap(dst, id2idx, preserve_missing_labels=False).astype(np.int32, copy=False)
+    # fastremap.unique returns sorted values; searchsorted maps dst→node index
+    # in pure C with no Python-object overhead, replacing the dict+remap path.
+    indices = np.searchsorted(unique_src, dst).astype(np.int32)
     return unique_src, indptr, indices
 
 
@@ -522,10 +531,11 @@ def expand_labels(label_image):
     Sped-up version of the scikit-image function just by dropping the distance thresholding. 
     Here we expand the labels into every background pixel. Can be over 40% faster. 
     """
-    nearest_label_coords = distance_transform_edt(label_image==0, 
-                                                  return_distances=False, 
+    nearest_label_coords = distance_transform_edt(label_image==0,
+                                                  return_distances=False,
                                                   return_indices=True)
     return label_image[tuple(nearest_label_coords)]
+    # return edt.expand_labels(label_image, parallel=N).astype(label_image.dtype)
     
     
 @njit(cache=True)
