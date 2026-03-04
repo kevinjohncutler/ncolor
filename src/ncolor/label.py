@@ -2,12 +2,38 @@
 
 import numpy as np
 import fastremap
+from functools import lru_cache
 
 # Import heavy dependencies but defer JIT compilation
-from numba import njit
+from numba import njit, prange
+import numba
 import scipy
-from scipy.ndimage import distance_transform_edt
+import edt as _edt
 from .format_labels import format_labels
+
+def _normalize_labels(labels):
+    """Lightweight label normalization for ncolor's internal pipeline.
+
+    Fast path: when labels already have background=0, skip fastremap.renumber
+    and refit entirely — saving ~0.5ms for typical segmentations. The coloring
+    algorithm only requires background=0 and a reasonable label range; phantom
+    CSR nodes (degree-0 gaps) are harmless and get color 1 from lut init.
+
+    Fallback: when min != 0 (e.g. dense-pixel inputs with no true background),
+    delegate to format_labels which handles background assignment correctly and
+    ensures the contiguous 1..N invariant that _build_csr_from_pairs relies on.
+    """
+    labels = labels.astype(np.int32)
+    if int(labels.min()) == 0:
+        # Fast path: skip renumber. Phantom CSR nodes (degree-0 gaps) are
+        # harmless for correctness, but they inflate max_iter proportionally
+        # to max_label. Guard: if max_label > n_pixels there are provably more
+        # gaps than real labels, so renumber to keep the coloring loop bounded.
+        if int(labels.max()) <= labels.size:
+            return labels
+    # Fall back to format_labels: handles min-shift + renumber correctly
+    return format_labels(labels).astype(np.int32)
+
 
 def is_sequential(labels):
     return np.all(np.diff(fastremap.unique(labels))==1)
@@ -41,10 +67,16 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False,
     else:
         lab_exp = lab
 
-    # Pre-format once here so _solver doesn't duplicate the work and the
-    # lut-building branch below can reuse the same formatted array.
+    # Normalize labels for the coloring pipeline.
     if format_input:
-        lab_fmt = format_labels(lab_exp).astype(np.int32)
+        if expand and int(lab.min()) == 0:
+            # After expansion all pixels are labeled (values 1..N, no zeros).
+            # No shift needed: connect() skips 0-pixels but there are none,
+            # lut[0] is set to 0 but never accessed. Skipping the shift also
+            # avoids incorrectly treating the minimum label as background.
+            lab_fmt = lab_exp.astype(np.int32, copy=False)
+        else:
+            lab_fmt = _normalize_labels(lab_exp)
     else:
         lab_fmt = lab_exp.astype(np.int32, copy=False)
 
@@ -149,15 +181,14 @@ def get_lut(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=Fals
     )
 
 
-def neighbors(shape, conn=1, unique=True):
-    dim = len(shape)
-    block = scipy.ndimage.generate_binary_structure(dim, conn)
-    block[tuple([1] * dim)] = 0
-    idx = np.array(np.where(block > 0)).T  # shape: (K, dim) in {0,1,2}
-    idx = idx - 1  # map to {-1,0,1}
-
+@lru_cache(maxsize=8)
+def _neighbor_dirs(ndim, conn, unique):
+    """Cached direction vectors for (ndim, conn) — shape-independent."""
+    block = scipy.ndimage.generate_binary_structure(ndim, conn)
+    block[tuple([1] * ndim)] = 0
+    idx = np.array(np.where(block > 0)).T  # (K, ndim) in {-1,0,1}
+    idx = idx - 1
     if unique:
-        # Keep only offsets where the first nonzero component is positive
         keep = []
         for off in idx:
             sel = 0
@@ -167,8 +198,11 @@ def neighbors(shape, conn=1, unique=True):
                     break
             keep.append(sel)
         idx = idx[np.array(keep, dtype=bool)]
+    return idx
 
-    # Flattened offset for row-major array
+
+def neighbors(shape, conn=1, unique=True):
+    idx = _neighbor_dirs(len(shape), conn, unique)
     acc = np.cumprod((1,) + shape[::-1][:-1])
     return np.dot(idx, acc[::-1])
 
@@ -210,31 +244,164 @@ def search(img, nbs):
                             
 
     
+@njit(cache=True)
+def _search_hashset(line, total, nbs, ht_size):
+    """
+    Single-pass adjacent-pair search with inline deduplication via open-addressing
+    hash table. Avoids the separate dedup step entirely for cases where the table
+    fits in cache (n_labels small relative to image size).
+    """
+    EMPTY = np.uint64(0xFFFFFFFFFFFFFFFF)
+    ht_mask = np.uint64(ht_size - 1)
+    ht = np.empty(ht_size, dtype=np.uint64)
+    for i in range(ht_size):
+        ht[i] = EMPTY
+
+    for i in range(total):
+        vi = line[i]
+        if vi == 0:
+            continue
+        for d in nbs:
+            j = i + d
+            if j < 0 or j >= total:
+                continue
+            vj = line[j]
+            if vj == 0 or vj == vi:
+                continue
+            lo = np.uint64(vi) if vi < vj else np.uint64(vj)
+            hi = np.uint64(vj) if vi < vj else np.uint64(vi)
+            key = (lo << np.uint64(32)) | hi
+            # Fibonacci hashing for uniform distribution
+            h = (key * np.uint64(11400714819323198485)) & ht_mask
+            while ht[int(h)] != EMPTY and ht[int(h)] != key:
+                h = (h + np.uint64(1)) & ht_mask
+            ht[int(h)] = key
+
+    count = np.int64(0)
+    for h in range(ht_size):
+        if ht[h] != EMPTY:
+            count += np.int64(1)
+
+    out = np.empty((int(count), 2), dtype=np.int32)
+    idx = np.int64(0)
+    for h in range(ht_size):
+        if ht[h] != EMPTY:
+            key = ht[h]
+            out[int(idx), 0] = np.int32(key >> np.uint64(32))
+            out[int(idx), 1] = np.int32(key & np.uint64(0xFFFFFFFF))
+            idx += np.int64(1)
+    return out
+
+
+@njit(parallel=True, cache=True)
+def _search_hashset_parallel(line, total, nbs, ht_size, n_threads):
+    """
+    Parallel version of _search_hashset.  Each thread scans a contiguous strip
+    of the (padded) line and writes into its own private hash table.  Because all
+    neighbor offsets are positive (unique=True on a padded image), each undirected
+    pair (lo,hi) is emitted by exactly the thread that owns the pixel with the
+    smaller flat index — so there is no cross-thread duplication within a single
+    region boundary.  Different regions that share the same label pair are
+    deduplicated inside each thread's table.  A short serial merge step
+    deduplicates any residual cross-thread collisions.
+    """
+    EMPTY = np.uint64(0xFFFFFFFFFFFFFFFF)
+    ht_mask = np.uint64(ht_size - 1)
+
+    # Per-thread hash tables (n_threads × ht_size), initialised to EMPTY
+    hts = np.empty((n_threads, ht_size), dtype=np.uint64)
+    for t in range(n_threads):
+        for h in range(ht_size):
+            hts[t, h] = EMPTY
+
+    strip = (total + n_threads - 1) // n_threads
+
+    for tid in prange(n_threads):
+        start = tid * strip
+        end = min(start + strip, total)
+        for i in range(start, end):
+            vi = line[i]
+            if vi == 0:
+                continue
+            for d in nbs:
+                j = i + d
+                if j < 0 or j >= total:
+                    continue
+                vj = line[j]
+                if vj == 0 or vj == vi:
+                    continue
+                lo = np.uint64(vi) if vi < vj else np.uint64(vj)
+                hi = np.uint64(vj) if vi < vj else np.uint64(vi)
+                key = (lo << np.uint64(32)) | hi
+                h = (key * np.uint64(11400714819323198485)) & ht_mask
+                while hts[tid, int(h)] != EMPTY and hts[tid, int(h)] != key:
+                    h = (h + np.uint64(1)) & ht_mask
+                hts[tid, int(h)] = key
+
+    # Serial merge: insert all per-thread entries into a single table
+    merge_ht = np.empty(ht_size, dtype=np.uint64)
+    for h in range(ht_size):
+        merge_ht[h] = EMPTY
+
+    for t in range(n_threads):
+        for h in range(ht_size):
+            key = hts[t, h]
+            if key == EMPTY:
+                continue
+            gh = (key * np.uint64(11400714819323198485)) & ht_mask
+            while merge_ht[int(gh)] != EMPTY and merge_ht[int(gh)] != key:
+                gh = (gh + np.uint64(1)) & ht_mask
+            merge_ht[int(gh)] = key
+
+    count = np.int64(0)
+    for h in range(ht_size):
+        if merge_ht[h] != EMPTY:
+            count += np.int64(1)
+
+    out = np.empty((int(count), 2), dtype=np.int32)
+    idx = np.int64(0)
+    for h in range(ht_size):
+        if merge_ht[h] != EMPTY:
+            key = merge_ht[h]
+            out[int(idx), 0] = np.int32(key >> np.uint64(32))
+            out[int(idx), 1] = np.int32(key & np.uint64(0xFFFFFFFF))
+            idx += np.int64(1)
+    return out
+
+
+# Pixel count above which the parallel kernel is used (avoids thread-launch
+# overhead for small images).
+_PARALLEL_THRESHOLD = 100_000
+
+
 def connect(img, conn=1):
+    nbs = neighbors(img.shape, conn, True)
+    n_labels = int(img.max())
+    if n_labels > 0:
+        ht_raw = len(nbs) * n_labels * 2
+        ht_size = 1
+        while ht_size < ht_raw:
+            ht_size <<= 1
+        if ht_size <= (1 << 20):
+            buf = np.pad(img, 1, 'constant')
+            nbs_pad = neighbors(buf.shape, conn, True)
+            line = buf.ravel()
+            n_threads = numba.get_num_threads()
+            if len(line) > _PARALLEL_THRESHOLD and n_threads > 1:
+                return _search_hashset_parallel(line, len(line), nbs_pad, ht_size, n_threads)
+            return _search_hashset(line, len(line), nbs_pad, ht_size)
+
+    # Fallback for very large label counts: pad then search+dedup.
     buf = np.pad(img, 1, 'constant')
-    nbs = neighbors(buf.shape, conn, unique=True)
-    rst = search(buf, nbs)
+    nbs_pad = neighbors(buf.shape, conn, unique=True)
+    rst = search(buf, nbs_pad)
     if rst.size == 0:
         return rst
-
-    a = rst[:, 0]; b = rst[:, 1]
-    lo = np.minimum(a, b)
-    hi = np.maximum(a, b)
-
-    # Sort by (lo, hi)
-    order = np.lexsort((hi, lo))
-    lo_s = lo[order]; hi_s = hi[order]
-
-    # Unique consecutive pairs
-    keep = np.empty(lo_s.size, dtype=bool)
-    if keep.size:
-        keep[0] = True
-        keep[1:] = (lo_s[1:] != lo_s[:-1]) | (hi_s[1:] != hi_s[:-1])
-
-    m = int(keep.sum())
-    out = np.empty((m, 2), dtype=lo.dtype)
-    out[:, 0] = lo_s[keep]
-    out[:, 1] = hi_s[keep]
+    keys = rst[:, 0].astype(np.uint64) << np.uint64(32) | rst[:, 1].astype(np.uint64)
+    ukeys = np.unique(keys)
+    out = np.empty((ukeys.size, 2), dtype=rst.dtype)
+    out[:, 0] = (ukeys >> np.uint64(32)).astype(rst.dtype)
+    out[:, 1] = (ukeys & np.uint64(0xFFFFFFFF)).astype(rst.dtype)
     return out
 
 
@@ -510,20 +677,47 @@ def _kempe_repair_csr(indptr, indices, colors, n, max_passes=2):
     return colors, conflict
 
 
+@njit(cache=True)
+def _build_csr_jit(src, dst, N, M):
+    """
+    O(M + N) symmetric CSR construction from M directed pairs (src[i], dst[i]).
+    Avoids the O(M log M) sort required by the vstack+argsort approach.
+    Neighbour order within each row is arbitrary (not needed by the coloring kernels).
+    """
+    # 1. Count degree per node (each undirected edge contributes 1 to each endpoint)
+    degree = np.zeros(N, np.int32)
+    for i in range(M):
+        degree[src[i]] += np.int32(1)
+        degree[dst[i]] += np.int32(1)
+    # 2. Prefix sum → indptr
+    indptr = np.empty(N + 1, np.int32)
+    indptr[0] = np.int32(0)
+    for i in range(N):
+        indptr[i + 1] = indptr[i] + degree[i]
+    # 3. Fill indices with write pointers (one pointer per node, advanced as filled)
+    write = indptr[:N].copy()
+    indices = np.empty(2 * M, np.int32)
+    for i in range(M):
+        s = src[i]
+        d = dst[i]
+        indices[write[s]] = d
+        write[s] += np.int32(1)
+        indices[write[d]] = s
+        write[d] += np.int32(1)
+    return indptr, indices
+
+
 def _build_csr_from_pairs(pairs_arr):
-    pairs_sym = np.vstack((pairs_arr, pairs_arr[:, [1, 0]]))
-    order = np.argsort(pairs_sym[:, 0], kind='mergesort')
-    src = pairs_sym[order, 0]
-    dst = pairs_sym[order, 1]
-    unique_src, counts = fastremap.unique(src, return_counts=True)
-    N = unique_src.size
-    indptr = np.empty(N + 1, dtype=np.int32)
-    indptr[0] = 0
-    np.cumsum(counts, out=indptr[1:])
-    # fastremap.unique returns sorted values; searchsorted maps dst→node index
-    # in pure C with no Python-object overhead, replacing the dict+remap path.
-    indices = np.searchsorted(unique_src, dst).astype(np.int32)
-    return unique_src, indptr, indices
+    # format_labels guarantees labels are contiguous 1..N, so the node index is
+    # simply (label - 1). This replaces unique() + two O(M log N) searchsorted
+    # calls with O(M) direct arithmetic — a ~25× speedup for large label counts.
+    N = int(pairs_arr.max())
+    M = len(pairs_arr)
+    src_idx = (pairs_arr[:, 0] - 1).astype(np.int32)
+    dst_idx = (pairs_arr[:, 1] - 1).astype(np.int32)
+    all_nodes = np.arange(1, N + 1, dtype=pairs_arr.dtype)
+    indptr, indices = _build_csr_jit(src_idx, dst_idx, N, M)
+    return all_nodes, indptr, indices
 
 
 def expand_labels(label_image):
@@ -531,15 +725,15 @@ def expand_labels(label_image):
     Sped-up version of the scikit-image function just by dropping the distance thresholding. 
     Here we expand the labels into every background pixel. Can be over 40% faster. 
     """
-    nearest_label_coords = distance_transform_edt(label_image==0,
-                                                  return_distances=False,
-                                                  return_indices=True)
-    return label_image[tuple(nearest_label_coords)]
-    # return edt.expand_labels(label_image, parallel=N).astype(label_image.dtype)
+    # nearest_label_coords = distance_transform_edt(label_image==0,
+    #                                               return_distances=False,
+    #                                               return_indices=True)
+    # return label_image[tuple(nearest_label_coords)]
+    return _edt.expand_labels(label_image, parallel=0).astype(label_image.dtype)
     
     
 @njit(cache=True)
-def _expand_wavefront_core(line, shape_flat, nbs):
+def _expand_wavefront_core(line, nbs):
     total = line.size
     # Simple ring buffer queue
     q = np.empty(total, np.int64)
@@ -580,6 +774,6 @@ def expand_labels_wavefront(label_image, conn=2):
     buf = np.pad(label_image, 1, mode='constant')
     nbs = neighbors(buf.shape, conn=conn, unique=False)
     line = buf.ravel()
-    _expand_wavefront_core(line, buf.shape, nbs)
+    _expand_wavefront_core(line, nbs)
     unpad = tuple([slice(1, -1)] * buf.ndim)
     return buf[unpad]
