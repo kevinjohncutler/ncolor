@@ -136,7 +136,9 @@ def _solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
 
     attempts_per_n = 4
     cur_n = int(n)
-    max_iter = max((indices.size + int(indptr.size)) * max_depth, 512)
+    # One O(M+N) pass is enough for convergence; extra iterations only help
+    # thrashing graphs (wrong n) burn more time — use early bailout instead.
+    max_iter = max(indices.size + int(indptr.size), 512)
     for _ in range(max_depth):
         for attempt in range(attempts_per_n):
             attempt_offset = offset + attempt
@@ -155,6 +157,10 @@ def _solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
                 lut[nodes] = colors
                 lut[0] = 0
                 return lut[lab]
+            # BFS hit max_iter AND all repair failed: n colors insufficient for
+            # this graph — more attempts with the same n won't help, bump n now.
+            if unfinished and needs_repair:
+                break
         cur_n += 1
     return None
 
@@ -308,15 +314,14 @@ def _search_hashset_parallel(line, total, nbs, ht_size, n_threads):
     EMPTY = np.uint64(0xFFFFFFFFFFFFFFFF)
     ht_mask = np.uint64(ht_size - 1)
 
-    # Per-thread hash tables (n_threads × ht_size), initialised to EMPTY
+    # Per-thread hash tables (n_threads × ht_size); each thread inits its own
+    # row in parallel so the memset is also distributed across cores.
     hts = np.empty((n_threads, ht_size), dtype=np.uint64)
-    for t in range(n_threads):
-        for h in range(ht_size):
-            hts[t, h] = EMPTY
-
     strip = (total + n_threads - 1) // n_threads
 
     for tid in prange(n_threads):
+        for h in range(ht_size):
+            hts[tid, h] = EMPTY
         start = tid * strip
         end = min(start + strip, total)
         for i in range(start, end):
