@@ -8,7 +8,9 @@ from functools import lru_cache
 from numba import njit, prange
 import numba
 import scipy
+import scipy.ndimage
 import edt as _edt
+_edt_has_expand = hasattr(_edt, 'expand_labels')
 from .format_labels import format_labels
 
 def _normalize_labels(labels):
@@ -120,6 +122,15 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False,
     return colored
 
 
+@njit(cache=True, parallel=True)
+def _apply_lut(flat_lab, lut):
+    """Parallel LUT gather: faster than NumPy fancy indexing for large arrays."""
+    out = np.empty(flat_lab.size, dtype=lut.dtype)
+    for i in prange(flat_lab.size):
+        out[i] = lut[flat_lab[i]]
+    return out
+
+
 def _solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
     lab = format_labels(lab).astype(np.int32) if format_input else lab.astype(np.int32, copy=False)
     idx = connect(lab, conn)
@@ -127,12 +138,12 @@ def _solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
     if idx.size == 0:
         lut = np.ones(max_label + 1, dtype=np.uint8)
         lut[0] = 0
-        return lut[lab]
+        return _apply_lut(lab.ravel(), lut).reshape(lab.shape)
     nodes, indptr, indices = _build_csr_from_pairs(idx)
     if nodes.size == 0:
         lut = np.ones(max_label + 1, dtype=np.uint8)
         lut[0] = 0
-        return lut[lab]
+        return _apply_lut(lab.ravel(), lut).reshape(lab.shape)
 
     attempts_per_n = 4
     cur_n = int(n)
@@ -156,7 +167,7 @@ def _solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
                 lut = np.ones(max_label + 1, dtype=np.uint8)
                 lut[nodes] = colors
                 lut[0] = 0
-                return lut[lab]
+                return _apply_lut(lab.ravel(), lut).reshape(lab.shape)
             # BFS hit max_iter AND all repair failed: n colors insufficient for
             # this graph — more attempts with the same n won't help, bump n now.
             if unfinished and needs_repair:
@@ -727,14 +738,16 @@ def _build_csr_from_pairs(pairs_arr):
 
 def expand_labels(label_image):
     """
-    Sped-up version of the scikit-image function just by dropping the distance thresholding. 
-    Here we expand the labels into every background pixel. Can be over 40% faster. 
+    Expand labels into every background pixel using nearest-label assignment.
+    Uses edt.expand_labels when available (fast Cython); falls back to
+    scipy.ndimage.distance_transform_edt on older edt versions.
     """
-    # nearest_label_coords = distance_transform_edt(label_image==0,
-    #                                               return_distances=False,
-    #                                               return_indices=True)
-    # return label_image[tuple(nearest_label_coords)]
-    return _edt.expand_labels(label_image, parallel=0).astype(label_image.dtype)
+    if _edt_has_expand:
+        return _edt.expand_labels(label_image, parallel=0).astype(label_image.dtype)
+    coords = scipy.ndimage.distance_transform_edt(
+        label_image == 0, return_distances=False, return_indices=True
+    )
+    return label_image[tuple(coords)]
     
     
 @njit(cache=True)
