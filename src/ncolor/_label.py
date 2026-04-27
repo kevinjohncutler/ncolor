@@ -9,7 +9,7 @@ from numba import njit, prange
 import numba
 import scipy
 import scipy.ndimage
-from .format_labels import format_labels
+from ._format_labels import format_labels
 
 def _normalize_labels(labels):
     """Lightweight label normalization for ncolor's internal pipeline.
@@ -731,6 +731,6 @@ def _build_csr_from_pairs(pairs_arr):
     return all_nodes, indptr, indices
 
 
-from .expand_labels import expand_labels
+from ._expand_labels import expand_labels
     
     

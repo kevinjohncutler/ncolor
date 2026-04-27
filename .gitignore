@@ -137,3 +137,6 @@ dmypy.json
 # IDE-specific settings and configurations
 .idea/
 .vscode/
+# macOS AppleDouble sidecar files (created on NAS / SMB mounts)
+._*
+.DS_Store
