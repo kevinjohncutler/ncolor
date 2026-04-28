@@ -27,12 +27,17 @@ def _expand_batch_transpose(src_a, src_b, dst_a, dst_b):
                 dst_b[a, c, b] = src_b[a, b, c]
 
 
-@njit(cache=True, parallel=True)
+@njit(cache=True, parallel=True, fastmath=True)
 def _expand_envelope_pass(h_lbl, h_dist):
     """
     Parabolic lower-envelope pass for one axis (Felzenszwalb & Huttenlocher 2012).
     h_lbl:  (n_slices, N) int32 — 0 = no seed; updated in-place to nearest label.
     h_dist: (n_slices, N) int32 — accumulated squared distance; updated in-place.
+
+    ``fastmath=True`` lets LLVM apply reassociation and reciprocal-multiply
+    optimizations on the parabolic-intersection arithmetic — verified safe
+    here because all FP values are well within double precision (label
+    coordinates ≤ image dimension, squared distances ≤ image diagonal²).
     """
     n_slices, N = h_lbl.shape
     for s in prange(n_slices):

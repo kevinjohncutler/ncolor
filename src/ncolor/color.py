@@ -9,7 +9,7 @@ from numba import njit, prange
 import numba
 import scipy
 import scipy.ndimage
-from ._format_labels import format_labels
+from .format import format_labels
 
 def _normalize_labels(labels):
     """Lightweight label normalization for ncolor's internal pipeline.
@@ -316,8 +316,18 @@ def _search_hashset_parallel(line, total, nbs, ht_size, n_threads):
     region boundary.  Different regions that share the same label pair are
     deduplicated inside each thread's table.  A short serial merge step
     deduplicates any residual cross-thread collisions.
+
+    Note: an earlier version used a parallel pairwise tree merge here. That
+    helps in C++ (microsecond-scale parallel-region launch via persistent
+    threadpool), but on numba's @njit(parallel=True) every prange region
+    pays ~1 ms of launch on many-core omp, so log2(n_threads) rounds
+    cost ~6 ms — more than the O(n_threads * ht_size) serial walk it replaces
+    for typical ht_size (≤ 16k). Serial merge wins decisively for the numba
+    backend; the tree-merge variant lives in cpp_proto/connect.hpp where the
+    launch cost is negligible.
     """
     EMPTY = np.uint64(0xFFFFFFFFFFFFFFFF)
+    HASH = np.uint64(11400714819323198485)
     ht_mask = np.uint64(ht_size - 1)
 
     # Per-thread hash tables (n_threads × ht_size); each thread inits its own
@@ -344,7 +354,7 @@ def _search_hashset_parallel(line, total, nbs, ht_size, n_threads):
                 lo = np.uint64(vi) if vi < vj else np.uint64(vj)
                 hi = np.uint64(vj) if vi < vj else np.uint64(vi)
                 key = (lo << np.uint64(32)) | hi
-                h = (key * np.uint64(11400714819323198485)) & ht_mask
+                h = (key * HASH) & ht_mask
                 while hts[tid, int(h)] != EMPTY and hts[tid, int(h)] != key:
                     h = (h + np.uint64(1)) & ht_mask
                 hts[tid, int(h)] = key
@@ -359,7 +369,7 @@ def _search_hashset_parallel(line, total, nbs, ht_size, n_threads):
             key = hts[t, h]
             if key == EMPTY:
                 continue
-            gh = (key * np.uint64(11400714819323198485)) & ht_mask
+            gh = (key * HASH) & ht_mask
             while merge_ht[int(gh)] != EMPTY and merge_ht[int(gh)] != key:
                 gh = (gh + np.uint64(1)) & ht_mask
             merge_ht[int(gh)] = key
@@ -731,6 +741,6 @@ def _build_csr_from_pairs(pairs_arr):
     return all_nodes, indptr, indices
 
 
-from ._expand_labels import expand_labels
+from .expand import expand_labels
     
     
