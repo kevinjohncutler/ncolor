@@ -95,14 +95,33 @@ public:
     // background pixel (=0), assign the label of the nearest seed by
     // squared-Euclidean distance via the separable parabolic-envelope
     // algorithm. Works on int32 ndarrays, any number of dims.
-    // L1 (Manhattan) chamfer expand. Two raster sweeps. ~3-5× faster than
-    // the parabolic (L2) expand_labels at 2048² but produces slightly
-    // different boundary placement. For ncolor coloring the resulting
-    // adjacency graph is nearly always identical.
+    // L1 (Manhattan) chamfer expand — Saito-Toriwaki separable transform
+    // (default, recommended). Two 1D passes per axis, no boundary fixup,
+    // clean parallel scaling.
     py::array_t<int32_t> expand_labels_l1(
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels) {
         const auto buf = labels.request();
         if (buf.ndim != 2) throw std::invalid_argument("expand_labels_l1 expects 2D input");
+        const int64_t H = buf.shape[0];
+        const int64_t W = buf.shape[1];
+        const int32_t* input = static_cast<const int32_t*>(buf.ptr);
+        py::array_t<int32_t> out(buf.shape);
+        int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
+        bufs_.resize(H * W);
+        std::memcpy(out_ptr, input, H * W * sizeof(int32_t));
+        {
+            py::gil_scoped_release release;
+            ncolor_cpp::chamfer_st_l1(out_ptr, bufs_.dist(), H, W, *pool_, n_threads_);
+        }
+        return out;
+    }
+
+    // L1 chamfer expand using the Rosenfeld–Pfaltz row-band method (legacy
+    // path with boundary fixup). Kept for benchmarking against Saito-Toriwaki.
+    py::array_t<int32_t> expand_labels_l1_rp(
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels) {
+        const auto buf = labels.request();
+        if (buf.ndim != 2) throw std::invalid_argument("expand_labels_l1_rp expects 2D input");
         const int64_t H = buf.shape[0];
         const int64_t W = buf.shape[1];
         const int32_t* input = static_cast<const int32_t*>(buf.ptr);
@@ -277,12 +296,11 @@ public:
             // 1. Expand labels (Voronoi) — every pixel ends up labeled.
             int32_t* expanded;
             if (use_l1) {
-                // L1 chamfer path: copy input and run two raster sweeps in
-                // place on the engine's lbl buffer. Same buffer layout the
-                // L2 path produces, so downstream stages don't change.
+                // L1 Saito-Toriwaki: separable 1D transforms, parallel-over-
+                // rows then parallel-over-column-bands, no boundary fixup.
                 expand_bufs_.resize(H * W);
                 std::memcpy(expand_bufs_.lbl(), mask_ptr, H * W * sizeof(int32_t));
-                ncolor_cpp::chamfer_l1_parallel(
+                ncolor_cpp::chamfer_st_l1(
                     expand_bufs_.lbl(), expand_bufs_.dist(), H, W, *pool_, n_threads_);
                 expanded = expand_bufs_.lbl();
             } else {
@@ -354,13 +372,37 @@ public:
             lut_.assign(static_cast<size_t>(N) + 1, 0);
             for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
 
-            // Apply LUT — and in expand_labels' original form, bg pixels (0 in
-            // the original input) get color 0. Mirror that: if the input pixel
-            // was 0, the output is 0 regardless of `expanded`. Otherwise we
-            // gather lut[expanded[i]].
+            // Apply LUT in parallel — bg pixels (0 in the original input) get
+            // color 0, foreground pixels get lut[expanded[i]]. The single-
+            // threaded version was costing ~5–10 ms at 2048² (4M loops with
+            // a branch each); pool-dispatched chunked write drops it to <1 ms.
             const int64_t total = H * W;
-            for (int64_t i = 0; i < total; ++i) {
-                out_ptr[i] = (mask_ptr[i] != 0) ? lut_[expanded[i]] : 0;
+            {
+                const int nt = std::max(1, n_threads_);
+                if (nt == 1 || total < 8192) {
+                    for (int64_t i = 0; i < total; ++i) {
+                        out_ptr[i] = (mask_ptr[i] != 0) ? lut_[expanded[i]] : 0;
+                    }
+                } else {
+                    const int64_t per = (total + nt - 1) / nt;
+                    std::vector<std::future<void>> fut;
+                    fut.reserve(nt);
+                    for (int t = 0; t < nt; ++t) {
+                        const int64_t i0 = t * per;
+                        const int64_t i1 = std::min(i0 + per, total);
+                        if (i0 >= i1) continue;
+                        const int32_t* mp = mask_ptr;
+                        const int32_t* ep = expanded;
+                        const uint8_t* lp = lut_.data();
+                        uint8_t* op = out_ptr;
+                        fut.emplace_back(pool_->enqueue([mp, ep, lp, op, i0, i1]() {
+                            for (int64_t i = i0; i < i1; ++i) {
+                                op[i] = (mp[i] != 0) ? lp[ep[i]] : 0;
+                            }
+                        }));
+                    }
+                    for (auto& f : fut) f.get();
+                }
             }
         }
         return {std::move(out), n_used};
@@ -402,8 +444,10 @@ PYBIND11_MODULE(ncolor_cpp_proto, m) {
         .def("expand_labels", &ExpandEngine::expand_labels, py::arg("labels"),
              "Felzenszwalb-Huttenlocher Voronoi label expansion (L2, any ndim).")
         .def("expand_labels_l1", &ExpandEngine::expand_labels_l1, py::arg("labels"),
-             "L1 (Manhattan) chamfer Voronoi expansion (2D only). Faster but\n"
-             "different boundary placement than the L2 parabolic version.")
+             "L1 (Manhattan) Saito-Toriwaki separable Voronoi expansion (2D).\n"
+             "Faster but different boundary placement than the L2 parabolic.")
+        .def("expand_labels_l1_rp", &ExpandEngine::expand_labels_l1_rp, py::arg("labels"),
+             "L1 chamfer via Rosenfeld-Pfaltz row-band method (legacy).")
         .def("expand_labels_timed", &ExpandEngine::expand_labels_timed, py::arg("labels"),
              "expand_labels + per-stage (name, ms) breakdown.")
         .def("apply_lut", &ExpandEngine::apply_lut,

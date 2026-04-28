@@ -134,24 +134,36 @@ output verified element-wise.
 | 1024×1024   | 13.36   | 9.13 (T=16)     | **1.5×** |
 | 2048×2048   | 32.95   | 32.76 (T=8)     | tied     |
 
-### L1 chamfer fast path (`use_l1=True`)
+### L1 fast path (`use_l1=True`) — Saito-Toriwaki separable transform
 
-`Solver.label(..., use_l1=True)` swaps the L2 parabolic Voronoi expand for
-an L1 (Manhattan) chamfer (Rosenfeld–Pfaltz two-pass) and uses an
-unpadded directly-on-row-major adjacency scan instead of the
-padded-buffer roundtrip the L2 path needs. Bench at 2048², all values minimums:
+`Solver.label(..., use_l1=True)` runs:
 
-| host | L2 default | L1 chamfer | speedup |
+1. **Saito-Toriwaki separable L1** ([chamfer.hpp::chamfer_st_l1](chamfer.hpp))
+   — exact L1 Voronoi via two orthogonal 1D passes per axis (forward+
+   backward sweep each), with label propagation. Phase 1 parallelizes
+   trivially over rows (each row's 1D L1 transform is independent); phase 2
+   parallelizes over column-bands (each band's vertical sweep is independent).
+   No boundary fixup, clean parallel scaling. Both algorithms compute
+   exact L1 — the legacy Rosenfeld–Pfaltz path
+   ([chamfer_l1_parallel](chamfer.hpp)) is still available as
+   `expand_labels_l1_rp` for benchmarking.
+2. **Unpadded `find_pairs`** ([connect.hpp::find_pairs_2d_unpadded](connect.hpp))
+   — direct row-major scan with 2 forward neighbours (right, down) per pixel.
+   Skips the (H+2, W+2) padded-buffer roundtrip the original
+   `search_hashset_parallel` needs.
+3. **Parallel `apply_lut`** at the tail — chunked dispatch via the persistent
+   ThreadPool. Earlier this was a single-threaded loop costing 5–10 ms at
+   2048².
+
+Bench at 2048², minimums of 10 timed runs:
+
+| host | L2 default | L1 (Saito-Toriwaki + unpadded + parallel-LUT) | speedup |
 |---|---:|---:|---:|
-| Mac M-series (T=16) | 19.49 ms | **7.33** | **2.7×** |
-| Threadripper (T=16) | 23.56 | **12.82** | 1.8× |
-| Threadripper (T=64) | 17.80 | 13.34 | 1.3× |
+| Mac M-series (T=32) | 18.29 ms | **5.80** | **3.2×** |
+| Threadripper (T=64) | 11.25 ms | **6.55** | **1.7×** |
 
-T=16 is the sweet spot for L1 on threadripper — the chamfer's row-band
-partitioning + boundary-fixup serialises at the inter-band boundary, so
-adding more threads means more boundaries to fix up serially. The L2
-parabolic path keeps scaling further because each row's envelope build is
-fully independent.
+Both hosts are now under 10 ms at 2048². L2 also benefits substantially
+from the parallel `apply_lut` (Threadripper L2 went from ~17.8 → 11.25 ms).
 
 Trade-off: L1 boundaries differ from L2 at ~5% of pixels (mostly on
 diagonals between adjacent regions). The resulting label adjacency graph
