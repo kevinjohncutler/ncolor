@@ -55,16 +55,30 @@ inline void chamfer_st_l1(int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
                           ThreadPool& pool, int n_threads) {
     constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
 
-    // Phase 1: per-row init + L1 1D transform. Each row independent.
+    // Phase 1: per-row init + L1 1D transform. Init fused with forward sweep
+    // — saves one full pass over the row's data (~16MB at 2048² → ~0.3 ms).
     auto row_pass = [&](int64_t y0, int64_t y1) {
         for (int64_t y = y0; y < y1; ++y) {
             int32_t* lr = lbl + y * W;
             int32_t* dr = dist + y * W;
-            for (int64_t x = 0; x < W; ++x) dr[x] = (lr[x] != 0) ? 0 : INF;
-            for (int64_t x = 1; x < W; ++x) {
-                const int32_t cd = dr[x - 1] + 1;
-                if (cd < dr[x]) { dr[x] = cd; lr[x] = lr[x - 1]; }
+            // Fused init + forward. `prev_d` carries the previous-cell's
+            // post-forward distance; for x=0 there's no left neighbour so
+            // prev_d starts at INF (saturating with +1 stays >> any seed).
+            int32_t prev_d = INF;
+            int32_t prev_l = 0;
+            for (int64_t x = 0; x < W; ++x) {
+                const int32_t init_l = lr[x];
+                const int32_t init_d = (init_l != 0) ? 0 : INF;
+                const int32_t cd = prev_d + 1;
+                int32_t out_d, out_l;
+                if (cd < init_d) { out_d = cd; out_l = prev_l; }
+                else             { out_d = init_d; out_l = init_l; }
+                dr[x] = out_d;
+                lr[x] = out_l;
+                prev_d = out_d;
+                prev_l = out_l;
             }
+            // Backward sweep — same as before.
             for (int64_t x = W - 2; x >= 0; --x) {
                 const int32_t cd = dr[x + 1] + 1;
                 if (cd < dr[x]) { dr[x] = cd; lr[x] = lr[x + 1]; }

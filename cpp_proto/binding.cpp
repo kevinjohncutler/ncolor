@@ -276,10 +276,14 @@ public:
     // at 2048²). Boundary placement differs from numba's L2 expand at ~5% of
     // pixels, but the resulting adjacency graph is nearly always isomorphic
     // — the 4-coloring still works.
+    // Per-stage timing breakdown (filled by `label` when capture_stages=true).
+    std::vector<std::pair<std::string, double>> last_stages_;
+    std::vector<std::pair<std::string, double>> get_last_stages() const { return last_stages_; }
+
     std::pair<py::array_t<uint8_t>, int> label(
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> mask,
             int n_colors = 4, int max_depth = 30, int rand_period = 10,
-            bool use_l1 = false) {
+            bool use_l1 = false, bool capture_stages = false) {
         const auto buf = mask.request();
         if (buf.ndim != 2) throw std::invalid_argument("Solver.label expects a 2D label image");
         const int64_t H = buf.shape[0];
@@ -290,6 +294,16 @@ public:
         uint8_t* out_ptr = static_cast<uint8_t*>(out.request().ptr);
 
         int n_used = 0;
+        last_stages_.clear();
+        std::chrono::steady_clock::time_point t_start, t_now;
+        if (capture_stages) t_start = std::chrono::steady_clock::now();
+        auto stage = [&](const char* name) {
+            if (!capture_stages) return;
+            t_now = std::chrono::steady_clock::now();
+            last_stages_.emplace_back(name,
+                std::chrono::duration<double, std::milli>(t_now - t_start).count());
+            t_start = t_now;
+        };
         {
             py::gil_scoped_release release;
 
@@ -308,14 +322,39 @@ public:
                 ncolor_cpp::expand_labels_inplace(mask_ptr, expand_bufs_, shape, *pool_, n_threads_);
                 expanded = expand_bufs_.lbl();
             }
+            stage("expand");
 
             // 2. Find adjacency pairs directly on the row-major expanded
             // buffer — no padding step needed (saves ~1 ms at 2048² from
             // the alloc + zero + memcpy of an (H+2, W+2) buffer).
+            // Parallel max-reduce — was a single-threaded 1.2 ms loop at 2048².
             int32_t max_label = 0;
-            for (int64_t i = 0; i < H * W; ++i) {
-                if (expanded[i] > max_label) max_label = expanded[i];
+            const int64_t hw = H * W;
+            if (n_threads_ <= 1 || hw < 8192) {
+                for (int64_t i = 0; i < hw; ++i) {
+                    if (expanded[i] > max_label) max_label = expanded[i];
+                }
+            } else {
+                const int64_t per_max = (hw + n_threads_ - 1) / n_threads_;
+                std::vector<std::future<int32_t>> futs;
+                futs.reserve(n_threads_);
+                for (int t = 0; t < n_threads_; ++t) {
+                    const int64_t i0 = t * per_max;
+                    const int64_t i1 = std::min(i0 + per_max, hw);
+                    if (i0 >= i1) continue;
+                    const int32_t* ep = expanded;
+                    futs.emplace_back(pool_->enqueue([ep, i0, i1]() -> int32_t {
+                        int32_t m = 0;
+                        for (int64_t i = i0; i < i1; ++i) if (ep[i] > m) m = ep[i];
+                        return m;
+                    }));
+                }
+                for (auto& f : futs) {
+                    const int32_t m = f.get();
+                    if (m > max_label) max_label = m;
+                }
             }
+            stage("max_scan");
             // For 4-conn (right + down per pixel), neighbour count is 2
             // contributions per pair, so ht_raw = 2 * n_labels * 2 = 4 * N.
             const int64_t ht_raw = 4 * static_cast<int64_t>(max_label);
@@ -324,6 +363,7 @@ public:
                 ncolor_cpp::find_pairs_2d_unpadded<int32_t>(
                     expanded, H, W, static_cast<uint64_t>(ht_size),
                     n_threads_, *pool_);
+            stage("find_pairs");
 
             // 3. Build CSR (labels are 1..max_label after expand → node = label-1).
             const int32_t N = max_label;
@@ -336,6 +376,7 @@ public:
             }
             ncolor_cpp::build_csr_from_pairs(src_idx_.data(), dst_idx_.data(), N, M,
                                              indptr_, indices_);
+            stage("build_csr");
 
             // 4. Color: BFS attempt → if conflicts/unfinished, run local
             // repair pass; only bump n_colors if both fail. Mirrors the
@@ -368,6 +409,7 @@ public:
             n_used = 0;
             for (uint8_t c : colors_) if (c > n_used) n_used = c;
 
+            stage("color");
             // 5. Build LUT and apply (expanded[i] is in 1..N, so lut size = N+1).
             lut_.assign(static_cast<size_t>(N) + 1, 0);
             for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
@@ -404,6 +446,7 @@ public:
                     for (auto& f : fut) f.get();
                 }
             }
+            stage("apply_lut");
         }
         return {std::move(out), n_used};
     }
@@ -464,8 +507,11 @@ PYBIND11_MODULE(ncolor_cpp_proto, m) {
         .def("label", &Solver::label,
              py::arg("mask"), py::arg("n_colors") = 4,
              py::arg("max_depth") = 30, py::arg("rand_period") = 10,
-             py::arg("use_l1") = false,
+             py::arg("use_l1") = false, py::arg("capture_stages") = false,
              "Run expand_labels → connect → CSR build → BFS color → apply LUT.\n"
              "use_l1=True swaps the parabolic L2 expand for an L1 chamfer\n"
-             "(~5× faster, slightly different boundary placement).");
+             "(~5× faster, slightly different boundary placement).")
+        .def("get_last_stages", &Solver::get_last_stages,
+             "Per-stage timing breakdown from the most recent label() call\n"
+             "made with capture_stages=True.");
 }
