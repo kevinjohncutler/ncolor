@@ -171,8 +171,16 @@ find_pairs_2d_unpadded(const T* lbl, int64_t H, int64_t W,
 
     std::vector<uint64_t> hts(static_cast<size_t>(n_threads) * ht_size, HT_EMPTY);
 
-    // Phase 1: parallel scan over row-bands. Per-pixel: check right + down
-    // neighbours (in-bounds). Emit pair into the local hashtable.
+    // Phase 1: parallel scan over row-bands. Per-pixel: check the 4 forward
+    // neighbours (right, down-left, down, down-right) — this matches numba
+    // ncolor's conn=2 (8-connectivity, the default for `ncolor.label`). With
+    // unique=True the neighbour set is just the forward half.
+    auto emit_pair = [ht_mask](uint64_t* ht, T vi, T vj) {
+        if (vj == 0 || vj == vi) return;
+        const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
+        const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
+        ht_insert(ht, ht_mask, (lo << 32) | hi);
+    };
     auto scan_band = [&](int64_t y0, int64_t y1, uint64_t* ht) {
         for (int64_t y = y0; y < y1; ++y) {
             const T* row  = lbl + y * W;
@@ -180,23 +188,11 @@ find_pairs_2d_unpadded(const T* lbl, int64_t H, int64_t W,
             for (int64_t x = 0; x < W; ++x) {
                 const T vi = row[x];
                 if (vi == 0) continue;
-                // Right neighbour
-                if (x + 1 < W) {
-                    const T vj = row[x + 1];
-                    if (vj != 0 && vj != vi) {
-                        const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
-                        const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
-                        ht_insert(ht, ht_mask, (lo << 32) | hi);
-                    }
-                }
-                // Down neighbour
+                if (x + 1 < W) emit_pair(ht, vi, row[x + 1]);  // right
                 if (rowd) {
-                    const T vj = rowd[x];
-                    if (vj != 0 && vj != vi) {
-                        const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
-                        const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
-                        ht_insert(ht, ht_mask, (lo << 32) | hi);
-                    }
+                    if (x > 0)       emit_pair(ht, vi, rowd[x - 1]);  // down-left
+                                      emit_pair(ht, vi, rowd[x]);      // down
+                    if (x + 1 < W)   emit_pair(ht, vi, rowd[x + 1]);  // down-right
                 }
             }
         }
