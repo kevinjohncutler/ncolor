@@ -480,7 +480,7 @@ private:
     std::vector<uint8_t> lut_;
 };
 
-PYBIND11_MODULE(ncolor_cpp_proto, m) {
+PYBIND11_MODULE(_ncolor_cpp_proto_impl, m) {
     m.doc() = "C++/threadpool prototype of ncolor's hot kernels — for "
               "benchmarking against the numba version on multi-CCX hosts "
               "where libgomp's per-parallel-region launch cost dominates.";
