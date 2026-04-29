@@ -261,20 +261,94 @@ static inline int64_t ipow2_ge(int64_t v) {
     return p;
 }
 
-// Compute the connectivity neighbour offsets for a 2D image of given shape.
-// Matches ncolor.color.neighbors(shape, conn=1, unique=True) for 2D — the
-// 4 forward neighbours (right, down, down-right diagonal omitted for conn=1).
-// We hardcode 2D conn=1 since that's the path Solver actually uses; for 3D
-// or other conns, the caller should still go through ncolor's `neighbors`.
-static inline std::vector<int64_t> neighbors_2d_conn1(int64_t H, int64_t W) {
-    // Padded image has stride W+2; offsets in flat indices.
-    // conn=1, unique=True picks the 4 forward neighbours: (0,1), (1,-1), (1,0), (1,1).
-    // ncolor's `neighbors` with unique=True only returns offsets where the
-    // first nonzero displacement is positive (in flat-index order). For 2D
-    // conn=1: down-left (1,-1), down (1,0), down-right (1,1), and right (0,1).
-    const int64_t Wp = W + 2;
-    std::vector<int64_t> nbs = { 1, Wp - 1, Wp, Wp + 1 };
+// Compute the connectivity neighbour flat-index offsets for a padded image.
+// Matches ncolor.color.neighbors(buf.shape, conn, unique=True) where buf is
+// the input padded by 1 zero in each dim. ``conn`` is the max number of
+// nonzero components in the offset (scipy.ndimage.generate_binary_structure
+// semantics): 2D conn=1 → 4-conn (face only), 2D conn=2 → 8-conn (face +
+// diagonals); 3D conn=1 → 6-conn, conn=2 → 18-conn, conn=3 → 26-conn.
+//
+// "unique forward half" means we keep only directions whose first nonzero
+// component is positive — each undirected pair is then emitted exactly
+// once across both directions during the scan.
+static inline std::vector<int64_t> neighbors_nd_padded(
+        const std::vector<int64_t>& shape, int conn) {
+    const int ndim = static_cast<int>(shape.size());
+    std::vector<int64_t> ps(ndim);  // padded strides (row-major)
+    {
+        int64_t s = 1;
+        for (int d = ndim - 1; d >= 0; --d) {
+            ps[d] = s;
+            s *= (shape[d] + 2);
+        }
+    }
+    int total = 1;
+    for (int d = 0; d < ndim; ++d) total *= 3;
+    std::vector<int64_t> nbs;
+    nbs.reserve(static_cast<size_t>((total - 1) / 2));
+    for (int idx = 0; idx < total; ++idx) {
+        int v = idx;
+        int n_nonzero = 0, first_nz = -1;
+        std::vector<int> off(ndim);
+        for (int d = 0; d < ndim; ++d) {
+            off[d] = (v % 3) - 1;
+            v /= 3;
+            if (off[d] != 0) {
+                ++n_nonzero;
+                if (first_nz < 0) first_nz = d;
+            }
+        }
+        if (n_nonzero == 0 || n_nonzero > conn) continue;
+        if (off[first_nz] < 0) continue;  // forward half only
+        int64_t flat = 0;
+        for (int d = 0; d < ndim; ++d) flat += off[d] * ps[d];
+        nbs.push_back(flat);
+    }
     return nbs;
+}
+
+// Pad an N-D row-major buffer by 1 zero in each dimension. ``dst`` must
+// have shape (s[0]+2, s[1]+2, ..., s[ndim-1]+2) and total ``total_padded``
+// elements; this fills it with ``pad_value`` then copies ``src`` into the
+// interior. Iterates over "innermost rows" so the inner copy is one
+// memcpy per (shape[ndim-1])-length row.
+template <typename T>
+inline void pad_nd_into(const T* src, T* dst,
+                        const std::vector<int64_t>& shape, T pad_value) {
+    const int ndim = static_cast<int>(shape.size());
+    int64_t total_padded = 1;
+    for (int d = 0; d < ndim; ++d) total_padded *= (shape[d] + 2);
+    std::fill_n(dst, total_padded, pad_value);
+
+    std::vector<int64_t> ps(ndim), ss(ndim);  // padded / source strides
+    {
+        int64_t p = 1, s = 1;
+        for (int d = ndim - 1; d >= 0; --d) {
+            ps[d] = p; p *= (shape[d] + 2);
+            ss[d] = s; s *= shape[d];
+        }
+    }
+    int64_t base_off = 0;
+    for (int d = 0; d < ndim; ++d) base_off += ps[d];
+
+    const int64_t row_len = shape[ndim - 1];
+    int64_t n_rows = 1;
+    for (int d = 0; d < ndim - 1; ++d) n_rows *= shape[d];
+
+    std::vector<int64_t> coord(std::max(0, ndim - 1), 0);
+    for (int64_t r = 0; r < n_rows; ++r) {
+        int64_t src_start = 0, dst_start = base_off;
+        for (int d = 0; d < ndim - 1; ++d) {
+            src_start += coord[d] * ss[d];
+            dst_start += coord[d] * ps[d];
+        }
+        std::memcpy(dst + dst_start, src + src_start, row_len * sizeof(T));
+        for (int d = ndim - 2; d >= 0; --d) {
+            ++coord[d];
+            if (coord[d] < shape[d]) break;
+            coord[d] = 0;
+        }
+    }
 }
 
 // Solver: end-to-end ncolor.label equivalent in C++. Wraps a ConnectEngine
@@ -304,14 +378,31 @@ public:
     std::pair<py::array_t<uint8_t>, int> label(
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> mask,
             int n_colors = 4, int max_depth = 30, int rand_period = 10,
-            bool use_l1 = false, bool capture_stages = false) {
+            int conn = 2, bool use_l1 = false, bool capture_stages = false) {
         const auto buf = mask.request();
-        if (buf.ndim != 2) throw std::invalid_argument("Solver.label expects a 2D label image");
-        const int64_t H = buf.shape[0];
-        const int64_t W = buf.shape[1];
+        const int ndim = static_cast<int>(buf.ndim);
+        if (ndim < 2) throw std::invalid_argument(
+            "Solver.label expects a label image with ndim >= 2");
+        if (conn < 1 || conn > ndim) throw std::invalid_argument(
+            "Solver.label: conn must be in [1, ndim]");
+
+        std::vector<int64_t> shape(ndim);
+        int64_t total = 1;
+        for (int d = 0; d < ndim; ++d) {
+            shape[d] = static_cast<int64_t>(buf.shape[d]);
+            total *= shape[d];
+        }
+        // 2D fast path uses the unpadded ConnectEngine optimisation; ND or
+        // non-default conn falls back to the generic padded path.
+        const bool fast_2d = (ndim == 2 && conn == 2);
+        const int64_t H = shape[0];
+        const int64_t W = (ndim >= 2) ? shape[1] : 1;
+
         const int32_t* mask_ptr = static_cast<const int32_t*>(buf.ptr);
 
-        py::array_t<uint8_t> out({H, W});
+        std::vector<py::ssize_t> out_shape(ndim);
+        for (int d = 0; d < ndim; ++d) out_shape[d] = static_cast<py::ssize_t>(shape[d]);
+        py::array_t<uint8_t> out(out_shape);
         uint8_t* out_ptr = static_cast<uint8_t*>(out.request().ptr);
 
         int n_used = 0;
@@ -330,27 +421,24 @@ public:
 
             // 1. Expand labels (Voronoi) — every pixel ends up labeled.
             int32_t* expanded;
-            if (use_l1) {
-                // L1 Saito-Toriwaki: separable 1D transforms, parallel-over-
-                // rows then parallel-over-column-bands, no boundary fixup.
-                expand_bufs_.resize(H * W);
-                std::memcpy(expand_bufs_.lbl(), mask_ptr, H * W * sizeof(int32_t));
+            if (use_l1 && fast_2d) {
+                // L1 Saito-Toriwaki — 2D-only kernel.
+                expand_bufs_.resize(total);
+                std::memcpy(expand_bufs_.lbl(), mask_ptr, total * sizeof(int32_t));
                 ncolor_cpp::chamfer_st_l1(
                     expand_bufs_.lbl(), expand_bufs_.dist(), H, W, *pool_, n_threads_);
                 expanded = expand_bufs_.lbl();
             } else {
-                std::vector<int64_t> shape = {H, W};
+                // L2 parabolic envelope — works for any ndim.
                 ncolor_cpp::expand_labels_inplace(mask_ptr, expand_bufs_, shape, *pool_, n_threads_);
                 expanded = expand_bufs_.lbl();
             }
             stage("expand");
 
-            // 2. Find adjacency pairs directly on the row-major expanded
-            // buffer — no padding step needed (saves ~1 ms at 2048² from
-            // the alloc + zero + memcpy of an (H+2, W+2) buffer).
+            // 2. Find adjacency pairs.
             // Parallel max-reduce — was a single-threaded 1.2 ms loop at 2048².
             int32_t max_label = 0;
-            const int64_t hw = H * W;
+            const int64_t hw = total;
             if (n_threads_ <= 1 || hw < 8192) {
                 for (int64_t i = 0; i < hw; ++i) {
                     if (expanded[i] > max_label) max_label = expanded[i];
@@ -380,14 +468,31 @@ public:
                 }
             }
             stage("max_scan");
-            // For 4-conn (right + down per pixel), neighbour count is 2
-            // contributions per pair, so ht_raw = 2 * n_labels * 2 = 4 * N.
-            const int64_t ht_raw = 4 * static_cast<int64_t>(max_label);
-            const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
-            std::vector<std::pair<int32_t, int32_t>> pairs =
-                ncolor_cpp::find_pairs_2d_unpadded<int32_t>(
+            std::vector<std::pair<int32_t, int32_t>> pairs;
+            if (fast_2d) {
+                // 2D conn=2 fast path: skip padding (saves ~1 ms at 2048²).
+                // For 4 forward neighbours per pixel (right, down-left, down,
+                // down-right), ht_raw = 2 contribs/pair × 4 = 8N; round up.
+                const int64_t ht_raw = 4 * static_cast<int64_t>(max_label);
+                const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
+                pairs = ncolor_cpp::find_pairs_2d_unpadded<int32_t>(
                     expanded, H, W, static_cast<uint64_t>(ht_size),
                     n_threads_, *pool_);
+            } else {
+                // ND or non-default conn: pad + generic search_hashset_parallel.
+                std::vector<int64_t> nbs = neighbors_nd_padded(shape, conn);
+                int64_t total_padded = 1;
+                for (int64_t s : shape) total_padded *= (s + 2);
+                std::unique_ptr<int32_t[]> padded(new int32_t[total_padded]);
+                pad_nd_into<int32_t>(expanded, padded.get(), shape, /*pad_value=*/0);
+                const int64_t ht_raw = 2 * static_cast<int64_t>(nbs.size())
+                                        * static_cast<int64_t>(max_label);
+                const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
+                pairs = ncolor_cpp::search_hashset_parallel<int32_t>(
+                    padded.get(), total_padded, nbs.data(),
+                    static_cast<int>(nbs.size()),
+                    static_cast<uint64_t>(ht_size), n_threads_, *pool_);
+            }
             stage("find_pairs");
 
             // 3. Build CSR (labels are 1..max_label after expand → node = label-1).
@@ -443,7 +548,6 @@ public:
             // color 0, foreground pixels get lut[expanded[i]]. The single-
             // threaded version was costing ~5–10 ms at 2048² (4M loops with
             // a branch each); pool-dispatched chunked write drops it to <1 ms.
-            const int64_t total = H * W;
             {
                 const int nt = std::max(1, n_threads_);
                 if (nt == 1 || total < 8192) {
@@ -521,6 +625,9 @@ PYBIND11_MODULE(_ncolor_cpp_proto_impl, m) {
         "so the per-call cost is just task enqueue + the actual work.\n"
         "Returns (colored_image_uint8, n_colors_used).\n"
         "\n"
+        "Supports 2D and 3D inputs. ``Solver.label(mask, conn=2)`` mirrors\n"
+        "ncolor.label's 2D default (8-connectivity); for 3D pass conn∈{1,2,3}.\n"
+        "\n"
         "n_threads conventions:\n"
         "  -1 (default), 0, negative  → auto (use cached calibration)\n"
         "  0 < x < 1                  → fraction × os.cpu_count() (e.g. 0.5)\n"
@@ -531,10 +638,15 @@ PYBIND11_MODULE(_ncolor_cpp_proto_impl, m) {
         .def("label", &Solver::label,
              py::arg("mask"), py::arg("n_colors") = 4,
              py::arg("max_depth") = 30, py::arg("rand_period") = 10,
+             py::arg("conn") = 2,
              py::arg("use_l1") = false, py::arg("capture_stages") = false,
              "Run expand_labels → connect → CSR build → BFS color → apply LUT.\n"
+             "Supports 2D and 3D inputs (any ndim ≥ 2 actually).\n"
+             "conn: 2D ∈ {1, 2}, 3D ∈ {1, 2, 3}. Matches\n"
+             "scipy.ndimage.generate_binary_structure semantics. The 2D conn=2\n"
+             "case takes a fast path that skips padding (~1 ms saved at 2048²).\n"
              "use_l1=True swaps the parabolic L2 expand for an L1 chamfer\n"
-             "(~5× faster, slightly different boundary placement).")
+             "(~5× faster, slightly different boundary placement; 2D only).")
         .def("get_last_stages", &Solver::get_last_stages,
              "Per-stage timing breakdown from the most recent label() call\n"
              "made with capture_stages=True.");

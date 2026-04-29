@@ -141,4 +141,37 @@ Solver = _impl.Solver
 # Make the SMT calibration submodule discoverable via ``ncolor_cpp_proto._smt``.
 from . import _smt  # noqa: E402
 
+
+def _maybe_calibrate_on_first_import() -> None:
+    """Run SMT calibration once per machine if no cache entry exists.
+
+    pip's wheel install has no post-install hook (``setup.py``'s
+    ``cmdclass`` only fires for source builds), so for users who install
+    a pre-built wheel, the SMT calibration that source-build users get at
+    install time has to happen at first import instead. ~50–300 ms hidden
+    under the user's first ``import ncolor_cpp_proto``; subsequent imports
+    are instant (they hit the cached JSON file).
+
+    Skip with ``NCOLOR_NO_CALIBRATE=1`` (CI / Docker / cross-compile).
+    Skip if numpy isn't yet importable (something has gone very wrong).
+    Failures are non-fatal — ``auto_threads()`` falls back to physical
+    core count.
+    """
+    if os.environ.get("NCOLOR_NO_CALIBRATE"):
+        return
+    cache = _smt._load_cache()
+    if _smt._cache_key() in cache:
+        return  # already calibrated on this host
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        return
+    try:
+        _smt.calibrate(force=False, verbose=False)
+    except Exception:
+        pass  # non-fatal — auto_threads() falls back to physical cores
+
+
+_maybe_calibrate_on_first_import()
+
 __all__ = ["ConnectEngine", "ExpandEngine", "Solver", "_smt"]

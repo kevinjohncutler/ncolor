@@ -141,3 +141,74 @@ def test_label_invariant_across_thread_counts():
         # All colors used must be in [1, n_used]
         assert set(np.unique(out[mask > 0]).tolist()) <= set(range(1, n_used + 1))
     assert len(set(counts)) == 1, f"color count varies by thread count: {counts}"
+
+
+# --- ND support: 2D conn∈{1,2}, 3D conn∈{1,2,3} ---------------------------
+
+def _make_3d_mask(D=32, n_blobs=20, seed=0):
+    rng = np.random.default_rng(seed)
+    mask = np.zeros((D, D, D), dtype=np.int32)
+    for i in range(1, n_blobs + 1):
+        cz = rng.integers(4, D - 4)
+        cy = rng.integers(4, D - 4)
+        cx = rng.integers(4, D - 4)
+        r = int(rng.integers(2, max(3, D // 6)))
+        zz, yy, xx = np.ogrid[:D, :D, :D]
+        mask[(zz - cz) ** 2 + (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r] = i
+    return mask
+
+
+def _coloring_is_valid(mask, colored, conn):
+    """Every pair of touching regions in mask must have different colors."""
+    import scipy.ndimage as snd
+    struct = snd.generate_binary_structure(mask.ndim, conn)
+    labels = np.unique(mask)
+    labels = labels[labels > 0]
+    color_of = {}
+    for l in labels:
+        coords = np.nonzero(mask == l)
+        color_of[int(l)] = int(colored[tuple(c[0] for c in coords)])
+    for l in labels:
+        m = (mask == l)
+        d = snd.binary_dilation(m, structure=struct) & ~m
+        for t in np.unique(mask[d]):
+            if t > 0 and t != l and color_of[int(t)] == color_of[int(l)]:
+                return False, (int(l), int(t), color_of[int(l)])
+    return True, None
+
+
+@pytest.mark.parametrize("conn", [1, 2])
+def test_label_2d_conn(conn):
+    mask = _make_mask(H=128, n_circles=20)
+    out, n_used = nc.Solver().label(mask, conn=conn)
+    assert out.shape == mask.shape
+    assert out.dtype == np.uint8
+    assert (out[mask == 0] == 0).all()
+    assert (out[mask > 0] > 0).all()
+    valid, err = _coloring_is_valid(mask, out, conn)
+    assert valid, f"adjacent regions share color: {err}"
+
+
+@pytest.mark.parametrize("conn", [1, 2, 3])
+def test_label_3d_conn(conn):
+    mask = _make_3d_mask(D=32, n_blobs=15, seed=conn)
+    out, n_used = nc.Solver().label(mask, conn=conn)
+    assert out.shape == mask.shape
+    assert out.dtype == np.uint8
+    assert (out[mask == 0] == 0).all()
+    assert (out[mask > 0] > 0).all()
+    valid, err = _coloring_is_valid(mask, out, conn)
+    assert valid, f"adjacent regions share color: {err}"
+
+
+def test_label_rejects_1d():
+    with pytest.raises(ValueError):
+        nc.Solver().label(np.zeros(64, dtype=np.int32))
+
+
+def test_label_rejects_invalid_conn():
+    mask = _make_mask(H=64, n_circles=5)
+    with pytest.raises(ValueError):
+        nc.Solver().label(mask, conn=3)  # 2D → conn must be 1 or 2
+    with pytest.raises(ValueError):
+        nc.Solver().label(mask, conn=0)
