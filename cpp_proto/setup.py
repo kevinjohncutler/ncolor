@@ -16,9 +16,42 @@ can call ``_smt.auto_threads()`` with a sub-millisecond cache lookup.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext as _build_ext
+
+
+def _is_quarantined_smbfs(path: str) -> bool:
+    """True if `path` is inside a macOS smbfs mount that has the `quarantine`
+    flag set. macOS Gatekeeper rejects .so loads from such mounts and dyld
+    hangs in `JustInTimeLoader::withRegions` when called via dlopen.
+
+    The mount-flag inheritance is system-managed; there's no setup.py-level
+    fix. Detected here so the post-build calibration can skip cleanly
+    rather than hang the install.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        out = subprocess.check_output(["mount"], text=True)
+    except Exception:
+        return False
+    abs_path = os.path.abspath(path)
+    for line in out.splitlines():
+        # Format: "//user@server/share on /Volumes/X (smbfs, ..., quarantine, ...)"
+        parts = line.split(" on ", 1)
+        if len(parts) != 2:
+            continue
+        rest = parts[1]
+        if " (" not in rest:
+            continue
+        mount_point, opts = rest.split(" (", 1)
+        if not abs_path.startswith(mount_point.rstrip()):
+            continue
+        if "smbfs" in opts and "quarantine" in opts:
+            return True
+    return False
 
 try:
     import pybind11
@@ -84,9 +117,21 @@ class build_ext(_build_ext):
         super().run()
         if os.environ.get("NCOLOR_NO_CALIBRATE"):
             return
+        srcdir = os.path.dirname(os.path.abspath(__file__))
+        if _is_quarantined_smbfs(srcdir):
+            print(
+                "[ncolor_cpp_proto] source dir is on a quarantined SMB mount\n"
+                "  -- macOS dyld cannot load .so files from quarantined SMB\n"
+                "  -- shares (Gatekeeper hangs on assessment). SMT calibration\n"
+                "  -- skipped. To use this package on macOS:\n"
+                "  --   1. `pip install /path/to/cpp_proto` (NOT -e .) so the\n"
+                "  --      .so is copied to local site-packages, OR\n"
+                "  --   2. remount the SMB share without quarantine via Finder\n"
+                "  --      (Connect to Server) instead of automount."
+            )
+            return
         # The .so may live in either source-dir (after inplace copy) or
         # build_lib (just-built); add both so import works in either case.
-        srcdir = os.path.dirname(os.path.abspath(__file__))
         candidates = [p for p in (srcdir, self.build_lib) if p and p not in sys.path]
         for p in candidates: sys.path.insert(0, p)
         try:
