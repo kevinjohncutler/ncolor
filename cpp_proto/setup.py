@@ -56,7 +56,7 @@ else:
         extra_compile_args += ["-mmacosx-version-min=10.14"]
 
 ext = Extension(
-    "_ncolor_cpp_proto_impl",
+    "ncolor_cpp_proto._ncolor_cpp_proto_impl",
     sources=["binding.cpp"],
     include_dirs=[pybind11.get_include(), "."],
     extra_compile_args=extra_compile_args,
@@ -85,12 +85,13 @@ class build_ext(_build_ext):
         if os.environ.get("NCOLOR_NO_CALIBRATE"):
             return
         srcdir = os.path.dirname(os.path.abspath(__file__))
-        # The .so may live in either source-dir (after inplace copy) or
-        # build_lib (just-built); add both so import works in either case.
-        # The Python wrapper ``ncolor_cpp_proto.py`` handles the macOS-smbfs
-        # case by copying ``_ncolor_cpp_proto_impl.so`` to a local cache and
-        # loading from there, avoiding the dyld+SMB+quarantine hang.
-        candidates = [p for p in (srcdir, self.build_lib) if p and p not in sys.path]
+        # Candidate roots that contain the ``ncolor_cpp_proto`` package after
+        # build. For ``--inplace`` it's ``src/``; for non-inplace it's
+        # ``build_lib``. The package's ``__init__.py`` handles network-mount
+        # ``.so`` loading transparently (smbfs/UNC), so calibration imports
+        # never touch the NAS-resident binary directly.
+        candidates = [p for p in (os.path.join(srcdir, "src"), self.build_lib)
+                      if p and p not in sys.path]
         for p in candidates: sys.path.insert(0, p)
         try:
             try:
@@ -100,7 +101,7 @@ class build_ext(_build_ext):
                       "SMT calibration deferred to first auto_threads() call.")
                 return
             try:
-                import _smt  # type: ignore
+                from ncolor_cpp_proto import _smt
                 _smt.calibrate(force=True, verbose=True)
             except Exception as exc:  # noqa: BLE001
                 print(f"[ncolor_cpp_proto] SMT calibration skipped ({exc!r}); "
@@ -116,7 +117,8 @@ setup(
     version="0.1.0",
     description="C++/threadpool prototype of ncolor's _search_hashset_parallel.",
     ext_modules=[ext],
-    py_modules=["_smt", "ncolor_cpp_proto"],
+    package_dir={"": "src"},
+    packages=["ncolor_cpp_proto"],
     cmdclass={"build_ext": build_ext},
     install_requires=["pybind11>=2.10", "numpy>=1.20"],
     python_requires=">=3.10",

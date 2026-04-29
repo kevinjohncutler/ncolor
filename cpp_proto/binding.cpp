@@ -42,7 +42,7 @@ namespace py = pybind11;
 // pybind11 3.0.4, so we use double here and let users pass -1 for auto.
 static int resolve_threads(double v) {
     if (v <= 0.0) {
-        return py::module_::import("_smt").attr("auto_threads")().cast<int>();
+        return py::module_::import("ncolor_cpp_proto._smt").attr("auto_threads")().cast<int>();
     }
     if (v < 1.0) {
         const long ncpu = py::module_::import("os").attr("cpu_count")().cast<long>();
