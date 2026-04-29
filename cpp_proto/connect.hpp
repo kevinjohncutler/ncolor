@@ -29,16 +29,15 @@
 #include <vector>
 #include <utility>
 #include <atomic>
-#include <future>
 
+#include "dispatch.hpp"
 #include "threadpool.h"
 
 namespace ncolor_cpp {
 
-// ``ThreadPool`` is declared at file scope in threadpool.h (vendored from edt
-// without modification). Bring it into our namespace so callers don't have
-// to mix qualifiers.
-using ::ThreadPool;
+// ``ForkJoinPool`` is declared at file scope in threadpool.h (vendored from
+// edt). Bring it into our namespace so callers don't have to mix qualifiers.
+using ::ForkJoinPool;
 
 constexpr uint64_t HT_EMPTY = 0xFFFFFFFFFFFFFFFFull;
 // Knuth's golden-ratio multiplicative hash (matches ncolor's @njit constant).
@@ -95,44 +94,46 @@ std::vector<std::pair<int32_t, int32_t>>
 search_hashset_parallel(const T* line, int64_t total,
                         const int64_t* nbs, int n_nbs,
                         uint64_t ht_size, int n_threads,
-                        ThreadPool& pool) {
+                        ForkJoinPool& pool) {
     const uint64_t ht_mask = ht_size - 1;
 
     // Per-thread hashtables, allocated as one contiguous block for locality.
     std::vector<uint64_t> hts(static_cast<size_t>(n_threads) * ht_size, HT_EMPTY);
 
-    // Phase 1: parallel scan.
-    const int64_t strip = (total + n_threads - 1) / n_threads;
-    std::vector<std::future<void>> futures;
-    futures.reserve(n_threads);
-    for (int t = 0; t < n_threads; ++t) {
-        const int64_t s = t * strip;
-        const int64_t e = std::min(s + strip, total);
-        uint64_t* ht = hts.data() + static_cast<size_t>(t) * ht_size;
-        futures.emplace_back(pool.enqueue([line, s, e, total, nbs, n_nbs, ht, ht_mask]() {
-            scan_strip<T>(line, s, e, total, nbs, n_nbs, ht, ht_mask);
-        }));
+    // Phase 1: parallel scan via atomic work-stealing. Strip count = n_threads
+    // (one strip per thread is correct here since the per-thread hashtables
+    // are pre-allocated and indexed by strip id).
+    {
+        std::atomic<int> next{0};
+        const int64_t strip = (total + n_threads - 1) / n_threads;
+        pool.parallel([&]() {
+            int t;
+            while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_threads) {
+                const int64_t s = static_cast<int64_t>(t) * strip;
+                const int64_t e = std::min(s + strip, total);
+                uint64_t* ht = hts.data() + static_cast<size_t>(t) * ht_size;
+                scan_strip<T>(line, s, e, total, nbs, n_nbs, ht, ht_mask);
+            }
+        });
     }
-    for (auto& f : futures) f.get();
-    futures.clear();
 
     // Phase 2: pairwise tree merge — log2(n_threads) parallel rounds, each
     // round folds the second half of every active group into the first half.
     int stride = 1;
     while (stride < n_threads) {
         const int n_pairs = (n_threads + 2 * stride - 1) / (2 * stride);
-        for (int p = 0; p < n_pairs; ++p) {
-            const int dst = p * 2 * stride;
-            const int src = dst + stride;
-            if (src >= n_threads) continue;
-            uint64_t* dst_ht = hts.data() + static_cast<size_t>(dst) * ht_size;
-            const uint64_t* src_ht = hts.data() + static_cast<size_t>(src) * ht_size;
-            futures.emplace_back(pool.enqueue([src_ht, dst_ht, ht_size]() {
+        std::atomic<int> next{0};
+        pool.parallel([&]() {
+            int p;
+            while ((p = next.fetch_add(1, std::memory_order_relaxed)) < n_pairs) {
+                const int dst = p * 2 * stride;
+                const int src = dst + stride;
+                if (src >= n_threads) continue;
+                uint64_t* dst_ht = hts.data() + static_cast<size_t>(dst) * ht_size;
+                const uint64_t* src_ht = hts.data() + static_cast<size_t>(src) * ht_size;
                 ht_merge(src_ht, dst_ht, ht_size);
-            }));
-        }
-        for (auto& f : futures) f.get();
-        futures.clear();
+            }
+        });
         stride *= 2;
     }
 
@@ -165,7 +166,7 @@ template <typename T>
 std::vector<std::pair<int32_t, int32_t>>
 find_pairs_2d_unpadded(const T* lbl, int64_t H, int64_t W,
                        uint64_t ht_size, int n_threads,
-                       ThreadPool& pool) {
+                       ForkJoinPool& pool) {
     const uint64_t ht_mask = ht_size - 1;
     if (n_threads < 1) n_threads = 1;
 
@@ -201,36 +202,38 @@ find_pairs_2d_unpadded(const T* lbl, int64_t H, int64_t W,
     if (n_threads == 1 || H < 4) {
         scan_band(0, H, hts.data());
     } else {
-        const int64_t per = (H + n_threads - 1) / n_threads;
-        std::vector<std::future<void>> futures;
-        futures.reserve(n_threads);
-        for (int t = 0; t < n_threads; ++t) {
-            const int64_t y0 = t * per;
-            const int64_t y1 = std::min(y0 + per, H);
-            if (y0 >= y1) continue;
-            uint64_t* ht = hts.data() + static_cast<size_t>(t) * ht_size;
-            futures.emplace_back(pool.enqueue([scan_band, y0, y1, ht]() {
-                scan_band(y0, y1, ht);
-            }));
+        // Phase 1: scan over row-bands via atomic work-stealing.
+        {
+            std::atomic<int> next{0};
+            const int64_t per = (H + n_threads - 1) / n_threads;
+            pool.parallel([&]() {
+                int t;
+                while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_threads) {
+                    const int64_t y0 = static_cast<int64_t>(t) * per;
+                    const int64_t y1 = std::min(y0 + per, H);
+                    if (y0 >= y1) continue;
+                    uint64_t* ht = hts.data() + static_cast<size_t>(t) * ht_size;
+                    scan_band(y0, y1, ht);
+                }
+            });
         }
-        for (auto& f : futures) f.get();
 
         // Phase 2: pairwise tree merge.
         int stride = 1;
         while (stride < n_threads) {
             const int n_pairs = (n_threads + 2 * stride - 1) / (2 * stride);
-            std::vector<std::future<void>> mfut;
-            for (int p = 0; p < n_pairs; ++p) {
-                const int dst = p * 2 * stride;
-                const int src = dst + stride;
-                if (src >= n_threads) continue;
-                uint64_t* dst_ht = hts.data() + static_cast<size_t>(dst) * ht_size;
-                const uint64_t* src_ht = hts.data() + static_cast<size_t>(src) * ht_size;
-                mfut.emplace_back(pool.enqueue([src_ht, dst_ht, ht_size]() {
+            std::atomic<int> next{0};
+            pool.parallel([&]() {
+                int p;
+                while ((p = next.fetch_add(1, std::memory_order_relaxed)) < n_pairs) {
+                    const int dst = p * 2 * stride;
+                    const int src = dst + stride;
+                    if (src >= n_threads) continue;
+                    uint64_t* dst_ht = hts.data() + static_cast<size_t>(dst) * ht_size;
+                    const uint64_t* src_ht = hts.data() + static_cast<size_t>(src) * ht_size;
                     ht_merge(src_ht, dst_ht, ht_size);
-                }));
-            }
-            for (auto& f : mfut) f.get();
+                }
+            });
             stride *= 2;
         }
     }

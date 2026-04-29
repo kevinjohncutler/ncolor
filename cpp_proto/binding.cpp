@@ -11,15 +11,16 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <future>
 #include <memory>
 #include <vector>
 
 #include "chamfer.hpp"
 #include "color.hpp"
 #include "connect.hpp"
+#include "dispatch.hpp"
 #include "expand.hpp"
 
 namespace py = pybind11;
@@ -28,7 +29,7 @@ class ConnectEngine {
 public:
     explicit ConnectEngine(int n_threads)
         : n_threads_(n_threads <= 0 ? 1 : n_threads),
-          pool_(std::make_unique<ncolor_cpp::ThreadPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
+          pool_(std::make_unique<ncolor_cpp::ForkJoinPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
 
     int n_threads() const { return n_threads_; }
 
@@ -77,7 +78,7 @@ public:
 
 private:
     int n_threads_;
-    std::unique_ptr<ncolor_cpp::ThreadPool> pool_;
+    std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
 };
 
 // Persistent-pool wrapper for expand_labels + parallel LUT apply.
@@ -87,7 +88,7 @@ class ExpandEngine {
 public:
     explicit ExpandEngine(int n_threads)
         : n_threads_(n_threads <= 0 ? 1 : n_threads),
-          pool_(std::make_unique<ncolor_cpp::ThreadPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
+          pool_(std::make_unique<ncolor_cpp::ForkJoinPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
 
     int n_threads() const { return n_threads_; }
 
@@ -196,20 +197,13 @@ public:
             }
             return out;
         }
-        const int64_t per_thread = (total + n_threads - 1) / n_threads;
-        std::vector<std::future<void>> futures;
-        futures.reserve(n_threads);
-        for (int t = 0; t < n_threads; ++t) {
-            const int64_t i0 = t * per_thread;
-            const int64_t i1 = std::min(i0 + per_thread, total);
-            if (i0 >= i1) continue;
-            futures.emplace_back(pool_->enqueue([lab_ptr, lut_ptr, out_ptr, i0, i1]() {
-                for (int64_t i = i0; i < i1; ++i) {
+        ncolor_cpp::dispatch_parallel(*pool_, static_cast<size_t>(total),
+            static_cast<size_t>(n_threads) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
+            [lab_ptr, lut_ptr, out_ptr](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i) {
                     out_ptr[i] = lut_ptr[lab_ptr[i]];
                 }
-            }));
-        }
-        for (auto& f : futures) f.get();
+            });
         return out;
     }
 
@@ -228,7 +222,7 @@ public:
 
 private:
     int n_threads_;
-    std::unique_ptr<ncolor_cpp::ThreadPool> pool_;
+    std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
     ncolor_cpp::ExpandBuffers bufs_;
 };
 
@@ -262,7 +256,7 @@ class Solver {
 public:
     explicit Solver(int n_threads)
         : n_threads_(n_threads <= 0 ? 1 : n_threads),
-          pool_(std::make_unique<ncolor_cpp::ThreadPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
+          pool_(std::make_unique<ncolor_cpp::ForkJoinPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
 
     int n_threads() const { return n_threads_; }
 
@@ -335,23 +329,27 @@ public:
                     if (expanded[i] > max_label) max_label = expanded[i];
                 }
             } else {
-                const int64_t per_max = (hw + n_threads_ - 1) / n_threads_;
-                std::vector<std::future<int32_t>> futs;
-                futs.reserve(n_threads_);
-                for (int t = 0; t < n_threads_; ++t) {
-                    const int64_t i0 = t * per_max;
-                    const int64_t i1 = std::min(i0 + per_max, hw);
-                    if (i0 >= i1) continue;
-                    const int32_t* ep = expanded;
-                    futs.emplace_back(pool_->enqueue([ep, i0, i1]() -> int32_t {
+                // Per-chunk partial maxes; final reduce on the main thread.
+                const size_t n_chunks = static_cast<size_t>(n_threads_) *
+                                        ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD;
+                std::vector<int32_t> partials(n_chunks, 0);
+                std::atomic<size_t> next{0};
+                const size_t total_sz = static_cast<size_t>(hw);
+                const size_t actual_chunks = std::min(n_chunks, total_sz);
+                const size_t chunk_sz = (total_sz + actual_chunks - 1) / actual_chunks;
+                const int32_t* ep = expanded;
+                pool_->parallel([&]() {
+                    size_t idx;
+                    while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < actual_chunks) {
+                        const size_t i0 = idx * chunk_sz;
+                        const size_t i1 = std::min(i0 + chunk_sz, total_sz);
                         int32_t m = 0;
-                        for (int64_t i = i0; i < i1; ++i) if (ep[i] > m) m = ep[i];
-                        return m;
-                    }));
-                }
-                for (auto& f : futs) {
-                    const int32_t m = f.get();
-                    if (m > max_label) max_label = m;
+                        for (size_t i = i0; i < i1; ++i) if (ep[i] > m) m = ep[i];
+                        partials[idx] = m;
+                    }
+                });
+                for (size_t i = 0; i < actual_chunks; ++i) {
+                    if (partials[i] > max_label) max_label = partials[i];
                 }
             }
             stage("max_scan");
@@ -426,24 +424,17 @@ public:
                         out_ptr[i] = (mask_ptr[i] != 0) ? lut_[expanded[i]] : 0;
                     }
                 } else {
-                    const int64_t per = (total + nt - 1) / nt;
-                    std::vector<std::future<void>> fut;
-                    fut.reserve(nt);
-                    for (int t = 0; t < nt; ++t) {
-                        const int64_t i0 = t * per;
-                        const int64_t i1 = std::min(i0 + per, total);
-                        if (i0 >= i1) continue;
-                        const int32_t* mp = mask_ptr;
-                        const int32_t* ep = expanded;
-                        const uint8_t* lp = lut_.data();
-                        uint8_t* op = out_ptr;
-                        fut.emplace_back(pool_->enqueue([mp, ep, lp, op, i0, i1]() {
-                            for (int64_t i = i0; i < i1; ++i) {
+                    const int32_t* mp = mask_ptr;
+                    const int32_t* ep = expanded;
+                    const uint8_t* lp = lut_.data();
+                    uint8_t* op = out_ptr;
+                    ncolor_cpp::dispatch_parallel(*pool_, static_cast<size_t>(total),
+                        static_cast<size_t>(nt) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
+                        [mp, ep, lp, op](size_t begin, size_t end) {
+                            for (size_t i = begin; i < end; ++i) {
                                 op[i] = (mp[i] != 0) ? lp[ep[i]] : 0;
                             }
-                        }));
-                    }
-                    for (auto& f : fut) f.get();
+                        });
                 }
             }
             stage("apply_lut");
@@ -453,7 +444,7 @@ public:
 
 private:
     int n_threads_;
-    std::unique_ptr<ncolor_cpp::ThreadPool> pool_;
+    std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
     ncolor_cpp::ExpandBuffers expand_bufs_;
     std::vector<int32_t> padded_;
     std::vector<int32_t> src_idx_, dst_idx_;

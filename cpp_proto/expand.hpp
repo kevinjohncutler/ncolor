@@ -19,17 +19,18 @@
 
 #include <algorithm>
 #include <chrono>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
-#include <future>
 #include <vector>
 
+#include "dispatch.hpp"
 #include "threadpool.h"
 
 namespace ncolor_cpp {
 
-using ::ThreadPool;
+using ::ForkJoinPool;
 
 // Strided indexer: lbl[i * stride], dist[i * stride]. With stride=1 this
 // is the contiguous row case; with stride=W it operates on a column of an
@@ -201,14 +202,18 @@ inline void envelope_pass0_row(
 inline void envelope_pass0(
         int32_t* h_lbl, int32_t* h_dist,
         int64_t n_slices, int64_t N,
-        ThreadPool& pool, int n_threads,
+        ForkJoinPool& pool, int n_threads,
         std::vector<EnvelopeScratch>& scratch) {
     if (n_threads < 1) n_threads = 1;
-    if (static_cast<int>(scratch.size()) < n_threads) scratch.resize(n_threads);
+    const int eff_threads = static_cast<int>(compute_threads(
+        static_cast<size_t>(n_threads),
+        static_cast<size_t>(n_slices),
+        static_cast<size_t>(N)));
+    if (static_cast<int>(scratch.size()) < eff_threads) scratch.resize(eff_threads);
     const size_t cap = static_cast<size_t>(N) + 1;
-    for (int t = 0; t < n_threads; ++t) scratch[t].resize(cap);
+    for (int t = 0; t < eff_threads; ++t) scratch[t].resize(cap);
 
-    if (n_threads == 1 || n_slices < 2) {
+    if (eff_threads == 1 || n_slices < 2) {
         for (int64_t s = 0; s < n_slices; ++s) {
             envelope_pass0_row(h_lbl + s * N, h_dist + s * N, N,
                                scratch[0].v.data(), scratch[0].lblstk.data());
@@ -216,36 +221,45 @@ inline void envelope_pass0(
         return;
     }
 
-    const int64_t per_thread = (n_slices + n_threads - 1) / n_threads;
-    std::vector<std::future<void>> futures;
-    futures.reserve(n_threads);
-    for (int t = 0; t < n_threads; ++t) {
-        const int64_t s0 = t * per_thread;
-        const int64_t s1 = std::min(s0 + per_thread, n_slices);
-        if (s0 >= s1) continue;
-        int32_t* sp = scratch[t].v.data();
-        int32_t* lp = scratch[t].lblstk.data();
-        futures.emplace_back(pool.enqueue([h_lbl, h_dist, N, s0, s1, sp, lp]() {
+    // Atomic work-stealing: split slices into chunks, each thread claims a
+    // tid once (so it can reuse its scratch[tid]) then loops claiming chunks.
+    const int n_chunks = static_cast<int>(std::min<int64_t>(
+        n_slices, static_cast<int64_t>(eff_threads) * DISPATCH_CHUNKS_PER_THREAD));
+    const int64_t chunk_sz = (n_slices + n_chunks - 1) / n_chunks;
+    std::atomic<int> tid_next{0};
+    std::atomic<int> chunk_next{0};
+    pool.parallel([&]() {
+        const int my_tid = tid_next.fetch_add(1, std::memory_order_relaxed);
+        if (my_tid >= eff_threads) return;
+        int32_t* sp = scratch[my_tid].v.data();
+        int32_t* lp = scratch[my_tid].lblstk.data();
+        int idx;
+        while ((idx = chunk_next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
+            const int64_t s0 = static_cast<int64_t>(idx) * chunk_sz;
+            const int64_t s1 = std::min(s0 + chunk_sz, n_slices);
             for (int64_t s = s0; s < s1; ++s) {
                 envelope_pass0_row(h_lbl + s * N, h_dist + s * N, N, sp, lp);
             }
-        }));
-    }
-    for (auto& f : futures) f.get();
+        }
+    });
 }
 
 // Pass over (n_slices, N) row-major arrays in parallel.
 inline void envelope_pass(
         int32_t* h_lbl, int32_t* h_dist,
         int64_t n_slices, int64_t N,
-        ThreadPool& pool, int n_threads,
+        ForkJoinPool& pool, int n_threads,
         std::vector<EnvelopeScratch>& scratch) {
     if (n_threads < 1) n_threads = 1;
-    if (static_cast<int>(scratch.size()) < n_threads) scratch.resize(n_threads);
+    const int eff_threads = static_cast<int>(compute_threads(
+        static_cast<size_t>(n_threads),
+        static_cast<size_t>(n_slices),
+        static_cast<size_t>(N)));
+    if (static_cast<int>(scratch.size()) < eff_threads) scratch.resize(eff_threads);
     const size_t cap = static_cast<size_t>(N) + 1;
-    for (int t = 0; t < n_threads; ++t) scratch[t].resize(cap);
+    for (int t = 0; t < eff_threads; ++t) scratch[t].resize(cap);
 
-    if (n_threads == 1 || n_slices < 2) {
+    if (eff_threads == 1 || n_slices < 2) {
         auto& sc = scratch[0];
         for (int64_t s = 0; s < n_slices; ++s) {
             envelope_pass_row(h_lbl + s * N, h_dist + s * N, N, /*stride=*/1,
@@ -255,27 +269,31 @@ inline void envelope_pass(
         return;
     }
 
-    const int64_t per_thread = (n_slices + n_threads - 1) / n_threads;
-    std::vector<std::future<void>> futures;
-    futures.reserve(n_threads);
-    for (int t = 0; t < n_threads; ++t) {
-        const int64_t s0 = t * per_thread;
-        const int64_t s1 = std::min(s0 + per_thread, n_slices);
-        if (s0 >= s1) continue;
-        auto& sc = scratch[t];
+    const int n_chunks = static_cast<int>(std::min<int64_t>(
+        n_slices, static_cast<int64_t>(eff_threads) * DISPATCH_CHUNKS_PER_THREAD));
+    const int64_t chunk_sz = (n_slices + n_chunks - 1) / n_chunks;
+    std::atomic<int> tid_next{0};
+    std::atomic<int> chunk_next{0};
+    pool.parallel([&]() {
+        const int my_tid = tid_next.fetch_add(1, std::memory_order_relaxed);
+        if (my_tid >= eff_threads) return;
+        auto& sc = scratch[my_tid];
         int32_t* vp = sc.v.data();
         int32_t* lp = sc.lblstk.data();
         int32_t* gp = sc.g.data();
         double* zp = sc.z.data();
         double* vdp = sc.vd.data();
         double* vdsqp = sc.vd_sq.data();
-        futures.emplace_back(pool.enqueue([h_lbl, h_dist, N, s0, s1, vp, lp, gp, zp, vdp, vdsqp]() {
+        int idx;
+        while ((idx = chunk_next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
+            const int64_t s0 = static_cast<int64_t>(idx) * chunk_sz;
+            const int64_t s1 = std::min(s0 + chunk_sz, n_slices);
             for (int64_t s = s0; s < s1; ++s) {
-                envelope_pass_row(h_lbl + s * N, h_dist + s * N, N, /*stride=*/1, vp, lp, gp, zp, vdp, vdsqp);
+                envelope_pass_row(h_lbl + s * N, h_dist + s * N, N, /*stride=*/1,
+                                  vp, lp, gp, zp, vdp, vdsqp);
             }
-        }));
-    }
-    for (auto& f : futures) f.get();
+        }
+    });
 }
 
 // Strided variant: process one logical "line" per call where pixels are
@@ -284,7 +302,7 @@ inline void envelope_pass(
 inline void envelope_pass_strided(
         int32_t* h_lbl, int32_t* h_dist,
         int64_t n_lines, int64_t N, int64_t stride,
-        ThreadPool& pool, int n_threads,
+        ForkJoinPool& pool, int n_threads,
         std::vector<EnvelopeScratch>& scratch) {
     if (n_threads < 1) n_threads = 1;
     if (static_cast<int>(scratch.size()) < n_threads) scratch.resize(n_threads);
@@ -301,82 +319,78 @@ inline void envelope_pass_strided(
         return;
     }
 
-    const int64_t per_thread = (n_lines + n_threads - 1) / n_threads;
-    std::vector<std::future<void>> futures;
-    futures.reserve(n_threads);
-    for (int t = 0; t < n_threads; ++t) {
-        const int64_t s0 = t * per_thread;
-        const int64_t s1 = std::min(s0 + per_thread, n_lines);
-        if (s0 >= s1) continue;
-        auto& sc = scratch[t];
+    const int n_chunks = static_cast<int>(std::min<int64_t>(
+        n_lines, static_cast<int64_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD));
+    const int64_t chunk_sz = (n_lines + n_chunks - 1) / n_chunks;
+    std::atomic<int> tid_next{0};
+    std::atomic<int> chunk_next{0};
+    pool.parallel([&]() {
+        const int my_tid = tid_next.fetch_add(1, std::memory_order_relaxed);
+        if (my_tid >= n_threads) return;
+        auto& sc = scratch[my_tid];
         int32_t* vp = sc.v.data();
         int32_t* lp = sc.lblstk.data();
         int32_t* gp = sc.g.data();
         double* zp = sc.z.data();
         double* vdp = sc.vd.data();
         double* vdsqp = sc.vd_sq.data();
-        futures.emplace_back(pool.enqueue([h_lbl, h_dist, N, stride, s0, s1, vp, lp, gp, zp, vdp, vdsqp]() {
+        int idx;
+        while ((idx = chunk_next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
+            const int64_t s0 = static_cast<int64_t>(idx) * chunk_sz;
+            const int64_t s1 = std::min(s0 + chunk_sz, n_lines);
             for (int64_t s = s0; s < s1; ++s) {
-                envelope_pass_row(h_lbl + s, h_dist + s, N, stride, vp, lp, gp, zp, vdp, vdsqp);
+                envelope_pass_row(h_lbl + s, h_dist + s, N, stride,
+                                  vp, lp, gp, zp, vdp, vdsqp);
             }
-        }));
-    }
-    for (auto& f : futures) f.get();
+        }
+    });
 }
 
 // Blocked batched transpose: src(A,B,C) → dst(A,C,B), for two arrays
-// in lockstep (label + dist). Tile size matches the numba version (Bi=64).
+// in lockstep (label + dist). Tile size 64 matches edt::TRANSPOSE_BLOCK
+// (also matches the numba version's Bi=64). Uses atomic work-stealing
+// dispatch over tile triples (a, rb, cb) — load balances naturally even
+// when total_tiles is not a clean multiple of n_threads.
 template <typename T>
 void batch_transpose(
         const T* src_a, const T* src_b,
         T* dst_a, T* dst_b,
         int64_t A, int64_t B, int64_t C,
-        ThreadPool& pool, int n_threads) {
+        ForkJoinPool& pool, int n_threads) {
     constexpr int Bi = 64;
     const int64_t n_b = (B + Bi - 1) / Bi;
     const int64_t n_c = (C + Bi - 1) / Bi;
-    const int64_t total_tiles = A * n_b * n_c;
+    const int64_t bpp = n_b * n_c;
+    const size_t total_tiles = static_cast<size_t>(A * bpp);
 
     if (n_threads < 1) n_threads = 1;
-    if (n_threads == 1 || total_tiles < 4) {
-        for (int64_t i = 0; i < total_tiles; ++i) {
-            const int64_t a = i / (n_b * n_c);
-            const int64_t bc = i % (n_b * n_c);
-            const int64_t b0 = (bc / n_c) * Bi;
-            const int64_t c0 = (bc % n_c) * Bi;
-            for (int64_t b = b0; b < std::min<int64_t>(b0 + Bi, B); ++b) {
-                for (int64_t c = c0; c < std::min<int64_t>(c0 + Bi, C); ++c) {
-                    dst_a[a * (C * B) + c * B + b] = src_a[a * (B * C) + b * C + c];
-                    dst_b[a * (C * B) + c * B + b] = src_b[a * (B * C) + b * C + c];
+    auto tile_work = [=](size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i) {
+            const int64_t a   = static_cast<int64_t>(i) / bpp;
+            const int64_t blk = static_cast<int64_t>(i) % bpp;
+            const int64_t b0  = (blk / n_c) * Bi;
+            const int64_t c0  = (blk % n_c) * Bi;
+            const int64_t b1  = std::min<int64_t>(b0 + Bi, B);
+            const int64_t c1  = std::min<int64_t>(c0 + Bi, C);
+            const int64_t plane  = a * B * C;
+            const int64_t tplane = a * C * B;
+            for (int64_t b = b0; b < b1; ++b) {
+                for (int64_t c = c0; c < c1; ++c) {
+                    dst_a[tplane + c * B + b] = src_a[plane + b * C + c];
+                    dst_b[tplane + c * B + b] = src_b[plane + b * C + c];
                 }
             }
         }
+    };
+
+    if (n_threads == 1 || total_tiles < 4) {
+        tile_work(0, total_tiles);
         return;
     }
 
-    const int64_t per_thread = (total_tiles + n_threads - 1) / n_threads;
-    std::vector<std::future<void>> futures;
-    futures.reserve(n_threads);
-    for (int t = 0; t < n_threads; ++t) {
-        const int64_t i0 = t * per_thread;
-        const int64_t i1 = std::min(i0 + per_thread, total_tiles);
-        if (i0 >= i1) continue;
-        futures.emplace_back(pool.enqueue([src_a, src_b, dst_a, dst_b, A, B, C, n_b, n_c, i0, i1]() {
-            for (int64_t i = i0; i < i1; ++i) {
-                const int64_t a = i / (n_b * n_c);
-                const int64_t bc = i % (n_b * n_c);
-                const int64_t b0 = (bc / n_c) * Bi;
-                const int64_t c0 = (bc % n_c) * Bi;
-                for (int64_t b = b0; b < std::min<int64_t>(b0 + Bi, B); ++b) {
-                    for (int64_t c = c0; c < std::min<int64_t>(c0 + Bi, C); ++c) {
-                        dst_a[a * (C * B) + c * B + b] = src_a[a * (B * C) + b * C + c];
-                        dst_b[a * (C * B) + c * B + b] = src_b[a * (B * C) + b * C + c];
-                    }
-                }
-            }
-        }));
-    }
-    for (auto& f : futures) f.get();
+    dispatch_parallel(pool, total_tiles,
+                      static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD,
+                      tile_work);
 }
 
 // Holds buffers for repeated calls. Keep one per Python ExpandEngine instance.
@@ -412,7 +426,7 @@ private:
 inline void expand_labels_inplace(
         const int32_t* input, ExpandBuffers& bufs,
         const std::vector<int64_t>& shape,
-        ThreadPool& pool, int n_threads) {
+        ForkJoinPool& pool, int n_threads) {
     const int ndim = static_cast<int>(shape.size());
     int64_t total = 1;
     for (int64_t d : shape) total *= d;
@@ -457,7 +471,7 @@ template <typename Cb>
 inline void expand_labels_inplace_timed(
         const int32_t* input, ExpandBuffers& bufs,
         const std::vector<int64_t>& shape,
-        ThreadPool& pool, int n_threads,
+        ForkJoinPool& pool, int n_threads,
         Cb&& report_ms) {
     const int ndim = static_cast<int>(shape.size());
     int64_t total = 1;

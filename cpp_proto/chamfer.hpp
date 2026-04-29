@@ -18,12 +18,13 @@
 #define NCOLOR_CHAMFER_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
-#include <future>
 #include <limits>
 #include <vector>
 
+#include "dispatch.hpp"
 #include "threadpool.h"
 
 namespace ncolor_cpp {
@@ -52,7 +53,7 @@ namespace ncolor_cpp {
 // but the parallel scaling is clean — no boundary fixup, predictable
 // O((H+W) × n_threads) throughput.
 inline void chamfer_st_l1(int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
-                          ThreadPool& pool, int n_threads) {
+                          ForkJoinPool& pool, int n_threads) {
     constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
 
     // Phase 1: per-row init + L1 1D transform. Init fused with forward sweep
@@ -111,35 +112,20 @@ inline void chamfer_st_l1(int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
         }
     };
 
-    if (n_threads <= 1 || H < 4) {
-        row_pass(0, H);
-    } else {
-        const int64_t per = (H + n_threads - 1) / n_threads;
-        std::vector<std::future<void>> fut;
-        fut.reserve(n_threads);
-        for (int t = 0; t < n_threads; ++t) {
-            const int64_t y0 = t * per;
-            const int64_t y1 = std::min(y0 + per, H);
-            if (y0 >= y1) continue;
-            fut.emplace_back(pool.enqueue(row_pass, y0, y1));
-        }
-        for (auto& f : fut) f.get();
-    }
+    // Phase 1: parallel over rows. Use atomic work-stealing — much better
+    // load balancing than static partitioning when bands have unequal seeds.
+    const size_t row_threads = compute_threads(n_threads, H, W);
+    dispatch_parallel(pool, static_cast<size_t>(H),
+                      row_threads * DISPATCH_CHUNKS_PER_THREAD,
+                      [&](size_t y0, size_t y1) { row_pass(static_cast<int64_t>(y0), static_cast<int64_t>(y1)); });
 
-    if (n_threads <= 1 || W < 4) {
-        col_pass(0, W);
-    } else {
-        const int64_t per = (W + n_threads - 1) / n_threads;
-        std::vector<std::future<void>> fut;
-        fut.reserve(n_threads);
-        for (int t = 0; t < n_threads; ++t) {
-            const int64_t x0 = t * per;
-            const int64_t x1 = std::min(x0 + per, W);
-            if (x0 >= x1) continue;
-            fut.emplace_back(pool.enqueue(col_pass, x0, x1));
-        }
-        for (auto& f : fut) f.get();
-    }
+    // Phase 2: parallel over column bands. Each band's vertical sweep is
+    // independent; atomic work-stealing balances cache-warm threads across
+    // chunks of bands automatically.
+    const size_t col_threads = compute_threads(n_threads, W, H);
+    dispatch_parallel(pool, static_cast<size_t>(W),
+                      col_threads * DISPATCH_CHUNKS_PER_THREAD,
+                      [&](size_t x0, size_t x1) { col_pass(static_cast<int64_t>(x0), static_cast<int64_t>(x1)); });
 }
 
 // Single-threaded L1 chamfer. `lbl` is in/out: nonzero entries are seeds.
@@ -205,14 +191,12 @@ inline void chamfer_l1_serial(int32_t* lbl, int32_t* dist, int64_t H, int64_t W)
 // band boundaries.
 inline void chamfer_l1_parallel(
         int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
-        ThreadPool& pool, int n_threads) {
+        ForkJoinPool& pool, int n_threads) {
     if (n_threads <= 1 || H < 8) {
         chamfer_l1_serial(lbl, dist, H, W);
         return;
     }
     const int64_t band = std::max<int64_t>((H + n_threads - 1) / n_threads, 1);
-    std::vector<std::future<void>> futures;
-    futures.reserve(n_threads);
     auto run_band = [&](int64_t y0, int64_t y1) {
         // Local two-pass chamfer restricted to rows [y0, y1).
         constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
@@ -258,22 +242,44 @@ inline void chamfer_l1_parallel(
             }
         }
     };
-    for (int t = 0; t < n_threads; ++t) {
-        const int64_t y0 = t * band;
-        const int64_t y1 = std::min(y0 + band, H);
-        if (y0 >= y1) continue;
-        futures.emplace_back(pool.enqueue(run_band, y0, y1));
+    // Run the local two-pass chamfer on each band in parallel.
+    {
+        std::atomic<int> next{0};
+        const int n_bands = static_cast<int>((H + band - 1) / band);
+        pool.parallel([&]() {
+            int idx;
+            while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < n_bands) {
+                const int64_t y0 = static_cast<int64_t>(idx) * band;
+                const int64_t y1 = std::min(y0 + band, H);
+                if (y0 < y1) run_band(y0, y1);
+            }
+        });
     }
-    for (auto& f : futures) f.get();
-    futures.clear();
 
-    // Boundary fixup: serial sweep across band boundaries propagating
-    // the now-correct interior values into adjacent bands. Run a few
-    // passes until convergence (bounded by max possible label distance).
+    // Boundary fixup: serial cross-band updates + parallel local backward
+    // sweeps. Run a few passes until convergence.
+    auto run_band_back = [&](int64_t y0, int64_t y1) {
+        for (int64_t y = y1 - 1; y >= y0; --y) {
+            int32_t* lr = lbl + y * W;
+            int32_t* dr = dist + y * W;
+            const int32_t* lb = (y + 1 < y1) ? lbl + (y + 1) * W : nullptr;
+            const int32_t* db = (y + 1 < y1) ? dist + (y + 1) * W : nullptr;
+            for (int64_t x = W - 1; x >= 0; --x) {
+                int32_t bd = dr[x], bl = lr[x];
+                if (y + 1 < y1) {
+                    const int32_t cd = db[x] + 1;
+                    if (cd < bd) { bd = cd; bl = lb[x]; }
+                }
+                if (x + 1 < W) {
+                    const int32_t cd = dr[x + 1] + 1;
+                    if (cd < bd) { bd = cd; bl = lr[x + 1]; }
+                }
+                dr[x] = bd; lr[x] = bl;
+            }
+        }
+    };
     for (int pass = 0; pass < 4; ++pass) {
         bool changed = false;
-        // Forward boundary fixup: at each band-internal boundary y_b,
-        // propagate from y_b-1 to y_b downward.
         for (int t = 1; t < n_threads; ++t) {
             const int64_t y_b = t * band;
             if (y_b >= H) break;
@@ -286,35 +292,16 @@ inline void chamfer_l1_parallel(
                 if (cd < dr[x]) { dr[x] = cd; lr[x] = lt[x]; changed = true; }
             }
         }
-        // Re-run local backward sweeps in each band so the new boundary
-        // values flow inward. Parallel.
-        for (int t = 0; t < n_threads; ++t) {
-            const int64_t y0 = t * band;
-            const int64_t y1 = std::min(y0 + band, H);
-            if (y0 >= y1) continue;
-            futures.emplace_back(pool.enqueue([=]() {
-                for (int64_t y = y1 - 1; y >= y0; --y) {
-                    int32_t* lr = lbl + y * W;
-                    int32_t* dr = dist + y * W;
-                    const int32_t* lb = (y + 1 < y1) ? lbl + (y + 1) * W : nullptr;
-                    const int32_t* db = (y + 1 < y1) ? dist + (y + 1) * W : nullptr;
-                    for (int64_t x = W - 1; x >= 0; --x) {
-                        int32_t bd = dr[x], bl = lr[x];
-                        if (y + 1 < y1) {
-                            const int32_t cd = db[x] + 1;
-                            if (cd < bd) { bd = cd; bl = lb[x]; }
-                        }
-                        if (x + 1 < W) {
-                            const int32_t cd = dr[x + 1] + 1;
-                            if (cd < bd) { bd = cd; bl = lr[x + 1]; }
-                        }
-                        dr[x] = bd; lr[x] = bl;
-                    }
-                }
-            }));
-        }
-        for (auto& f : futures) f.get();
-        futures.clear();
+        std::atomic<int> next{0};
+        const int n_bands = static_cast<int>((H + band - 1) / band);
+        pool.parallel([&]() {
+            int idx;
+            while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < n_bands) {
+                const int64_t y0 = static_cast<int64_t>(idx) * band;
+                const int64_t y1 = std::min(y0 + band, H);
+                if (y0 < y1) run_band_back(y0, y1);
+            }
+        });
         if (!changed) break;
     }
 }
