@@ -421,12 +421,20 @@ public:
 
             // 1. Expand labels (Voronoi) — every pixel ends up labeled.
             int32_t* expanded;
-            if (use_l1 && fast_2d) {
-                // L1 Saito-Toriwaki — 2D-only kernel.
+            if (use_l1) {
+                // L1 Saito-Toriwaki — 2D fast path uses the dedicated kernel,
+                // higher ndim uses the generic ND separable variant.
                 expand_bufs_.resize(total);
                 std::memcpy(expand_bufs_.lbl(), mask_ptr, total * sizeof(int32_t));
-                ncolor_cpp::chamfer_st_l1(
-                    expand_bufs_.lbl(), expand_bufs_.dist(), H, W, *pool_, n_threads_);
+                if (ndim == 2) {
+                    ncolor_cpp::chamfer_st_l1(
+                        expand_bufs_.lbl(), expand_bufs_.dist(), H, W,
+                        *pool_, n_threads_);
+                } else {
+                    ncolor_cpp::chamfer_st_l1_nd(
+                        expand_bufs_.lbl(), expand_bufs_.dist(), shape,
+                        *pool_, n_threads_);
+                }
                 expanded = expand_bufs_.lbl();
             } else {
                 // L2 parabolic envelope — works for any ndim.
@@ -646,7 +654,9 @@ PYBIND11_MODULE(_ncolor_cpp_proto_impl, m) {
              "scipy.ndimage.generate_binary_structure semantics. The 2D conn=2\n"
              "case takes a fast path that skips padding (~1 ms saved at 2048²).\n"
              "use_l1=True swaps the parabolic L2 expand for an L1 chamfer\n"
-             "(~5× faster, slightly different boundary placement; 2D only).")
+             "(~5× faster, slightly different boundary placement). The ND\n"
+             "Saito-Toriwaki separable transform is used for ndim > 2; the\n"
+             "dedicated 2D kernel is used for ndim == 2.")
         .def("get_last_stages", &Solver::get_last_stages,
              "Per-stage timing breakdown from the most recent label() call\n"
              "made with capture_stages=True.");

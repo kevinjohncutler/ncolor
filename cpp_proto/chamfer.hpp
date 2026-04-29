@@ -306,6 +306,128 @@ inline void chamfer_l1_parallel(
     }
 }
 
+// 1D L1 chamfer pass over a single line of length N at given stride.
+//
+//   `init=true`  → fused init + forward + backward sweep (first axis).
+//                  dist[i*stride] = 0 if lbl[i*stride] != 0, else INF, then
+//                  the standard forward+backward L1 propagation.
+//   `init=false` → forward + backward propagation only (subsequent axes).
+//                  dist already contains valid 1D-L1 distances from prior
+//                  axis passes; this propagates them along this axis.
+//
+// `__restrict__` lets the compiler vectorise — separate buffers, no alias.
+inline void chamfer_l1_1d_pass(int32_t* __restrict__ lbl,
+                               int32_t* __restrict__ dist,
+                               int64_t N, int64_t stride, bool init) {
+    constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
+    if (init) {
+        // Fused init + forward
+        int32_t prev_d = INF, prev_l = 0;
+        for (int64_t i = 0; i < N; ++i) {
+            const int32_t init_l = lbl[i * stride];
+            const int32_t init_d = (init_l != 0) ? 0 : INF;
+            const int32_t cd = prev_d + 1;
+            int32_t out_d, out_l;
+            if (cd < init_d) { out_d = cd;     out_l = prev_l; }
+            else             { out_d = init_d; out_l = init_l; }
+            dist[i * stride] = out_d;
+            lbl[i * stride]  = out_l;
+            prev_d = out_d;
+            prev_l = out_l;
+        }
+    } else {
+        // Forward propagate (no init)
+        for (int64_t i = 1; i < N; ++i) {
+            const int32_t cd = dist[(i - 1) * stride] + 1;
+            if (cd < dist[i * stride]) {
+                dist[i * stride] = cd;
+                lbl[i * stride]  = lbl[(i - 1) * stride];
+            }
+        }
+    }
+    // Backward (always)
+    for (int64_t i = N - 2; i >= 0; --i) {
+        const int32_t cd = dist[(i + 1) * stride] + 1;
+        if (cd < dist[i * stride]) {
+            dist[i * stride] = cd;
+            lbl[i * stride]  = lbl[(i + 1) * stride];
+        }
+    }
+}
+
+// N-D Saito-Toriwaki separable L1 distance transform with label
+// propagation. Equivalent to the 2D ``chamfer_st_l1`` but generalises to
+// any ndim via stride-aware axis sweeps (no transposes — the strided
+// access in non-innermost axes is cheaper than the round-trip transpose
+// for L1's simple per-element work). Mirrors the separable structure of
+// ``expand_labels_inplace`` (L2 parabolic).
+//
+// For 2D this matches the dedicated ``chamfer_st_l1`` bit-for-bit; the
+// dedicated version retains a row-stripe-friendly access pattern that's
+// marginally faster, so we keep it as the 2D fast path.
+inline void chamfer_st_l1_nd(int32_t* lbl, int32_t* dist,
+                             const std::vector<int64_t>& shape,
+                             ForkJoinPool& pool, int n_threads) {
+    const int ndim = static_cast<int>(shape.size());
+    if (ndim == 0) return;
+
+    // Strides (row-major).
+    std::vector<int64_t> strides(ndim);
+    {
+        int64_t s = 1;
+        for (int d = ndim - 1; d >= 0; --d) {
+            strides[d] = s;
+            s *= shape[d];
+        }
+    }
+
+    for (int ax = ndim - 1; ax >= 0; --ax) {
+        const int64_t N = shape[ax];
+        const int64_t stride_ax = strides[ax];
+        const bool first = (ax == ndim - 1);
+
+        // Lines: one per combination of non-ax coords.
+        int64_t n_lines = 1;
+        for (int d = 0; d < ndim; ++d) if (d != ax) n_lines *= shape[d];
+
+        // Build the line-index → flat-offset mapping. We want to enumerate
+        // non-ax coords in row-major order; line index l decomposes as
+        //   coord[d_0] * P_1*P_2*…  +  coord[d_1] * P_2*…  + … + coord[d_{n-1}]
+        // where P_k is shape of the k-th non-ax dim and the d_k's are the
+        // non-ax dim indices in original (row-major) order.
+        std::vector<int> non_ax;
+        non_ax.reserve(static_cast<size_t>(ndim - 1));
+        for (int d = 0; d < ndim; ++d) if (d != ax) non_ax.push_back(d);
+        std::vector<int64_t> line_strides(non_ax.size());
+        {
+            int64_t s = 1;
+            for (int i = static_cast<int>(non_ax.size()) - 1; i >= 0; --i) {
+                line_strides[i] = s;
+                s *= shape[non_ax[i]];
+            }
+        }
+
+        const size_t threads_for = compute_threads(
+            static_cast<size_t>(n_threads),
+            static_cast<size_t>(n_lines),
+            static_cast<size_t>(N));
+        dispatch_parallel(pool, static_cast<size_t>(n_lines),
+                          threads_for * DISPATCH_CHUNKS_PER_THREAD,
+                          [&](size_t l0, size_t l1) {
+            for (size_t l = l0; l < l1; ++l) {
+                int64_t off = 0;
+                int64_t rem = static_cast<int64_t>(l);
+                for (size_t i = 0; i < non_ax.size(); ++i) {
+                    const int64_t coord = rem / line_strides[i];
+                    rem -= coord * line_strides[i];
+                    off += coord * strides[non_ax[i]];
+                }
+                chamfer_l1_1d_pass(lbl + off, dist + off, N, stride_ax, first);
+            }
+        });
+    }
+}
+
 } // namespace ncolor_cpp
 
 #endif // NCOLOR_CHAMFER_HPP
