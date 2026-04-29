@@ -23,6 +23,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#  include <arm_neon.h>
+#elif defined(__SSE2__)
+#  include <emmintrin.h>
+#  if defined(__SSE4_1__)
+#    include <smmintrin.h>
+#  endif
+#endif
 #include <vector>
 
 #include "dispatch.hpp"
@@ -67,10 +76,129 @@ struct StridedView {
 // (≤4K) the per-column working set fits in L2 and end-to-end this beats
 // the transpose+contiguous variant by a ~2× margin (transpose is dominated
 // by the strided write half anyway).
+// SIMD fill helper: writes lbl[i_start..i_end) = lbl_j and
+// dist[i_start..i_end) = g_j + (i - v_j)². Vectorized for ARM64 NEON
+// (Apple Silicon — 4×int32 per iteration) and x86_64 SSE2/AVX2 (4×int32
+// per iteration via _mm_mullo_epi32). Scalar tail handles the remainder.
+//
+// Hand-rolled because clang -O3 -march=native consistently fails to
+// vectorize the int32 ``di*di`` multiply + paired stores even with
+// __restrict__ qualifiers.
+static inline void envelope_fill_simd(
+        int32_t* __restrict__ lbl, int32_t* __restrict__ dist,
+        int64_t i_start, int64_t i_end,
+        int32_t lbl_j, int32_t g_j, int32_t v_j) {
+    int64_t i = i_start;
+#if defined(__aarch64__) || defined(__ARM_NEON)
+    const int32x4_t v_lbl = vdupq_n_s32(lbl_j);
+    const int32x4_t v_g   = vdupq_n_s32(g_j);
+    const int32x4_t v_vj  = vdupq_n_s32(v_j);
+    const int32x4_t v_inc = {0, 1, 2, 3};
+    const int32x4_t v_four = vdupq_n_s32(4);
+    int32x4_t v_i = vaddq_s32(vdupq_n_s32(static_cast<int32_t>(i_start)), v_inc);
+    for (; i + 4 <= i_end; i += 4) {
+        int32x4_t v_di = vsubq_s32(v_i, v_vj);
+        int32x4_t v_di_sq = vmulq_s32(v_di, v_di);
+        int32x4_t v_dist = vaddq_s32(v_di_sq, v_g);
+        vst1q_s32(lbl + i, v_lbl);
+        vst1q_s32(dist + i, v_dist);
+        v_i = vaddq_s32(v_i, v_four);
+    }
+#elif defined(__SSE2__)
+    const __m128i v_lbl = _mm_set1_epi32(lbl_j);
+    const __m128i v_g   = _mm_set1_epi32(g_j);
+    const __m128i v_vj  = _mm_set1_epi32(v_j);
+    const __m128i v_four = _mm_set1_epi32(4);
+    __m128i v_i = _mm_add_epi32(_mm_set1_epi32(static_cast<int32_t>(i_start)),
+                                _mm_set_epi32(3, 2, 1, 0));
+    for (; i + 4 <= i_end; i += 4) {
+        __m128i v_di = _mm_sub_epi32(v_i, v_vj);
+        // _mm_mullo_epi32 needs SSE4.1; fall back to scalar tail otherwise.
+    #if defined(__SSE4_1__)
+        __m128i v_di_sq = _mm_mullo_epi32(v_di, v_di);
+    #else
+        // SSE2-only: spill to scalar
+        break;
+    #endif
+        __m128i v_dist = _mm_add_epi32(v_di_sq, v_g);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(lbl + i), v_lbl);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dist + i), v_dist);
+        v_i = _mm_add_epi32(v_i, v_four);
+    }
+#endif
+    for (; i < i_end; ++i) {
+        const int32_t di = static_cast<int32_t>(i) - v_j;
+        lbl[i] = lbl_j;
+        dist[i] = g_j + di * di;
+    }
+}
+
+// Contiguous (stride=1) variant — separate symbol so the compiler can
+// vectorize the phase-2 fill loop without proving stride=1 every call.
+// ``__restrict__`` lets it assume lbl and dist don't alias.
+inline void envelope_pass_row_contig(
+        int32_t* __restrict__ lbl, int32_t* __restrict__ dist, int64_t N,
+        int32_t* __restrict__ v, int32_t* __restrict__ lblstk,
+        int32_t* __restrict__ g, double* __restrict__ z,
+        double* __restrict__ vd, double* __restrict__ vd_sq) {
+    int32_t k = 0;
+    for (int64_t i = 0; i < N; ++i) {
+        if (lbl[i] == 0) continue;
+        const int32_t gi = dist[i];
+        const double fi = static_cast<double>(i);
+        const double gf = static_cast<double>(gi);
+        const double fi_sq_plus_gf = fi * fi + gf;
+        double new_z = -1e18;
+        while (k > 0) {
+            const int32_t top = k - 1;
+            const double ft = vd[top];
+            const double ft_sq = vd_sq[top];
+            const double g_top = static_cast<double>(g[top]);
+            const double numer = fi_sq_plus_gf - g_top - ft_sq;
+            const double denom = 2.0 * (fi - ft);
+            if (numer > z[top] * denom) {
+                new_z = numer / denom;
+                break;
+            }
+            k -= 1;
+        }
+        z[k] = new_z;
+        v[k] = static_cast<int32_t>(i);
+        vd[k] = fi;
+        vd_sq[k] = fi * fi;
+        lblstk[k] = lbl[i];
+        g[k] = gi;
+        k += 1;
+    }
+    if (k == 0) return;
+    int64_t i_start = 0;
+    for (int32_t j = 0; j < k; ++j) {
+        int64_t i_end;
+        if (j + 1 == k) {
+            i_end = N;
+        } else {
+            const double zj1 = z[j + 1];
+            if (zj1 <= static_cast<double>(i_start)) continue;
+            i_end = (zj1 >= static_cast<double>(N)) ? N : static_cast<int64_t>(std::ceil(zj1));
+            if (i_end > N) i_end = N;
+        }
+        if (i_end <= i_start) continue;
+        const int32_t lbl_j = lblstk[j];
+        const int32_t g_j = g[j];
+        const int32_t v_j = v[j];
+        envelope_fill_simd(lbl, dist, i_start, i_end, lbl_j, g_j, v_j);
+        i_start = i_end;
+    }
+}
+
 inline void envelope_pass_row(
         int32_t* lbl, int32_t* dist, int64_t N, int64_t stride,
         int32_t* v, int32_t* lblstk, int32_t* g, double* z,
         double* vd, double* vd_sq) {
+    if (stride == 1) {
+        envelope_pass_row_contig(lbl, dist, N, v, lblstk, g, z, vd, vd_sq);
+        return;
+    }
     int32_t k = 0;
     for (int64_t i = 0; i < N; ++i) {
         if (lbl[i * stride] == 0) continue;
