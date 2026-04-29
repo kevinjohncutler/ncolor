@@ -25,10 +25,37 @@
 
 namespace py = pybind11;
 
+// Resolve a user-supplied n_threads value into a concrete positive int.
+//
+//   -1 / 0 / negative          →  _smt.auto_threads()  (cached calibration)
+//   0 < x < 1                  →  round(x × os.cpu_count()), min 1
+//   1                          →  1 (serial)
+//   x ≥ 1                      →  round(x), exact
+//
+// Note: `1` is always interpreted as one thread, never as 100% of cores —
+// the fractional-ratio interpretation only applies for values strictly
+// between 0 and 1.
+//
+// Accepts double for flexibility (Python int/float both convert), with -1.0
+// as the default sentinel for "auto". Python ``None`` would also be natural
+// but ``py::object`` constructors break import on macOS arm64 with
+// pybind11 3.0.4, so we use double here and let users pass -1 for auto.
+static int resolve_threads(double v) {
+    if (v <= 0.0) {
+        return py::module_::import("_smt").attr("auto_threads")().cast<int>();
+    }
+    if (v < 1.0) {
+        const long ncpu = py::module_::import("os").attr("cpu_count")().cast<long>();
+        const long n = static_cast<long>(v * static_cast<double>(ncpu) + 0.5);
+        return static_cast<int>(std::max<long>(1, n));
+    }
+    return static_cast<int>(std::max<long>(1, static_cast<long>(v + 0.5)));
+}
+
 class ConnectEngine {
 public:
-    explicit ConnectEngine(int n_threads)
-        : n_threads_(n_threads <= 0 ? 1 : n_threads),
+    explicit ConnectEngine(double n_threads)
+        : n_threads_(resolve_threads(n_threads)),
           pool_(std::make_unique<ncolor_cpp::ForkJoinPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
 
     int n_threads() const { return n_threads_; }
@@ -86,8 +113,8 @@ private:
 // across calls so the only per-call cost is task enqueue.
 class ExpandEngine {
 public:
-    explicit ExpandEngine(int n_threads)
-        : n_threads_(n_threads <= 0 ? 1 : n_threads),
+    explicit ExpandEngine(double n_threads)
+        : n_threads_(resolve_threads(n_threads)),
           pool_(std::make_unique<ncolor_cpp::ForkJoinPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
 
     int n_threads() const { return n_threads_; }
@@ -254,8 +281,8 @@ static inline std::vector<int64_t> neighbors_2d_conn1(int64_t H, int64_t W) {
 // and ExpandEngine plus its own scratch for CSR build + coloring.
 class Solver {
 public:
-    explicit Solver(int n_threads)
-        : n_threads_(n_threads <= 0 ? 1 : n_threads),
+    explicit Solver(double n_threads)
+        : n_threads_(resolve_threads(n_threads)),
           pool_(std::make_unique<ncolor_cpp::ForkJoinPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
 
     int n_threads() const { return n_threads_; }
@@ -462,7 +489,7 @@ PYBIND11_MODULE(ncolor_cpp_proto, m) {
         "Construct once with the desired worker count; the underlying\n"
         "std::thread workers live for the engine's lifetime, so call cost\n"
         "is just task enqueue + dispatch (sub-millisecond on a warm pool).")
-        .def(py::init<int>(), py::arg("n_threads") = 1)
+        .def(py::init<double>(), py::arg("n_threads") = -1.0)
         .def_property_readonly("n_threads", &ConnectEngine::n_threads)
         .def("find_pairs", &ConnectEngine::find_pairs,
              py::arg("line"), py::arg("nbs"), py::arg("ht_size"),
@@ -473,7 +500,7 @@ PYBIND11_MODULE(ncolor_cpp_proto, m) {
         "Persistent threadpool wrapper for expand_labels + apply_lut.\n"
         "One engine per pipeline; the pool and intermediate buffers are\n"
         "reused across calls.")
-        .def(py::init<int>(), py::arg("n_threads") = 1)
+        .def(py::init<double>(), py::arg("n_threads") = -1.0)
         .def_property_readonly("n_threads", &ExpandEngine::n_threads)
         .def("expand_labels", &ExpandEngine::expand_labels, py::arg("labels"),
              "Felzenszwalb-Huttenlocher Voronoi label expansion (L2, any ndim).")
@@ -492,8 +519,14 @@ PYBIND11_MODULE(ncolor_cpp_proto, m) {
         "End-to-end ncolor.label() equivalent for 2D conn=1 inputs.\n"
         "Wraps a single ThreadPool and re-uses all intermediate buffers,\n"
         "so the per-call cost is just task enqueue + the actual work.\n"
-        "Returns (colored_image_uint8, n_colors_used).")
-        .def(py::init<int>(), py::arg("n_threads") = 1)
+        "Returns (colored_image_uint8, n_colors_used).\n"
+        "\n"
+        "n_threads conventions:\n"
+        "  -1 (default), 0, negative  → auto (use cached calibration)\n"
+        "  0 < x < 1                  → fraction × os.cpu_count() (e.g. 0.5)\n"
+        "  1                          → serial\n"
+        "  N >= 1                     → exact thread count")
+        .def(py::init<double>(), py::arg("n_threads") = -1.0)
         .def_property_readonly("n_threads", &Solver::n_threads)
         .def("label", &Solver::label,
              py::arg("mask"), py::arg("n_colors") = 4,
