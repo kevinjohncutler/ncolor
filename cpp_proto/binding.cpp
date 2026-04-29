@@ -129,17 +129,30 @@ public:
     py::array_t<int32_t> expand_labels_l1(
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels) {
         const auto buf = labels.request();
-        if (buf.ndim != 2) throw std::invalid_argument("expand_labels_l1 expects 2D input");
-        const int64_t H = buf.shape[0];
-        const int64_t W = buf.shape[1];
+        const int ndim = static_cast<int>(buf.ndim);
+        if (ndim < 2) throw std::invalid_argument(
+            "expand_labels_l1 expects ndim >= 2");
+        std::vector<int64_t> shape(ndim);
+        int64_t total = 1;
+        for (int d = 0; d < ndim; ++d) {
+            shape[d] = static_cast<int64_t>(buf.shape[d]);
+            total *= shape[d];
+        }
         const int32_t* input = static_cast<const int32_t*>(buf.ptr);
         py::array_t<int32_t> out(buf.shape);
         int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
-        bufs_.resize(H * W);
-        std::memcpy(out_ptr, input, H * W * sizeof(int32_t));
+        bufs_.resize(total);
+        std::memcpy(out_ptr, input, total * sizeof(int32_t));
         {
             py::gil_scoped_release release;
-            ncolor_cpp::chamfer_st_l1(out_ptr, bufs_.dist(), H, W, *pool_, n_threads_);
+            if (ndim == 2) {
+                // 2D fast path uses the dedicated stripe-friendly kernel.
+                ncolor_cpp::chamfer_st_l1(out_ptr, bufs_.dist(),
+                    shape[0], shape[1], *pool_, n_threads_);
+            } else {
+                ncolor_cpp::chamfer_st_l1_nd(out_ptr, bufs_.dist(),
+                    shape, *pool_, n_threads_);
+            }
         }
         return out;
     }
