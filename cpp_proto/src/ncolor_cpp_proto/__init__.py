@@ -23,6 +23,7 @@ On non-network mounts we fast-path to a direct ``importlib`` load.
 """
 from __future__ import annotations
 
+import importlib.machinery
 import os
 import shutil
 import subprocess
@@ -32,7 +33,19 @@ from pathlib import Path
 
 _THIS_DIR = Path(__file__).resolve().parent
 _IMPL_BASENAME = "_ncolor_cpp_proto_impl"
-_CACHE_ROOT = Path.home() / ".cache" / "ncolor_cpp_proto" / "lib"
+
+
+def _user_cache_dir() -> Path:
+    """Per-OS cache directory; falls back to ``~/.cache/`` if ``platformdirs``
+    isn't installed yet (e.g., during pip's pre-install build phase)."""
+    try:
+        from platformdirs import user_cache_dir
+        return Path(user_cache_dir("ncolor_cpp_proto"))
+    except ImportError:
+        return Path.home() / ".cache" / "ncolor_cpp_proto"
+
+
+_CACHE_ROOT = _user_cache_dir() / "lib"
 
 
 def _on_remote_mount(path: Path) -> bool:
@@ -59,14 +72,22 @@ def _on_remote_mount(path: Path) -> bool:
 
 
 def _find_impl() -> Path:
-    """Locate the compiled extension next to this ``__init__.py``."""
-    for ext in (".so", ".pyd"):
-        matches = sorted(_THIS_DIR.glob(f"{_IMPL_BASENAME}*{ext}"))
-        if matches:
-            return matches[0]
+    """Locate the compiled extension matching this Python's platform tag.
+
+    On a NAS-shared package directory, .so files for *every* host that has
+    built here may live alongside each other (e.g.,
+    ``cpython-310-x86_64-linux-gnu.so`` and ``cpython-312-darwin.so``).
+    Use ``importlib.machinery.EXTENSION_SUFFIXES`` so we only ever pick the
+    one this interpreter can actually load.
+    """
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        candidate = _THIS_DIR / f"{_IMPL_BASENAME}{suffix}"
+        if candidate.exists():
+            return candidate
     raise ImportError(
-        f"{_IMPL_BASENAME} shared object not found in {_THIS_DIR}; "
-        "did the extension build succeed?"
+        f"{_IMPL_BASENAME} extension matching this Python's platform tag "
+        f"not found in {_THIS_DIR}; did the build succeed for "
+        f"{sys.platform} {sys.implementation.name} {sys.version_info[:2]}?"
     )
 
 

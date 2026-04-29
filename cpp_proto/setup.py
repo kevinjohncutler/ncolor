@@ -120,6 +120,6 @@ setup(
     package_dir={"": "src"},
     packages=["ncolor_cpp_proto"],
     cmdclass={"build_ext": build_ext},
-    install_requires=["pybind11>=2.10", "numpy>=1.20"],
+    install_requires=["pybind11>=2.10", "numpy>=1.20", "platformdirs"],
     python_requires=">=3.10",
 )

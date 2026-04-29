@@ -33,7 +33,23 @@ import sys
 import time
 from pathlib import Path
 
-CACHE_PATH = Path.home() / ".cache" / "ncolor_cpp_proto" / "smt_threads.json"
+
+def _user_cache_dir() -> Path:
+    """Per-OS cache directory (``~/Library/Caches/...`` on macOS,
+    ``~/.cache/...`` on Linux, ``%LOCALAPPDATA%\\...\\Cache`` on Windows).
+
+    Falls back to ``~/.cache/ncolor_cpp_proto/`` if ``platformdirs`` isn't
+    available (e.g., during pip's pre-install build phase before
+    ``install_requires`` has been processed).
+    """
+    try:
+        from platformdirs import user_cache_dir
+        return Path(user_cache_dir("ncolor_cpp_proto"))
+    except ImportError:
+        return Path.home() / ".cache" / "ncolor_cpp_proto"
+
+
+CACHE_PATH = _user_cache_dir() / "smt_threads.json"
 CALIBRATION_SIZE = 1024
 
 
@@ -129,19 +145,23 @@ def _save_cache(data: dict) -> None:
 
 
 def _make_calibration_mask(H: int, seed: int = 0):
+    """Cheap synthetic mask of axis-aligned boxes. We need *some* connected
+    components for ``Solver.label`` to exercise the expand kernel + adjacency
+    graph, but the exact shape doesn't matter for calibration. Boxes via
+    NumPy slice-assign are ~25× faster than ogrid+circle filtering."""
     import numpy as np
     rng = np.random.default_rng(seed)
     mask = np.zeros((H, H), dtype=np.int32)
     n = max(20, H * H // 8000)
-    for i in range(1, n + 1):
-        cy, cx = rng.integers(20, H - 20), rng.integers(20, H - 20)
-        r = int(rng.integers(8, max(16, H // 30)))
-        yy, xx = np.ogrid[:H, :H]
-        mask[(yy - cy) ** 2 + (xx - cx) ** 2 <= r * r] = i
+    centers = rng.integers(20, H - 20, size=(n, 2))
+    radii = rng.integers(8, max(16, H // 30), size=n)
+    for i, ((cy, cx), r) in enumerate(zip(centers, radii), 1):
+        mask[max(0, cy - r):cy + r, max(0, cx - r):cx + r] = i
     return mask
 
 
-def _time_solver(sv, mask, warmup: int = 5, iters: int = 20) -> float:
+def _time_solver(sv, mask, warmup: int = 2, iters: int = 5) -> float:
+    """Min-of-N wall-clock timing of ``sv.label(mask)``."""
     for _ in range(warmup):
         sv.label(mask)
     best = float("inf")
@@ -188,13 +208,24 @@ def calibrate(force: bool = False, verbose: bool = False) -> int:
 
     mask = _make_calibration_mask(CALIBRATION_SIZE)
 
-    sv = nc.Solver(phys)
-    t_phys = _time_solver(sv, mask)
-    del sv
+    # Two-pass adaptive timing. First pass uses few iters (~5) — fast
+    # (~50-100 ms total) and reliable when the SMT gap is large (≥10%).
+    # If the two timings come out within 10% of each other, redo with
+    # min-of-20 to pin down the winner — the only host where this matters
+    # is i9-9900K where SMT helps by ~3-5%.
+    def time_pair(warmup, iters):
+        sv = nc.Solver(phys)
+        tp = _time_solver(sv, mask, warmup=warmup, iters=iters)
+        del sv
+        sv = nc.Solver(log)
+        tl = _time_solver(sv, mask, warmup=warmup, iters=iters)
+        del sv
+        return tp, tl
 
-    sv = nc.Solver(log)
-    t_log = _time_solver(sv, mask)
-    del sv
+    t_phys, t_log = time_pair(warmup=2, iters=5)
+    margin = abs(t_phys - t_log) / min(t_phys, t_log)
+    if margin < 0.10:
+        t_phys, t_log = time_pair(warmup=3, iters=20)
 
     chosen = log if t_log < t_phys * 0.98 else phys
 
