@@ -153,9 +153,18 @@ public:
     // In-place label compaction: rewrite nonzero labels to 1..N (with
     // bg=0). Min-shift semantics match the legacy ``format_labels``:
     // if min(labels) != 0, the min is treated as bg and everything is
-    // shifted before compacting. Returns (formatted_array, n_labels).
+    // shifted before compacting.
+    //
+    // ``first_seen=False`` (default) uses ascending-source numbering
+    // (fast: parallel mark + serial scan over [1..max] + parallel
+    // apply). ``first_seen=True`` uses input-order numbering (matches
+    // fastremap.renumber bit-for-bit; build pass is serial through
+    // the input array — slower).
+    //
+    // Returns (formatted_array, n_labels).
     std::pair<py::array_t<int32_t>, int> format_labels(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels) {
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
+            bool first_seen = false) {
         const auto buf = labels.request();
         const int64_t total = buf.size;
         py::array_t<int32_t> out(buf.shape);
@@ -164,8 +173,11 @@ public:
         int n_labels;
         {
             py::gil_scoped_release release;
-            n_labels = ncolor_cpp::format_labels_inplace(
-                out_ptr, total, *pool_, n_threads_);
+            n_labels = first_seen
+                ? ncolor_cpp::format_labels_inplace_first_seen(
+                    out_ptr, total, *pool_, n_threads_)
+                : ncolor_cpp::format_labels_inplace(
+                    out_ptr, total, *pool_, n_threads_);
         }
         return {std::move(out), n_labels};
     }
@@ -625,11 +637,15 @@ PYBIND11_MODULE(_impl, m) {
              "Default p=2 matches numba's expand_labels(metric='l2').")
         .def("expand_labels_timed", &ExpandEngine::expand_labels_timed, py::arg("labels"),
              "expand_labels(p=2) + per-stage (name, ms) breakdown.")
-        .def("format_labels", &ExpandEngine::format_labels, py::arg("labels"),
+        .def("format_labels", &ExpandEngine::format_labels,
+             py::arg("labels"), py::arg("first_seen") = false,
              "Compact nonzero labels to 1..N. If min(labels) != 0 the\n"
              "min is treated as background and everything is shifted\n"
              "before compaction (matches legacy fastremap-based\n"
-             "format_labels). Returns (formatted_array, n_labels).")
+             "format_labels). first_seen=True matches fastremap.renumber\n"
+             "bit-for-bit (input-order numbering, serial build pass);\n"
+             "default first_seen=False uses ascending-source numbering\n"
+             "(parallel build, faster). Returns (formatted_array, n_labels).")
         .def("apply_lut", &ExpandEngine::apply_lut,
              py::arg("flat_lab"), py::arg("lut"),
              "Parallel scatter: out[i] = lut[flat_lab[i]]. Lut must be uint8 or int32.");

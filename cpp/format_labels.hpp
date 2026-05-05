@@ -35,6 +35,106 @@
 
 namespace ncolor_cpp {
 
+// First-seen-numbering variant: mirrors fastremap.renumber's output
+// exactly. Build pass is inherently serial — assigns a new sequential
+// label the first time each source value is encountered in input scan
+// order. Apply pass parallelizes. Used to bench the cost of bit-equality
+// with fastremap; production code uses ``format_labels_inplace`` (the
+// ascending-source variant) which is faster.
+inline int32_t format_labels_inplace_first_seen(
+        int32_t* lbl, int64_t total,
+        ForkJoinPool& pool, int n_threads) {
+    if (total <= 0) return 0;
+
+    // 1. Min/max reduce (parallel) — same as the ascending variant.
+    constexpr int32_t INT32_MIN_VAL = std::numeric_limits<int32_t>::min();
+    constexpr int32_t INT32_MAX_VAL = std::numeric_limits<int32_t>::max();
+    int32_t min_lbl = INT32_MAX_VAL, max_lbl = INT32_MIN_VAL;
+    if (n_threads <= 1 || total < 500000) {
+        for (int64_t i = 0; i < total; ++i) {
+            const int32_t v = lbl[i];
+            if (v < min_lbl) min_lbl = v;
+            if (v > max_lbl) max_lbl = v;
+        }
+    } else {
+        const size_t n_chunks =
+            static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD;
+        const size_t total_sz = static_cast<size_t>(total);
+        const size_t actual_chunks = std::min(n_chunks, total_sz);
+        const size_t chunk_sz = (total_sz + actual_chunks - 1) / actual_chunks;
+        std::vector<int32_t> mins(actual_chunks, INT32_MAX_VAL);
+        std::vector<int32_t> maxs(actual_chunks, INT32_MIN_VAL);
+        std::atomic<size_t> next{0};
+        pool.parallel([&]() {
+            size_t idx;
+            while ((idx = next.fetch_add(1, std::memory_order_relaxed))
+                   < actual_chunks) {
+                const size_t i0 = idx * chunk_sz;
+                const size_t i1 = std::min(i0 + chunk_sz, total_sz);
+                int32_t mn = INT32_MAX_VAL, mx = INT32_MIN_VAL;
+                for (size_t i = i0; i < i1; ++i) {
+                    const int32_t v = lbl[i];
+                    if (v < mn) mn = v;
+                    if (v > mx) mx = v;
+                }
+                mins[idx] = mn; maxs[idx] = mx;
+            }
+        });
+        for (size_t i = 0; i < actual_chunks; ++i) {
+            if (mins[i] < min_lbl) min_lbl = mins[i];
+            if (maxs[i] > max_lbl) max_lbl = maxs[i];
+        }
+    }
+    if (max_lbl <= min_lbl) return 0;
+
+    // 2. Min-shift if needed (parallel).
+    if (min_lbl != 0) {
+        const int32_t shift = -min_lbl;
+        if (n_threads <= 1 || total < 500000) {
+            for (int64_t i = 0; i < total; ++i) lbl[i] += shift;
+        } else {
+            dispatch_parallel(pool, static_cast<size_t>(total),
+                static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD,
+                [lbl, shift](size_t i0, size_t i1) {
+                    for (size_t i = i0; i < i1; ++i) lbl[i] += shift;
+                });
+        }
+        max_lbl += shift;
+    }
+    if (max_lbl <= 0) return 0;
+
+    // 3. SERIAL build: dense table[l] = remapped_label. The first time
+    // we encounter a label, assign next_lbl++ and remember. This is
+    // the part that's inherently sequential — fastremap's bit-equality
+    // requires this exact scan order.
+    std::vector<int32_t> table(static_cast<size_t>(max_lbl) + 1, 0);
+    int32_t next_lbl = 0;
+    for (int64_t i = 0; i < total; ++i) {
+        const int32_t l = lbl[i];
+        if (l > 0 && table[static_cast<size_t>(l)] == 0) {
+            table[static_cast<size_t>(l)] = ++next_lbl;
+        }
+    }
+    if (next_lbl == 0) return 0;
+
+    // 4. Parallel apply.
+    if (n_threads <= 1 || total < 500000) {
+        for (int64_t i = 0; i < total; ++i) {
+            lbl[i] = table[static_cast<size_t>(lbl[i])];
+        }
+    } else {
+        const int32_t* table_ptr = table.data();
+        dispatch_parallel(pool, static_cast<size_t>(total),
+            static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD,
+            [lbl, table_ptr](size_t i0, size_t i1) {
+                for (size_t i = i0; i < i1; ++i) {
+                    lbl[i] = table_ptr[static_cast<size_t>(lbl[i])];
+                }
+            });
+    }
+    return next_lbl;
+}
+
 inline int32_t format_labels_inplace(int32_t* lbl, int64_t total,
                                      ForkJoinPool& pool, int n_threads) {
     if (total <= 0) return 0;
