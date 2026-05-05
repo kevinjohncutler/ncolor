@@ -477,6 +477,73 @@ inline void envelope_pass_strided(
     });
 }
 
+// ABC strided variant: sweep axis B in an (A, B, C)-laid-out array.
+// Each line k = (a, c) starts at base = a*B*C + c, length B, stride C.
+// Avoids the 4-pass transpose+contiguous+transpose round-trip on axes
+// where the column working set fits in cache. For 3D 256³ axis 1
+// (B*C=65K elements ≈ 256 KiB) this halves expand time vs transpose.
+//
+// Bigger strides (e.g. 3D axis 0 where stride=H*W spans the whole image)
+// are still cache-unfriendly; the caller is responsible for choosing
+// strided vs transpose. See expand_labels_inplace for the threshold.
+inline void envelope_pass_strided_abc(
+        int32_t* h_lbl, int32_t* h_dist,
+        int64_t A, int64_t B, int64_t C,
+        ForkJoinPool& pool, int n_threads,
+        std::vector<EnvelopeScratch>& scratch) {
+    if (n_threads < 1) n_threads = 1;
+    const int eff_threads = static_cast<int>(compute_threads(
+        static_cast<size_t>(n_threads),
+        static_cast<size_t>(A * C),
+        static_cast<size_t>(B)));
+    if (static_cast<int>(scratch.size()) < eff_threads) scratch.resize(eff_threads);
+    const size_t cap = static_cast<size_t>(B) + 1;
+    for (int t = 0; t < eff_threads; ++t) scratch[t].resize(cap);
+
+    const int64_t n_lines = A * C;
+    if (eff_threads == 1 || n_lines < 2) {
+        auto& sc = scratch[0];
+        for (int64_t k = 0; k < n_lines; ++k) {
+            const int64_t a = k / C;
+            const int64_t c = k % C;
+            const int64_t base = a * B * C + c;
+            envelope_pass_row(h_lbl + base, h_dist + base, B, /*stride=*/C,
+                              sc.v.data(), sc.lblstk.data(), sc.g.data(),
+                              sc.z.data(), sc.vd.data(), sc.vd_sq.data());
+        }
+        return;
+    }
+
+    const int n_chunks = static_cast<int>(std::min<int64_t>(
+        n_lines, static_cast<int64_t>(eff_threads) * DISPATCH_CHUNKS_PER_THREAD));
+    const int64_t chunk_sz = (n_lines + n_chunks - 1) / n_chunks;
+    std::atomic<int> tid_next{0};
+    std::atomic<int> chunk_next{0};
+    pool.parallel([&]() {
+        const int my_tid = tid_next.fetch_add(1, std::memory_order_relaxed);
+        if (my_tid >= eff_threads) return;
+        auto& sc = scratch[my_tid];
+        int32_t* vp = sc.v.data();
+        int32_t* lp = sc.lblstk.data();
+        int32_t* gp = sc.g.data();
+        double* zp = sc.z.data();
+        double* vdp = sc.vd.data();
+        double* vdsqp = sc.vd_sq.data();
+        int idx;
+        while ((idx = chunk_next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
+            const int64_t k0 = static_cast<int64_t>(idx) * chunk_sz;
+            const int64_t k1 = std::min(k0 + chunk_sz, n_lines);
+            for (int64_t k = k0; k < k1; ++k) {
+                const int64_t a = k / C;
+                const int64_t c = k % C;
+                const int64_t base = a * B * C + c;
+                envelope_pass_row(h_lbl + base, h_dist + base, B, /*stride=*/C,
+                                  vp, lp, gp, zp, vdp, vdsqp);
+            }
+        }
+    });
+}
+
 // Blocked batched transpose: src(A,B,C) → dst(A,C,B), for two arrays
 // in lockstep (label + dist). Tile size 64 matches edt::TRANSPOSE_BLOCK
 // (also matches the numba version's Bi=64). Uses atomic work-stealing
@@ -583,19 +650,32 @@ inline void expand_labels_inplace(
             // First axis: midpoint fast path (edt's _expand_pass0).
             const int64_t n_slices = total / n;
             envelope_pass0(h_lbl, h_dist, n_slices, n, pool, n_threads, bufs.scratch());
+            continue;
+        }
+        int64_t A = 1;
+        for (int d = 0; d < ax; ++d) A *= shape[d];
+        int64_t C = 1;
+        for (int d = ax + 1; d < ndim; ++d) C *= shape[d];
+        const int64_t B = n;
+
+        // Pick strided slab sweep vs transpose+contig+transpose. Strided
+        // wins only when there's an outer A dimension providing implicit
+        // cache-blocking across slabs AND each slab (B*C elements) fits
+        // in L2. For 3D 256³ axis 1 (A=256, B*C=64K) the per-slab
+        // working set stays in cache and we skip 2× full-array transpose
+        // bandwidth. For 2D and 3D outermost axes (A=1) there is no
+        // slab structure: the entire image is one sweep, and strided
+        // access through the whole array busts the cache and loses
+        // vectorization, so transpose+contig wins by ~25%.
+        //
+        // Threshold: A >= 2 (have a slab axis) AND B*C <= 4M ints (~16
+        // MiB ≤ M2 shared L2). Tuned on M2 / AMD Ryzen / Threadripper.
+        constexpr int64_t STRIDED_SLAB_LIMIT = 4 * 1024 * 1024;
+        const bool use_strided = (A >= 2) && (B * C <= STRIDED_SLAB_LIMIT);
+        if (use_strided) {
+            envelope_pass_strided_abc(h_lbl, h_dist, A, B, C,
+                                      pool, n_threads, bufs.scratch());
         } else {
-            // Subsequent axes: tested both stride-aware and transpose-then-
-            // contiguous. For 2D images with axis-0 length ≤ ~512 the strided
-            // variant wins (column fits in L1); for ≥ 1024 the cache-line
-            // utilization at column stride busts L2 (1/16 of every line is
-            // useful) and the transpose roundtrip wins by a 2× margin.
-            // Transpose is the universal default; strided is available via
-            // ``envelope_pass_strided`` for callers who know their geometry.
-            int64_t A = 1;
-            for (int d = 0; d < ax; ++d) A *= shape[d];
-            int64_t C = 1;
-            for (int d = ax + 1; d < ndim; ++d) C *= shape[d];
-            const int64_t B = n;
             batch_transpose<int32_t>(h_lbl, h_dist, t_lbl, t_dist, A, B, C, pool, n_threads);
             envelope_pass(t_lbl, t_dist, A * C, B, pool, n_threads, bufs.scratch());
             batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads);
