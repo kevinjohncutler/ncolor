@@ -19,6 +19,7 @@
 
 #include "chamfer.hpp"
 #include "color.hpp"
+#include "expand_lp.hpp"
 #include "connect.hpp"
 #include "dispatch.hpp"
 #include "expand.hpp"
@@ -119,65 +120,38 @@ public:
 
     int n_threads() const { return n_threads_; }
 
-    // Equivalent to ncolor.expand.expand_labels(label_image): for every
-    // background pixel (=0), assign the label of the nearest seed by
-    // squared-Euclidean distance via the separable parabolic-envelope
-    // algorithm. Works on int32 ndarrays, any number of dims.
-    // L1 (Manhattan) chamfer expand — Saito-Toriwaki separable transform
-    // (default, recommended). Two 1D passes per axis, no boundary fixup,
-    // clean parallel scaling.
-    py::array_t<int32_t> expand_labels_l1(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels) {
+    // Voronoi label expansion under L_p metric. ``p=1`` (Manhattan) uses the
+    // Saito-Toriwaki separable sweep; ``p=2`` (Euclidean²) uses the
+    // Felzenszwalb-Huttenlocher parabolic envelope. Same ND driver,
+    // dispatched at compile time on p — see ``expand_lp.hpp``. Default is
+    // p=2 (matches numba's ``expand_labels(metric='l2')``).
+    py::array_t<int32_t> expand_labels(
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
+            int p = 2) {
         const auto buf = labels.request();
-        const int ndim = static_cast<int>(buf.ndim);
-        if (ndim < 2) throw std::invalid_argument(
-            "expand_labels_l1 expects ndim >= 2");
-        std::vector<int64_t> shape(ndim);
-        int64_t total = 1;
-        for (int d = 0; d < ndim; ++d) {
-            shape[d] = static_cast<int64_t>(buf.shape[d]);
-            total *= shape[d];
-        }
+        std::vector<int64_t> shape(buf.ndim);
+        for (int i = 0; i < buf.ndim; ++i) shape[i] = buf.shape[i];
+
         const int32_t* input = static_cast<const int32_t*>(buf.ptr);
         py::array_t<int32_t> out(buf.shape);
         int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
-        bufs_.resize(total);
-        std::memcpy(out_ptr, input, total * sizeof(int32_t));
+
         {
             py::gil_scoped_release release;
-            if (ndim == 2) {
-                // 2D fast path uses the dedicated stripe-friendly kernel.
-                ncolor_cpp::chamfer_st_l1(out_ptr, bufs_.dist(),
-                    shape[0], shape[1], *pool_, n_threads_);
+            if (p == 2) {
+                ncolor_cpp::expand_labels_lp<2>(input, out_ptr, bufs_, shape, *pool_, n_threads_);
+            } else if (p == 1) {
+                ncolor_cpp::expand_labels_lp<1>(input, out_ptr, bufs_, shape, *pool_, n_threads_);
             } else {
-                ncolor_cpp::chamfer_st_l1_nd(out_ptr, bufs_.dist(),
-                    shape, *pool_, n_threads_);
+                throw std::invalid_argument("expand_labels: p must be 1 or 2");
             }
         }
         return out;
     }
 
-    // L1 chamfer expand using the Rosenfeld–Pfaltz row-band method (legacy
-    // path with boundary fixup). Kept for benchmarking against Saito-Toriwaki.
-    py::array_t<int32_t> expand_labels_l1_rp(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels) {
-        const auto buf = labels.request();
-        if (buf.ndim != 2) throw std::invalid_argument("expand_labels_l1_rp expects 2D input");
-        const int64_t H = buf.shape[0];
-        const int64_t W = buf.shape[1];
-        const int32_t* input = static_cast<const int32_t*>(buf.ptr);
-        py::array_t<int32_t> out(buf.shape);
-        int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
-        bufs_.resize(H * W);
-        std::memcpy(out_ptr, input, H * W * sizeof(int32_t));
-        {
-            py::gil_scoped_release release;
-            ncolor_cpp::chamfer_l1_parallel(out_ptr, bufs_.dist(), H, W, *pool_, n_threads_);
-        }
-        return out;
-    }
-
-    // Same as expand_labels but returns a (output, list[(stage_name, ms)]) tuple.
+    // Same as expand_labels but returns a (output, list[(stage_name, ms)])
+    // tuple — used by callers that want to attribute time to expand /
+    // find_pairs / build_csr / color / apply_lut. p=2 only for now.
     std::pair<py::array_t<int32_t>, std::vector<std::pair<std::string, double>>>
     expand_labels_timed(
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels) {
@@ -195,24 +169,6 @@ public:
             std::memcpy(out_ptr, bufs_.lbl(), bufs_.size() * sizeof(int32_t));
         }
         return {std::move(out), std::move(stages)};
-    }
-
-    py::array_t<int32_t> expand_labels(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels) {
-        const auto buf = labels.request();
-        std::vector<int64_t> shape(buf.ndim);
-        for (int i = 0; i < buf.ndim; ++i) shape[i] = buf.shape[i];
-
-        const int32_t* input = static_cast<const int32_t*>(buf.ptr);
-        py::array_t<int32_t> out(buf.shape);
-        int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
-
-        {
-            py::gil_scoped_release release;
-            ncolor_cpp::expand_labels_inplace(input, bufs_, shape, *pool_, n_threads_);
-            std::memcpy(out_ptr, bufs_.lbl(), bufs_.size() * sizeof(int32_t));
-        }
-        return out;
     }
 
     // Parallel scatter: out[i] = lut[flat_lab[i]] for every i. Used by
@@ -380,10 +336,12 @@ public:
     // where 4 colors aren't enough or BFS fails to converge, the caller
     // should fall back to ncolor.label (which has the full repair chain).
     //
-    // ``use_l1=True`` swaps the L2 parabolic expand for L1 chamfer (~5× faster
-    // at 2048²). Boundary placement differs from numba's L2 expand at ~5% of
-    // pixels, but the resulting adjacency graph is nearly always isomorphic
-    // — the 4-coloring still works.
+    // ``p`` selects the expand metric: p=2 (Felzenszwalb parabolic
+    // envelope, default — bit-identical to numba's L2 expand) or p=1
+    // (Saito-Toriwaki sweep — Manhattan distance, ~5× faster at 2048²).
+    // Boundary placement under p=1 differs from p=2 at ~5% of pixels;
+    // the adjacency graph is nearly always isomorphic — the 4-coloring
+    // still works either way.
     // Per-stage timing breakdown (filled by `label` when capture_stages=true).
     std::vector<std::pair<std::string, double>> last_stages_;
     std::vector<std::pair<std::string, double>> get_last_stages() const { return last_stages_; }
@@ -391,13 +349,15 @@ public:
     std::pair<py::array_t<uint8_t>, int> label(
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> mask,
             int n_colors = 4, int max_depth = 30, int rand_period = 10,
-            int conn = 2, bool use_l1 = false, bool capture_stages = false) {
+            int conn = 2, int p = 2, bool capture_stages = false) {
         const auto buf = mask.request();
         const int ndim = static_cast<int>(buf.ndim);
         if (ndim < 2) throw std::invalid_argument(
             "Solver.label expects a label image with ndim >= 2");
         if (conn < 1 || conn > ndim) throw std::invalid_argument(
             "Solver.label: conn must be in [1, ndim]");
+        if (p != 1 && p != 2) throw std::invalid_argument(
+            "Solver.label: p must be 1 or 2");
 
         std::vector<int64_t> shape(ndim);
         int64_t total = 1;
@@ -433,26 +393,17 @@ public:
             py::gil_scoped_release release;
 
             // 1. Expand labels (Voronoi) — every pixel ends up labeled.
-            int32_t* expanded;
-            if (use_l1) {
-                // L1 Saito-Toriwaki — 2D fast path uses the dedicated kernel,
-                // higher ndim uses the generic ND separable variant.
-                expand_bufs_.resize(total);
-                std::memcpy(expand_bufs_.lbl(), mask_ptr, total * sizeof(int32_t));
-                if (ndim == 2) {
-                    ncolor_cpp::chamfer_st_l1(
-                        expand_bufs_.lbl(), expand_bufs_.dist(), H, W,
-                        *pool_, n_threads_);
-                } else {
-                    ncolor_cpp::chamfer_st_l1_nd(
-                        expand_bufs_.lbl(), expand_bufs_.dist(), shape,
-                        *pool_, n_threads_);
-                }
-                expanded = expand_bufs_.lbl();
+            // Single ND driver dispatches on p at compile time:
+            // p=1 → Saito-Toriwaki sweep; p=2 → Felzenszwalb envelope.
+            // Result lands in expand_bufs_.lbl(); the L2 ``output ==
+            // bufs.lbl()`` self-copy is elided inside LpExpand<2>::expand,
+            // and L1's in-place sweep writes directly there.
+            expand_bufs_.resize(total);
+            int32_t* expanded = expand_bufs_.lbl();
+            if (p == 2) {
+                ncolor_cpp::expand_labels_lp<2>(mask_ptr, expanded, expand_bufs_, shape, *pool_, n_threads_);
             } else {
-                // L2 parabolic envelope — works for any ndim.
-                ncolor_cpp::expand_labels_inplace(mask_ptr, expand_bufs_, shape, *pool_, n_threads_);
-                expanded = expand_bufs_.lbl();
+                ncolor_cpp::expand_labels_lp<1>(mask_ptr, expanded, expand_bufs_, shape, *pool_, n_threads_);
             }
             stage("expand");
 
@@ -627,15 +578,14 @@ PYBIND11_MODULE(_impl, m) {
         "reused across calls.")
         .def(py::init<double>(), py::arg("n_threads") = -1.0)
         .def_property_readonly("n_threads", &ExpandEngine::n_threads)
-        .def("expand_labels", &ExpandEngine::expand_labels, py::arg("labels"),
-             "Felzenszwalb-Huttenlocher Voronoi label expansion (L2, any ndim).")
-        .def("expand_labels_l1", &ExpandEngine::expand_labels_l1, py::arg("labels"),
-             "L1 (Manhattan) Saito-Toriwaki separable Voronoi expansion (2D).\n"
-             "Faster but different boundary placement than the L2 parabolic.")
-        .def("expand_labels_l1_rp", &ExpandEngine::expand_labels_l1_rp, py::arg("labels"),
-             "L1 chamfer via Rosenfeld-Pfaltz row-band method (legacy).")
+        .def("expand_labels", &ExpandEngine::expand_labels,
+             py::arg("labels"), py::arg("p") = 2,
+             "Voronoi label expansion under L_p metric. p=1 (Manhattan,\n"
+             "Saito-Toriwaki sweep) or p=2 (Euclidean², Felzenszwalb\n"
+             "envelope). Same ND driver, dispatched at compile time on p.\n"
+             "Default p=2 matches numba's expand_labels(metric='l2').")
         .def("expand_labels_timed", &ExpandEngine::expand_labels_timed, py::arg("labels"),
-             "expand_labels + per-stage (name, ms) breakdown.")
+             "expand_labels(p=2) + per-stage (name, ms) breakdown.")
         .def("apply_lut", &ExpandEngine::apply_lut,
              py::arg("flat_lab"), py::arg("lut"),
              "Parallel scatter: out[i] = lut[flat_lab[i]]. Lut must be uint8 or int32.");
@@ -660,16 +610,15 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("mask"), py::arg("n_colors") = 4,
              py::arg("max_depth") = 30, py::arg("rand_period") = 10,
              py::arg("conn") = 2,
-             py::arg("use_l1") = false, py::arg("capture_stages") = false,
+             py::arg("p") = 2, py::arg("capture_stages") = false,
              "Run expand_labels → connect → CSR build → BFS color → apply LUT.\n"
              "Supports 2D and 3D inputs (any ndim ≥ 2 actually).\n"
              "conn: 2D ∈ {1, 2}, 3D ∈ {1, 2, 3}. Matches\n"
              "scipy.ndimage.generate_binary_structure semantics. The 2D conn=2\n"
              "case takes a fast path that skips padding (~1 ms saved at 2048²).\n"
-             "use_l1=True swaps the parabolic L2 expand for an L1 chamfer\n"
-             "(~5× faster, slightly different boundary placement). The ND\n"
-             "Saito-Toriwaki separable transform is used for ndim > 2; the\n"
-             "dedicated 2D kernel is used for ndim == 2.")
+             "p selects the expand metric: p=2 (Felzenszwalb parabolic\n"
+             "envelope, default) or p=1 (Saito-Toriwaki sweep, ~5× faster\n"
+             "with slightly different boundary placement at ties).")
         .def("get_last_stages", &Solver::get_last_stages,
              "Per-stage timing breakdown from the most recent label() call\n"
              "made with capture_stages=True.");

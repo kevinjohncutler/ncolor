@@ -1,29 +1,39 @@
 """Public ``ncolor.expand_labels`` API — thin wrapper over the C++
 :class:`ncolor._backend.ExpandEngine`. Falls back to the numba reference
-for ndims/metrics the C++ engine doesn't yet support.
+when there's nothing to expand (empty array / no labels).
 """
 from __future__ import annotations
 
 import numpy as np
 
 
-def expand_labels(label_image, metric: str = "l2"):
-    """Voronoi label expansion across background pixels.
+def expand_labels(label_image, p: int = 2, *, metric: str | None = None):
+    """Voronoi label expansion across background pixels under L_p metric.
 
-    ``metric='l2'`` uses the Felzenszwalb-Huttenlocher parabolic envelope
-    (any ndim). ``metric='l1'`` uses the Saito-Toriwaki separable chamfer
-    (faster on 2D; ND is supported but only marginally faster than L2).
+    ``p=2`` uses the Felzenszwalb-Huttenlocher parabolic envelope (any
+    ndim, default). ``p=1`` uses the Saito-Toriwaki separable sweep —
+    Manhattan distance, ~5× faster on 2D, slightly different boundary
+    placement at ties.
+
+    Legacy ``metric='l1'``/``'l2'`` strings are accepted for backward
+    compatibility and translated to ``p=1``/``p=2``.
     """
+    if metric is not None:
+        if metric == "l2":
+            p = 2
+        elif metric == "l1":
+            p = 1
+        else:
+            raise ValueError(f"Unknown metric: {metric!r} (use 'l1' or 'l2')")
+    if p not in (1, 2):
+        raise ValueError(f"p must be 1 or 2, got {p!r}")
+
     arr = np.asarray(label_image)
     if arr.size == 0 or int(arr.max()) == 0:
         # Nothing to expand — fall back to legacy (handles the empty case).
         from ._numba_legacy.expand import expand_labels as _legacy
-        return _legacy(label_image, metric=metric)
+        return _legacy(label_image, metric="l2" if p == 2 else "l1")
 
     from ._backend import ExpandEngine
     eng = ExpandEngine()  # auto-thread count from calibration cache
-    if metric == "l2":
-        return eng.expand_labels(arr.astype(np.int32, copy=False))
-    if metric == "l1":
-        return eng.expand_labels_l1(arr.astype(np.int32, copy=False))
-    raise ValueError(f"Unknown metric: {metric!r} (use 'l1' or 'l2')")
+    return eng.expand_labels(arr.astype(np.int32, copy=False), p=p)

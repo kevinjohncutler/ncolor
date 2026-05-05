@@ -36,6 +36,7 @@
 
 #include "dispatch.hpp"
 #include "threadpool.h"
+#include "lp_metric.hpp"
 
 namespace ncolor_cpp {
 
@@ -257,9 +258,9 @@ inline void envelope_pass_row(
     }
 }
 
-// Per-worker scratch for envelope_pass. Held by ExpandBuffers so allocations
-// persist across calls (the numba version pays the same cost per call inside
-// each @njit prange iteration).
+// =============================================================================
+// Per-worker scratch for the unified Lp envelope pass and the legacy L2
+// kernels. Held by ExpandBuffers so allocations persist across calls.
 struct EnvelopeScratch {
     std::vector<int32_t> v, lblstk, g;
     std::vector<double> z, vd, vd_sq;
@@ -274,6 +275,9 @@ struct EnvelopeScratch {
         }
     }
 };
+
+
+// =============================================================================
 
 // Pass-0 fast path (sparse first-axis input, all seeds have dist=0).
 //
@@ -521,6 +525,8 @@ void batch_transpose(
                       tile_work);
 }
 
+// =============================================================================
+
 // Holds buffers for repeated calls. Keep one per Python ExpandEngine instance.
 class ExpandBuffers {
 public:
@@ -547,6 +553,9 @@ private:
     int64_t size_ = 0;
     std::vector<EnvelopeScratch> scratch_;
 };
+
+
+// =============================================================================
 
 // Run expand_labels on a row-major label image of arbitrary ndim.
 // `shape` is the image shape; total = product of shape entries; the output
