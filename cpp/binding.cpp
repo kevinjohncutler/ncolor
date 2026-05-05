@@ -499,7 +499,11 @@ public:
             int n_colors = 4, int max_depth = 30, int rand_period = 10,
             int conn = 2, int p = 2, bool capture_stages = false,
             bool format_input = true, bool expand = true,
-            py::object out_arg = py::none()) {
+            py::object out_arg = py::none(),
+            int color_mode = -1) {
+        // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
+        // 1 = force parallel. Used by benchmarks to A/B test the parallel
+        // coloring path without rebuilding the extension.
         // Require C-contiguous; pybind11 doesn't enforce that for the
         // untyped py::array, so check explicitly. Common dtypes accepted
         // (uint8/uint16/uint32, int8/int16/int32/int64) and fused with
@@ -792,7 +796,11 @@ public:
             bool ok = false;
             // Threshold tuned on M2 / 20-thread ForkJoinPool: below ~500
             // edges the BFS finishes in <100 µs and dispatch eats the win.
-            const bool color_parallel = (n_threads_ > 1) &&
+            // color_mode override: 0 = forced serial, 1 = forced parallel.
+            bool color_parallel;
+            if (color_mode == 0) color_parallel = false;
+            else if (color_mode == 1) color_parallel = (n_threads_ > 1);
+            else color_parallel = (n_threads_ > 1) &&
                 (static_cast<int64_t>(N) + M >= 500);
             if (color_parallel) {
                 per_attempt_colors_.resize(attempts_per_n);
@@ -1001,7 +1009,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("conn") = 2,
              py::arg("p") = 2, py::arg("capture_stages") = false,
              py::arg("format_input") = true, py::arg("expand") = true,
-             py::arg("out") = py::none(),
+             py::arg("out") = py::none(), py::arg("color_mode") = -1,
              "Run [format_labels →] [expand →] connect → CSR → color → apply_lut.\n"
              "Supports 2D and 3D inputs (any ndim ≥ 2 actually).\n"
              "conn: 2D ∈ {1, 2}, 3D ∈ {1, 2, 3}. Matches\n"
