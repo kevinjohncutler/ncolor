@@ -1,4 +1,4 @@
-"""SMT/HT thread-count auto-calibration for ``ncolor_cpp_proto.Solver``.
+"""SMT/HT thread-count auto-calibration for ``ncolor._backend.Solver``.
 
 Whether SMT (AMD) / HT (Intel) helps for our expand kernel depends on the
 specific chip's memory subsystem and cache topology. Empirically:
@@ -16,7 +16,8 @@ T=logical once per machine, cache the result.
 
 Calibration runs at 1024² (the smallest size where SMT vs no-SMT separates
 cleanly across all hosts we tested) and takes ~200 ms. Result is cached at
-``~/.cache/ncolor_cpp_proto/smt_threads.json`` keyed by (hostname, CPU model).
+``platformdirs.user_cache_dir("ncolor") / smt_threads.json`` keyed by
+(hostname, CPU model).
 
 Public API:
     auto_threads()         — return cached optimal, fall back to physical
@@ -44,7 +45,7 @@ def _user_cache_dir() -> Path:
     path than the build-time hook did.
     """
     from platformdirs import user_cache_dir
-    return Path(user_cache_dir("ncolor_cpp_proto"))
+    return Path(user_cache_dir("ncolor"))
 
 
 CACHE_PATH = _user_cache_dir() / "smt_threads.json"
@@ -188,7 +189,8 @@ def calibrate(force: bool = False, verbose: bool = False) -> int:
 
     Returns the picked thread count.
     """
-    import ncolor_cpp_proto as nc
+    # Local import to avoid a circular import: _backend/__init__.py imports us.
+    from . import _impl as nc
 
     phys = _physical_cores()
     log = os.cpu_count() or phys
@@ -228,7 +230,7 @@ def calibrate(force: bool = False, verbose: bool = False) -> int:
     chosen = log if t_log < t_phys * 0.98 else phys
 
     if verbose:
-        print(f"[ncolor_cpp_proto] calibrated SMT on {key}: "
+        print(f"[ncolor] calibrated SMT on {key}: "
               f"T={phys}: {t_phys*1000:.2f} ms, T={log}: {t_log*1000:.2f} ms "
               f"→ T={chosen}")
 
@@ -252,7 +254,7 @@ def auto_threads() -> int:
 
 if __name__ == "__main__":
     import argparse
-    p = argparse.ArgumentParser(description="Calibrate SMT thread count for ncolor_cpp_proto.Solver.")
+    p = argparse.ArgumentParser(description="Calibrate SMT thread count for ncolor._backend.Solver.")
     p.add_argument("--force", action="store_true", help="Re-run even if cached.")
     p.add_argument("--show", action="store_true", help="Print current cache and exit.")
     args = p.parse_args()

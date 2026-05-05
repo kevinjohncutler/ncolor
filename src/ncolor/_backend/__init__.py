@@ -1,9 +1,9 @@
-"""Loader for the ``_ncolor_cpp_proto_impl`` C++ extension.
+"""Loader for ``ncolor._backend._impl``, the C++ extension that implements
+the connect / expand / color pipeline.
 
-This package exists as a thin Python wrapper around a single C++ extension
-``_ncolor_cpp_proto_impl.<py-tag>.so`` (or ``.pyd`` on Windows). The wrapper
-exists for one reason: ``dlopen()`` of a compiled extension hangs or fails
-when the file lives on a network filesystem.
+The wrapper around a direct ``importlib`` load exists for one reason:
+``dlopen()`` of a compiled extension hangs or fails when the file lives
+on a network filesystem.
 
   * **macOS smbfs** — dyld calls ``fcntl()`` for code-signature validation
     and SMB hangs on those calls; ``dlopen`` blocks indefinitely in
@@ -11,13 +11,15 @@ when the file lives on a network filesystem.
   * **Windows UNC** — ``LoadLibrary`` raises *Access is denied* for some
     server configurations.
 
-On first import, if the source ``.so``/``.pyd`` lives on a network mount,
-we copy it to a unique local-disk cache directory and load it from there
-instead. The cache key is the source-side ``(mtime_ns, size)`` so a rebuild
+When the package source lives on a network mount (the developer-on-NAS
+case — irrelevant for pip-installed wheels, since ``site-packages/`` is
+always local), the loader copies the ``.so``/``.pyd`` to a local-disk
+cache via ``platformdirs.user_cache_dir("ncolor")`` and ``dlopen``s from
+there. Cache key is the source-side ``(mtime_ns, size)`` so a rebuild
 produces a fresh local path — dyld retains stale path-keyed state from
 prior failed loads at the same path, so reusing the same path can still
-hang. On macOS we also strip ``com.apple.quarantine`` (which ``cp`` from an
-SMB mount inherits, even when the user has stripped it from the file).
+hang. On macOS we also strip ``com.apple.quarantine`` (which ``cp`` from
+an SMB mount inherits, even when the user has stripped it from the file).
 
 On non-network mounts we fast-path to a direct ``importlib`` load.
 """
@@ -32,14 +34,15 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 _THIS_DIR = Path(__file__).resolve().parent
-_IMPL_BASENAME = "_ncolor_cpp_proto_impl"
+_IMPL_BASENAME = "_impl"
+_FQ_NAME = "ncolor._backend._impl"
 
 
 def _user_cache_dir() -> Path:
     """Per-OS cache directory. ``platformdirs`` is a hard runtime dep
     (declared in ``setup.py``'s ``install_requires``)."""
     from platformdirs import user_cache_dir
-    return Path(user_cache_dir("ncolor_cpp_proto"))
+    return Path(user_cache_dir("ncolor"))
 
 
 _CACHE_ROOT = _user_cache_dir() / "lib"
@@ -118,24 +121,25 @@ def _load_impl():
     else:
         load_path = src
 
-    spec = spec_from_file_location(_IMPL_BASENAME, str(load_path))
+    spec = spec_from_file_location(_FQ_NAME, str(load_path))
     if spec is None or spec.loader is None:
         raise ImportError(f"failed to build spec for {load_path}")
     mod = module_from_spec(spec)
     spec.loader.exec_module(mod)
-    sys.modules[_IMPL_BASENAME] = mod
+    sys.modules[_FQ_NAME] = mod
     return mod
 
 
 _impl = _load_impl()
 
-# Re-export the public API so ``import ncolor_cpp_proto as nc`` keeps
-# ``nc.Solver(...)`` etc. working unchanged.
+# Re-export the public engine classes so ``from ncolor._backend import Solver``
+# works for internal callers (the high-level wrappers in ncolor.color /
+# ncolor.expand).
 ConnectEngine = _impl.ConnectEngine
 ExpandEngine = _impl.ExpandEngine
 Solver = _impl.Solver
 
-# Make the SMT calibration submodule discoverable via ``ncolor_cpp_proto._smt``.
+# Expose the calibration submodule.
 from . import _smt  # noqa: E402
 
 
@@ -146,8 +150,8 @@ def _maybe_calibrate_on_first_import() -> None:
     ``cmdclass`` only fires for source builds), so for users who install
     a pre-built wheel, the SMT calibration that source-build users get at
     install time has to happen at first import instead. ~50–300 ms hidden
-    under the user's first ``import ncolor_cpp_proto``; subsequent imports
-    are instant (they hit the cached JSON file).
+    under the user's first ``import ncolor``; subsequent imports are
+    instant (they hit the cached JSON file).
 
     Skip with ``NCOLOR_NO_CALIBRATE=1`` (CI / Docker / cross-compile).
     Skip if numpy isn't yet importable (something has gone very wrong).

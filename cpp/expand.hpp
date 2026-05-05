@@ -83,9 +83,9 @@ struct StridedView {
 //
 // Hand-rolled because clang -O3 -march=native consistently fails to
 // vectorize the int32 ``di*di`` multiply + paired stores even with
-// __restrict__ qualifiers.
+// __restrict qualifiers.
 static inline void envelope_fill_simd(
-        int32_t* __restrict__ lbl, int32_t* __restrict__ dist,
+        int32_t* __restrict lbl, int32_t* __restrict dist,
         int64_t i_start, int64_t i_end,
         int32_t lbl_j, int32_t g_j, int32_t v_j) {
     int64_t i = i_start;
@@ -135,12 +135,12 @@ static inline void envelope_fill_simd(
 
 // Contiguous (stride=1) variant — separate symbol so the compiler can
 // vectorize the phase-2 fill loop without proving stride=1 every call.
-// ``__restrict__`` lets it assume lbl and dist don't alias.
+// ``__restrict`` lets it assume lbl and dist don't alias.
 inline void envelope_pass_row_contig(
-        int32_t* __restrict__ lbl, int32_t* __restrict__ dist, int64_t N,
-        int32_t* __restrict__ v, int32_t* __restrict__ lblstk,
-        int32_t* __restrict__ g, double* __restrict__ z,
-        double* __restrict__ vd, double* __restrict__ vd_sq) {
+        int32_t* __restrict lbl, int32_t* __restrict dist, int64_t N,
+        int32_t* __restrict v, int32_t* __restrict lblstk,
+        int32_t* __restrict g, double* __restrict z,
+        double* __restrict vd, double* __restrict vd_sq) {
     int32_t k = 0;
     for (int64_t i = 0; i < N; ++i) {
         if (lbl[i] == 0) continue;

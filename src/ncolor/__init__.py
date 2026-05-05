@@ -1,16 +1,14 @@
 """ncolor — 4-color label graph coloring and label expansion utilities.
 
 Public API resolves lazily (PEP 562 ``__getattr__``): bare ``import ncolor``
-does almost no work; submodules — and their numba/scipy dependencies —
-load only on first attribute access. This matters because ``_label`` pulls
-in numba JIT-decorated functions whose @njit cache lookups dominate
-cold-start time on NAS-mounted source trees.
+does almost no work; submodules — and their numba/C++ extension
+dependencies — load only on first attribute access.
 
-The implementation submodules are private (``_label``, ``_format_labels``,
-``_expand_labels``) so their names don't shadow the public function names
-they provide. The previous public-name modules (``label.py`` etc.) were
-renamed to free up the namespace — the public API at ``ncolor.<name>`` is
-unchanged.
+Default backend is the C++ engine in :mod:`ncolor._backend`. Set
+``NCOLOR_BACKEND=numba`` in the environment to fall back to the original
+numba reference implementation in :mod:`ncolor._numba_legacy` (kept as a
+sanity-check toggle; will be removed once the C++ path is fully battle-
+tested).
 
 Public names:
 
@@ -20,6 +18,7 @@ Public names:
 * ``get_lut``        — return the color lookup table built by ``label``
 * ``expand_labels``  — multi-pass label expansion across background pixels
 """
+import os as _os
 
 from ._version import __version__  # cheap; no heavy deps
 
@@ -31,14 +30,29 @@ __all__ = [
     "expand_labels",
 ]
 
+_BACKEND = _os.environ.get("NCOLOR_BACKEND", "cpp").lower()
+if _BACKEND not in ("cpp", "numba"):
+    raise ValueError(
+        f"NCOLOR_BACKEND must be 'cpp' or 'numba', got {_BACKEND!r}"
+    )
+
 # Map public attribute -> source module (relative path).
-_LAZY_ATTRS = {
-    "label": "._label",
-    "unique_nonzero": "._label",
-    "get_lut": "._label",
-    "format_labels": "._format_labels",
-    "expand_labels": "._expand_labels",
-}
+if _BACKEND == "numba":
+    _LAZY_ATTRS = {
+        "label": "._numba_legacy.color",
+        "unique_nonzero": "._numba_legacy.color",
+        "get_lut": "._numba_legacy.color",
+        "format_labels": ".format",
+        "expand_labels": "._numba_legacy.expand",
+    }
+else:
+    _LAZY_ATTRS = {
+        "label": ".color",
+        "unique_nonzero": ".color",
+        "get_lut": ".color",
+        "format_labels": ".format",
+        "expand_labels": ".expand",
+    }
 
 
 def __getattr__(name):

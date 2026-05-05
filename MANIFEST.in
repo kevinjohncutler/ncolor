@@ -1,3 +1,4 @@
 include example.png
 include README.md
 include LICENSE
+recursive-include cpp *.cpp *.hpp *.h

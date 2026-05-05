@@ -16,50 +16,33 @@ The script:
 """
 from __future__ import annotations
 
-import glob
 import os
-import shutil
 import statistics as st
 import sys
-import tempfile
 import time
-
-# macOS hangs in dlopen when the .so lives on a NAS/SMB mount (Gatekeeper
-# code-validation deadlocks on network filesystems). Copy the in-place build
-# to a local temp dir as a *fresh* byte stream — shutil.copy2's xattr
-# preservation triggers the same hang, so we open/read/write manually.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_NEEDS_LOCAL = sys.platform == "darwin" and _HERE.startswith("/Volumes/")
-if _NEEDS_LOCAL:
-    _local = tempfile.mkdtemp(prefix="ncolor_cpp_proto_", dir="/tmp")
-    sources = glob.glob(os.path.join(_HERE, "ncolor_cpp_proto*.so"))
-    if not sources:
-        sys.exit(f"no .so found in {_HERE} — build first: python setup.py build_ext --inplace")
-    for so in sources:
-        with open(so, "rb") as src, open(os.path.join(_local, os.path.basename(so)), "wb") as dst:
-            dst.write(src.read())
-    sys.path.insert(0, _local)
-else:
-    sys.path.insert(0, _HERE)
 
 import numpy as np
 
 # Ensure ncolor's NUMBA_NUM_THREADS env can vary.
 print(f"NUMBA_NUM_THREADS={os.environ.get('NUMBA_NUM_THREADS', 'default')}", file=sys.stderr)
 
+# Force the numba reference for "numba ncolor.label" timing line — even when
+# NCOLOR_BACKEND=cpp is set in the environment, this script wants to compare.
+os.environ["NCOLOR_BACKEND"] = "numba"
 import ncolor                                       # noqa: E402
-from ncolor.color import neighbors, _PARALLEL_THRESHOLD  # noqa: E402
+from ncolor._numba_legacy.color import neighbors, _PARALLEL_THRESHOLD  # noqa: E402
 
 try:
-    import ncolor_cpp_proto
+    from ncolor._backend import Solver, ConnectEngine, ExpandEngine, _smt
 except ImportError:
     sys.exit(
-        "ncolor_cpp_proto extension not found. Build with:\n"
-        "  cd <ncolor>/cpp_proto && python setup.py build_ext --inplace"
+        "ncolor._backend extension not found. Build with:\n"
+        "  python setup.py build_ext --inplace"
     )
 
-print(f"ncolor:    {ncolor.__file__}")
-print(f"cpp proto: {ncolor_cpp_proto.__file__}")
+print(f"ncolor:        {ncolor.__file__}")
+print(f"backend:       {Solver.__module__}")
+print(f"auto_threads:  {_smt.auto_threads()}")
 
 
 def make_mask(H=287, W=377, n=20, seed=0):
@@ -129,7 +112,7 @@ def main():
 
         # C++ end-to-end via Solver.
         for nt in cpp_thread_grid:
-            solver = ncolor_cpp_proto.Solver(nt)
+            solver = Solver(nt)
             s = bench(lambda: solver.label(mask_int, 4, 30, 10), runs=10, warmup=2)
             if nt == cpp_thread_grid[0]:
                 cpp_out, cpp_n = solver.label(mask_int, 4, 30, 10)

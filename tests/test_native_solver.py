@@ -1,5 +1,5 @@
-"""Smoke tests for ncolor_cpp_proto.Solver — focused on the n_threads
-resolution conventions and end-to-end labeling correctness."""
+"""Smoke tests for ncolor._backend (the C++ engine) — focused on the
+n_threads resolution conventions and end-to-end labeling correctness."""
 from __future__ import annotations
 
 import os
@@ -11,8 +11,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import ncolor_cpp_proto as nc
-from ncolor_cpp_proto import _smt
+from ncolor import _backend as nc
+from ncolor._backend import _smt
 
 
 # --- n_threads resolution conventions ---------------------------------------

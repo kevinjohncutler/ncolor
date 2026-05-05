@@ -42,7 +42,7 @@ namespace py = pybind11;
 // pybind11 3.0.4, so we use double here and let users pass -1 for auto.
 static int resolve_threads(double v) {
     if (v <= 0.0) {
-        return py::module_::import("ncolor_cpp_proto._smt").attr("auto_threads")().cast<int>();
+        return py::module_::import("ncolor._backend._smt").attr("auto_threads")().cast<int>();
     }
     if (v < 1.0) {
         const long ncpu = py::module_::import("os").attr("cpu_count")().cast<long>();
@@ -605,10 +605,10 @@ private:
     std::vector<uint8_t> lut_;
 };
 
-PYBIND11_MODULE(_ncolor_cpp_proto_impl, m) {
-    m.doc() = "C++/threadpool prototype of ncolor's hot kernels — for "
-              "benchmarking against the numba version on multi-CCX hosts "
-              "where libgomp's per-parallel-region launch cost dominates.";
+PYBIND11_MODULE(_impl, m) {
+    m.doc() = "ncolor C++ engine: connect / expand / color pipeline + "
+              "ForkJoinPool. Public Python API in ncolor.color, ncolor.expand "
+              "wraps the engines exposed here.";
     py::class_<ConnectEngine>(m, "ConnectEngine",
         "Persistent threadpool wrapper for the search-hashset kernel.\n"
         "Construct once with the desired worker count; the underlying\n"
