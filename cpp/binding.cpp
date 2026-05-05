@@ -571,6 +571,11 @@ public:
 
         int n_used = 0;
         last_stages_.clear();
+        // Reset per-call accessor state so get_last_lut() / get_last_n_conflicts()
+        // always reflect the current call (and never silently report data from
+        // the previous call when this one short-circuits).
+        last_n_conflicts_ = 0;
+        lut_.assign(1, 0);  // {bg=0}; overwritten if pipeline runs to completion
         std::chrono::steady_clock::time_point t_start, t_now;
         if (capture_stages) t_start = std::chrono::steady_clock::now();
         auto stage = [&](const char* name) {
@@ -773,6 +778,15 @@ public:
             n_used = 0;
             for (uint8_t c : colors_) if (c > n_used) n_used = c;
 
+            // Cheap O(M) tally of adjacent same-color pairs. Matches the
+            // legacy ``conflicts = sum(lut[pairs[:,0]] == lut[pairs[:,1]])``
+            // since src_idx_/dst_idx_ are exactly the pairs from connect()
+            // (shifted to 0-based) and colors_[k] == lut_[k+1].
+            last_n_conflicts_ = 0;
+            for (int32_t i = 0; i < M; ++i) {
+                if (colors_[src_idx_[i]] == colors_[dst_idx_[i]]) ++last_n_conflicts_;
+            }
+
             stage("color");
             // 5. Build LUT and apply (expanded[i] is in 1..N, so lut size = N+1).
             lut_.assign(static_cast<size_t>(N) + 1, 0);
@@ -809,6 +823,17 @@ public:
         return {std::move(out), n_used};
     }
 
+    // Accessors for the most recent label() call. Used by the public
+    // ncolor.label wrapper to satisfy return_lut / check_conflicts /
+    // return_conflicts without re-running connect()/coloring.
+    py::array_t<uint8_t> get_last_lut() const {
+        py::array_t<uint8_t> arr(static_cast<py::ssize_t>(lut_.size()));
+        std::memcpy(arr.request().ptr, lut_.data(),
+                    lut_.size() * sizeof(uint8_t));
+        return arr;
+    }
+    int get_last_n_conflicts() const { return last_n_conflicts_; }
+
 private:
     int n_threads_;
     std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
@@ -820,6 +845,7 @@ private:
     std::vector<int32_t> indptr_, indices_;
     std::vector<uint8_t> colors_;
     std::vector<uint8_t> lut_;
+    int last_n_conflicts_ = 0;
 };
 
 PYBIND11_MODULE(_impl, m) {
@@ -909,5 +935,13 @@ PYBIND11_MODULE(_impl, m) {
              "signature; runs the cpp connect kernel directly.")
         .def("get_last_stages", &Solver::get_last_stages,
              "Per-stage timing breakdown from the most recent label() call\n"
-             "made with capture_stages=True.");
+             "made with capture_stages=True.")
+        .def("get_last_lut", &Solver::get_last_lut,
+             "label→color LUT from the most recent label() call. uint8\n"
+             "array of length (max_label + 1). lut[0] = 0 (bg); lut[k] is\n"
+             "the color assigned to formatted-label k for k = 1..max_label.")
+        .def("get_last_n_conflicts", &Solver::get_last_n_conflicts,
+             "Number of adjacent same-color pairs in the most recent\n"
+             "label() output. 0 means the coloring is valid; nonzero\n"
+             "means the solver bailed out without finding a clean coloring.");
 }

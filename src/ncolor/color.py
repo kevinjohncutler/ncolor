@@ -52,18 +52,10 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           check_conflicts=False, return_conflicts=False, format_input=True):
     """4-color graph coloring of a label image.
 
-    Default path uses the C++ Solver. Falls back to the numba reference
-    when a flag is set that the C++ engine doesn't yet implement
-    (``return_lut`` / ``check_conflicts`` / ``return_conflicts`` /
-    ``verbose``).
+    Default path uses the C++ Solver. ``verbose`` still falls back to the
+    numba reference (the cpp pipeline doesn't print stage info).
     """
-    needs_legacy = (
-        return_lut
-        or check_conflicts
-        or return_conflicts
-        or verbose
-    )
-    if needs_legacy:
+    if verbose:
         return _legacy_label(lab, n=n, conn=conn, max_depth=max_depth,
                              offset=offset, expand=expand, return_n=return_n,
                              return_lut=return_lut, verbose=verbose,
@@ -76,11 +68,38 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     # apply_lut, and bg-masking under one GIL release. The wrapper just
     # dispatches; no per-call numpy scans.
     lab_arr = np.asarray(lab)
-    out, n_used = _get_solver().label(
+    solver = _get_solver()
+    out, n_used = solver.label(
         lab_arr,
         n_colors=int(n), max_depth=int(max_depth),
         conn=int(conn), format_input=bool(format_input),
         expand=bool(expand))
+
+    # return_lut / check_conflicts / return_conflicts: read accessors from
+    # the Solver (cheap — lut and conflict count were computed inside the
+    # GIL-released label() call).
+    if return_lut or check_conflicts or return_conflicts:
+        lut = solver.get_last_lut() if return_lut else None
+        conflicts = solver.get_last_n_conflicts() \
+            if (check_conflicts or return_conflicts) else 0
+        if check_conflicts and conflicts:
+            raise ValueError(
+                f"Coloring conflict detected: {conflicts} adjacent pairs share a color.")
+        if return_lut:
+            if return_n and return_conflicts:
+                return lut, int(np.max(lut)) if lut.size else 0, conflicts
+            if return_n:
+                return lut, int(np.max(lut)) if lut.size else 0
+            if return_conflicts:
+                return lut, conflicts
+            return lut
+        if return_n and return_conflicts:
+            return out, int(n_used), conflicts
+        if return_n:
+            return out, int(n_used)
+        if return_conflicts:
+            return out, conflicts
+        return out
 
     if return_n:
         return out, int(n_used)
@@ -106,9 +125,8 @@ def get_lut(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
             return_n=False, verbose=False, check_conflicts=False,
             return_conflicts=False, format_input=True):
     """Return the label→color LUT used by :func:`label`."""
-    return _legacy_label(lab, n=n, conn=conn, max_depth=max_depth,
-                         offset=offset, expand=expand, return_n=return_n,
-                         return_lut=True, verbose=verbose,
-                         check_conflicts=check_conflicts,
-                         return_conflicts=return_conflicts,
-                         format_input=format_input)
+    return label(lab, n=n, conn=conn, max_depth=max_depth, offset=offset,
+                 expand=expand, return_n=return_n, return_lut=True,
+                 verbose=verbose, check_conflicts=check_conflicts,
+                 return_conflicts=return_conflicts,
+                 format_input=format_input)
