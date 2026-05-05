@@ -49,11 +49,15 @@ def _get_solver():
 
 def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           return_n=False, return_lut=False, verbose=False,
-          check_conflicts=False, return_conflicts=False, format_input=True):
+          check_conflicts=False, return_conflicts=False, format_input=True,
+          out=None):
     """4-color graph coloring of a label image.
 
     Default path uses the C++ Solver. ``verbose`` still falls back to the
     numba reference (the cpp pipeline doesn't print stage info).
+
+    Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
+    across calls — useful for batch pipelines.
     """
     if verbose:
         return _legacy_label(lab, n=n, conn=conn, max_depth=max_depth,
@@ -69,11 +73,12 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     # dispatches; no per-call numpy scans.
     lab_arr = np.asarray(lab)
     solver = _get_solver()
-    out, n_used = solver.label(
+    out_array, n_used = solver.label(
         lab_arr,
         n_colors=int(n), max_depth=int(max_depth),
         conn=int(conn), format_input=bool(format_input),
-        expand=bool(expand))
+        expand=bool(expand), out=out)
+    out = out_array
 
     # return_lut / check_conflicts / return_conflicts: read accessors from
     # the Solver (cheap — lut and conflict count were computed inside the

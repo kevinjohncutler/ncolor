@@ -498,7 +498,8 @@ public:
             py::array mask,
             int n_colors = 4, int max_depth = 30, int rand_period = 10,
             int conn = 2, int p = 2, bool capture_stages = false,
-            bool format_input = true, bool expand = true) {
+            bool format_input = true, bool expand = true,
+            py::object out_arg = py::none()) {
         // Require C-contiguous; pybind11 doesn't enforce that for the
         // untyped py::array, so check explicitly. Common dtypes accepted
         // (uint8/uint16/uint32, int8/int16/int32/int64) and fused with
@@ -566,7 +567,32 @@ public:
 
         std::vector<py::ssize_t> out_shape(ndim);
         for (int d = 0; d < ndim; ++d) out_shape[d] = static_cast<py::ssize_t>(shape[d]);
-        py::array_t<uint8_t> out(out_shape);
+        py::array_t<uint8_t> out;
+        if (out_arg.is_none()) {
+            out = py::array_t<uint8_t>(out_shape);
+        } else {
+            // Caller-supplied buffer: must be uint8, C-contiguous, exact-shape.
+            // Reusing an output buffer across calls saves the per-call alloc
+            // (16 MiB at 4096²); useful for batch pipelines. We need strict
+            // dtype check (not pybind11's auto-cast) so that the caller's
+            // buffer is actually the one written — a silent copy would defeat
+            // the purpose of passing out=.
+            const py::array out_view = py::cast<py::array>(out_arg);
+            if (out_view.dtype().kind() != 'u' || out_view.dtype().itemsize() != 1) {
+                throw std::invalid_argument(
+                    "Solver.label: out buffer must be uint8");
+            }
+            out = py::cast<py::array_t<uint8_t>>(out_arg);
+            const auto out_buf = out.request();
+            if (out_buf.ndim != ndim) throw std::invalid_argument(
+                "Solver.label: out buffer ndim does not match input");
+            for (int d = 0; d < ndim; ++d) {
+                if (out_buf.shape[d] != buf.shape[d]) throw std::invalid_argument(
+                    "Solver.label: out buffer shape does not match input");
+            }
+            if (!(out.flags() & py::array::c_style)) throw std::invalid_argument(
+                "Solver.label: out buffer must be C-contiguous");
+        }
         uint8_t* out_ptr = static_cast<uint8_t*>(out.request().ptr);
 
         int n_used = 0;
@@ -913,6 +939,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("conn") = 2,
              py::arg("p") = 2, py::arg("capture_stages") = false,
              py::arg("format_input") = true, py::arg("expand") = true,
+             py::arg("out") = py::none(),
              "Run [format_labels →] [expand →] connect → CSR → color → apply_lut.\n"
              "Supports 2D and 3D inputs (any ndim ≥ 2 actually).\n"
              "conn: 2D ∈ {1, 2}, 3D ∈ {1, 2, 3}. Matches\n"
@@ -926,7 +953,11 @@ PYBIND11_MODULE(_impl, m) {
              "Precondition: bg=0 in the input. Pass format_input=False if\n"
              "labels are already 1..N (saves ~one full-image pass).\n"
              "Background masking (output=0 wherever input=0) is always\n"
-             "applied in the apply_lut step.")
+             "applied in the apply_lut step.\n"
+             "out: optional preallocated uint8 array of the same shape as\n"
+             "mask. If supplied, results are written there and returned\n"
+             "instead of allocating a new array — useful for batch\n"
+             "pipelines that reuse the same output buffer across calls.")
         .def("connect", &Solver::connect,
              py::arg("mask"), py::arg("conn") = 1,
              "Adjacency pairs for a label image. Returns an (M, 2) int32\n"

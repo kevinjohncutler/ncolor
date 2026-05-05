@@ -162,6 +162,33 @@ def test_label_uint16_round_trip(solver):
     assert 0 < n_used <= 8
 
 
+def test_label_out_buffer_reuse(solver):
+    """out= passes a preallocated buffer; identity should be preserved
+    (no silent copy) and the result should match a fresh-alloc call."""
+    m = _circles_2d(128, 128, 12, np.int32)
+    out_alloc, n_alloc = solver.label(m, conn=2)
+    buf = np.empty_like(out_alloc)
+    out_buf, n_buf = solver.label(m, conn=2, out=buf)
+    assert out_buf is buf, "out= should return the supplied buffer"
+    assert n_buf == n_alloc
+    assert np.array_equal(out_buf, out_alloc)
+
+
+def test_label_out_buffer_validates(solver):
+    """out= rejects wrong shape / dtype / non-contiguous so that callers
+    can't accidentally feed a buffer that won't be written."""
+    m = _circles_2d(64, 64, 4, np.int32)
+    with pytest.raises(ValueError):
+        solver.label(m, out=np.zeros((32, 32), dtype=np.uint8))
+    with pytest.raises(ValueError):
+        solver.label(m, out=np.zeros((64, 64), dtype=np.int32))
+    with pytest.raises(ValueError):
+        solver.label(m, out=np.zeros((64, 64), dtype=np.float32))
+    non_contig = np.zeros((64, 128), dtype=np.uint8)[:, ::2]
+    with pytest.raises(ValueError):
+        solver.label(m, out=non_contig)
+
+
 def test_label_expand_false_keeps_bg(solver):
     """expand=False: bg pixels stay 0 (no Voronoi fill) and only
     fg pixels get a color."""
