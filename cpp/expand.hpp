@@ -572,7 +572,9 @@ inline void expand_labels_inplace(
     int32_t* t_lbl = bufs.lbl_T();
     int32_t* t_dist = bufs.dist_T();
 
-    std::memcpy(h_lbl, input, total * sizeof(int32_t));
+    if (input != h_lbl) {
+        std::memcpy(h_lbl, input, total * sizeof(int32_t));
+    }
     // dist init unnecessary — pass0 overwrites every entry.
 
     for (int ax = ndim - 1; ax >= 0; --ax) {
@@ -626,7 +628,9 @@ inline void expand_labels_inplace_timed(
         t0 = t1;
     };
 
-    std::memcpy(h_lbl, input, total * sizeof(int32_t));
+    if (input != h_lbl) {
+        std::memcpy(h_lbl, input, total * sizeof(int32_t));
+    }
     stage("memcpy_in");
 
     for (int ax = ndim - 1; ax >= 0; --ax) {

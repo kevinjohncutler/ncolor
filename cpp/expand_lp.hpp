@@ -73,7 +73,9 @@ struct LpExpand<1> {
         int64_t total = 1;
         for (int64_t d : shape) total *= d;
         bufs.resize(total);  // for the dist scratch
-        std::memcpy(output, input, total * sizeof(int32_t));
+        if (input != output) {
+            std::memcpy(output, input, total * sizeof(int32_t));
+        }
         if (ndim == 2) {
             chamfer_st_l1(output, bufs.dist(),
                           shape[0], shape[1], pool, n_threads);

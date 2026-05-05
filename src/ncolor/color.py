@@ -78,19 +78,20 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
                              offset=offset, expand=expand, return_n=return_n,
                              format_input=format_input)
 
-    if format_input:
-        lab_fmt = format_labels(lab_arr).astype(np.int32, copy=False)
-    else:
-        lab_fmt = lab_arr.astype(np.int32, copy=False)
+    # The C++ Solver does format_labels (compact 1..N), expand, connect,
+    # color, apply_lut, and bg-masking — all under one GIL release. We
+    # only need to ensure dtype + min==0 (bg) preconditions; if min!=0
+    # (legacy "treat min as bg") fall back to the numba reference path,
+    # which has the full shift semantics.
+    if format_input and int(lab_arr.min()) != 0:
+        return _legacy_label(lab, n=n, conn=conn, max_depth=max_depth,
+                             offset=offset, expand=expand, return_n=return_n,
+                             format_input=format_input)
 
-    out, n_used = _get_solver().label(lab_fmt, n_colors=int(n),
-                                      max_depth=int(max_depth),
-                                      conn=int(conn))
-    # Solver expand() fills bg via Voronoi; mask back to original bg=0
-    # to match numba's ``colored * (lab != 0)`` semantics for expand=True.
-    bg = (lab_fmt == 0)
-    if bg.any():
-        out = np.where(bg, 0, out)
+    out, n_used = _get_solver().label(
+        lab_arr.astype(np.int32, copy=False),
+        n_colors=int(n), max_depth=int(max_depth),
+        conn=int(conn), format_input=bool(format_input))
 
     if return_n:
         return out, int(n_used)

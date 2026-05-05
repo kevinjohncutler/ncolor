@@ -20,6 +20,7 @@
 #include "chamfer.hpp"
 #include "color.hpp"
 #include "expand_lp.hpp"
+#include "format_labels.hpp"
 #include "connect.hpp"
 #include "dispatch.hpp"
 #include "expand.hpp"
@@ -349,7 +350,8 @@ public:
     std::pair<py::array_t<uint8_t>, int> label(
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> mask,
             int n_colors = 4, int max_depth = 30, int rand_period = 10,
-            int conn = 2, int p = 2, bool capture_stages = false) {
+            int conn = 2, int p = 2, bool capture_stages = false,
+            bool format_input = true) {
         const auto buf = mask.request();
         const int ndim = static_cast<int>(buf.ndim);
         if (ndim < 2) throw std::invalid_argument(
@@ -392,18 +394,35 @@ public:
         {
             py::gil_scoped_release release;
 
+            // 0. Optional format_labels: compact nonzero labels to 1..N
+            // in place inside expand_bufs_.lbl(). Subsequent stages see
+            // a normalized buffer; the original mask_ptr is preserved
+            // for the bg-mask step at the end.
+            expand_bufs_.resize(total);
+            int32_t* expanded = expand_bufs_.lbl();
+            const int32_t* expand_input;
+            if (format_input) {
+                std::memcpy(expanded, mask_ptr, total * sizeof(int32_t));
+                ncolor_cpp::format_labels_inplace(expanded, total, *pool_, n_threads_);
+                expand_input = expanded;  // already in expand_bufs_.lbl()
+                stage("format");
+            } else {
+                expand_input = mask_ptr;
+            }
+
             // 1. Expand labels (Voronoi) — every pixel ends up labeled.
             // Single ND driver dispatches on p at compile time:
             // p=1 → Saito-Toriwaki sweep; p=2 → Felzenszwalb envelope.
             // Result lands in expand_bufs_.lbl(); the L2 ``output ==
             // bufs.lbl()`` self-copy is elided inside LpExpand<2>::expand,
-            // and L1's in-place sweep writes directly there.
-            expand_bufs_.resize(total);
-            int32_t* expanded = expand_bufs_.lbl();
+            // and L1's in-place sweep writes directly there. When
+            // format_input=true, expand_input == expanded already, and
+            // the in-place memcpys inside both LpExpand variants
+            // detect input==output and skip.
             if (p == 2) {
-                ncolor_cpp::expand_labels_lp<2>(mask_ptr, expanded, expand_bufs_, shape, *pool_, n_threads_);
+                ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_);
             } else {
-                ncolor_cpp::expand_labels_lp<1>(mask_ptr, expanded, expand_bufs_, shape, *pool_, n_threads_);
+                ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_);
             }
             stage("expand");
 
@@ -611,14 +630,21 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("max_depth") = 30, py::arg("rand_period") = 10,
              py::arg("conn") = 2,
              py::arg("p") = 2, py::arg("capture_stages") = false,
-             "Run expand_labels → connect → CSR build → BFS color → apply LUT.\n"
+             py::arg("format_input") = true,
+             "Run [format_labels →] expand → connect → CSR → color → apply_lut.\n"
              "Supports 2D and 3D inputs (any ndim ≥ 2 actually).\n"
              "conn: 2D ∈ {1, 2}, 3D ∈ {1, 2, 3}. Matches\n"
              "scipy.ndimage.generate_binary_structure semantics. The 2D conn=2\n"
              "case takes a fast path that skips padding (~1 ms saved at 2048²).\n"
              "p selects the expand metric: p=2 (Felzenszwalb parabolic\n"
              "envelope, default) or p=1 (Saito-Toriwaki sweep, ~5× faster\n"
-             "with slightly different boundary placement at ties).")
+             "with slightly different boundary placement at ties).\n"
+             "format_input=True (default) compacts non-sequential nonzero\n"
+             "labels to 1..N in-place inside the released-GIL section.\n"
+             "Precondition: bg=0 in the input. Pass format_input=False if\n"
+             "labels are already 1..N (saves ~one full-image pass).\n"
+             "Background masking (output=0 wherever input=0) is always\n"
+             "applied in the apply_lut step.")
         .def("get_last_stages", &Solver::get_last_stages,
              "Per-stage timing breakdown from the most recent label() call\n"
              "made with capture_stages=True.");
