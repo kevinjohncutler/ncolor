@@ -36,7 +36,6 @@
 
 #include "dispatch.hpp"
 #include "threadpool.h"
-#include "lp_metric.hpp"
 
 namespace ncolor_cpp {
 

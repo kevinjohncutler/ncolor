@@ -27,7 +27,6 @@
 
 #include "expand.hpp"
 #include "chamfer.hpp"
-#include "lp_metric.hpp"
 
 namespace ncolor_cpp {
 
