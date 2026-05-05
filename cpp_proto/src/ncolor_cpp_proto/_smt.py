@@ -38,15 +38,13 @@ def _user_cache_dir() -> Path:
     """Per-OS cache directory (``~/Library/Caches/...`` on macOS,
     ``~/.cache/...`` on Linux, ``%LOCALAPPDATA%\\...\\Cache`` on Windows).
 
-    Falls back to ``~/.cache/ncolor_cpp_proto/`` if ``platformdirs`` isn't
-    available (e.g., during pip's pre-install build phase before
-    ``install_requires`` has been processed).
+    ``platformdirs`` is a hard runtime dep (in ``setup.py``'s
+    ``install_requires``); a missing import here means the install was
+    incomplete and we'd rather raise than silently use a different cache
+    path than the build-time hook did.
     """
-    try:
-        from platformdirs import user_cache_dir
-        return Path(user_cache_dir("ncolor_cpp_proto"))
-    except ImportError:
-        return Path.home() / ".cache" / "ncolor_cpp_proto"
+    from platformdirs import user_cache_dir
+    return Path(user_cache_dir("ncolor_cpp_proto"))
 
 
 CACHE_PATH = _user_cache_dir() / "smt_threads.json"

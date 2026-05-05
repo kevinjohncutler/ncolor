@@ -36,13 +36,10 @@ _IMPL_BASENAME = "_ncolor_cpp_proto_impl"
 
 
 def _user_cache_dir() -> Path:
-    """Per-OS cache directory; falls back to ``~/.cache/`` if ``platformdirs``
-    isn't installed yet (e.g., during pip's pre-install build phase)."""
-    try:
-        from platformdirs import user_cache_dir
-        return Path(user_cache_dir("ncolor_cpp_proto"))
-    except ImportError:
-        return Path.home() / ".cache" / "ncolor_cpp_proto"
+    """Per-OS cache directory. ``platformdirs`` is a hard runtime dep
+    (declared in ``setup.py``'s ``install_requires``)."""
+    from platformdirs import user_cache_dir
+    return Path(user_cache_dir("ncolor_cpp_proto"))
 
 
 _CACHE_ROOT = _user_cache_dir() / "lib"
