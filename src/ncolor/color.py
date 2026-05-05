@@ -31,6 +31,22 @@ def _legacy_label(*args, **kwargs):
     return _legacy(*args, **kwargs)
 
 
+# Module-level Solver singleton. The C++ Solver owns a persistent thread
+# pool; constructing it per call adds ~5–10 ms of pool-spinup overhead
+# that swamps small-image latencies. One Solver per process is plenty —
+# label() / expand_labels() are not called concurrently from within a
+# single ncolor consumer.
+_SOLVER = None
+
+
+def _get_solver():
+    global _SOLVER
+    if _SOLVER is None:
+        from ._backend import Solver
+        _SOLVER = Solver()  # auto-thread count from calibration cache
+    return _SOLVER
+
+
 def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           return_n=False, return_lut=False, verbose=False,
           check_conflicts=False, return_conflicts=False, format_input=True):
@@ -55,8 +71,6 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
                              format_input=format_input)
 
     # Common path: expand=True, no LUT/conflict introspection.
-    from ._backend import Solver
-
     lab_arr = np.asarray(lab)
     if lab_arr.size == 0 or int(lab_arr.max()) == 0:
         # No labels — fall back; legacy handles the empty case cleanly.
@@ -69,9 +83,9 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     else:
         lab_fmt = lab_arr.astype(np.int32, copy=False)
 
-    solver = Solver()  # auto-thread count from calibration cache
-    out, n_used = solver.label(lab_fmt, n_colors=int(n), max_depth=int(max_depth),
-                               conn=int(conn))
+    out, n_used = _get_solver().label(lab_fmt, n_colors=int(n),
+                                      max_depth=int(max_depth),
+                                      conn=int(conn))
     # Solver expand() fills bg via Voronoi; mask back to original bg=0
     # to match numba's ``colored * (lab != 0)`` semantics for expand=True.
     bg = (lab_fmt == 0)

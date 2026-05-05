@@ -7,6 +7,19 @@ from __future__ import annotations
 import numpy as np
 
 
+# Module-level singleton — the engine owns a persistent thread pool;
+# constructing per call swamps small-image latencies.
+_ENGINE = None
+
+
+def _get_engine():
+    global _ENGINE
+    if _ENGINE is None:
+        from ._backend import ExpandEngine
+        _ENGINE = ExpandEngine()  # auto-thread count from calibration cache
+    return _ENGINE
+
+
 def expand_labels(label_image, p: int = 2, *, metric: str | None = None):
     """Voronoi label expansion across background pixels under L_p metric.
 
@@ -34,6 +47,4 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None):
         from ._numba_legacy.expand import expand_labels as _legacy
         return _legacy(label_image, metric="l2" if p == 2 else "l1")
 
-    from ._backend import ExpandEngine
-    eng = ExpandEngine()  # auto-thread count from calibration cache
-    return eng.expand_labels(arr.astype(np.int32, copy=False), p=p)
+    return _get_engine().expand_labels(arr.astype(np.int32, copy=False), p=p)
