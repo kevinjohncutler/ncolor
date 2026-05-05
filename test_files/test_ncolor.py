@@ -6,8 +6,8 @@ from itertools import product
 
 import skimage.io
 import ncolor
-from ncolor._format_labels import format_labels
-from ncolor._label import is_sequential
+from ncolor.format import format_labels
+from ncolor.color import is_sequential
 import pytest
 import numpy as np
 import tempfile

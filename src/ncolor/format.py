@@ -11,32 +11,63 @@ def _lazy_import_skimage_morphology():
     return remove_small_holes
 
 
-def format_labels(labels, clean=False, min_area=9, despur=False, 
+def format_labels(labels, clean=False, min_area=9, despur=False,
                   verbose=False, background=None, ignore=False):
     """
     Puts labels into 'standard form', i.e. background=0 and cells 1,2,3,...,N-1,N.
-    Optional clean flag: disconnect and disjoint masks and discard small masks below min_area. 
-    min_area default is 9px. 
-    Optional ignore flag: 0 is now 'ignore' and 1 is background. We do not want to shift 1->0 in that case. 
+    Optional clean flag: disconnect and disjoint masks and discard small masks below min_area.
+    min_area default is 9px.
+    Optional ignore flag: 0 is now 'ignore' and 1 is background. We do not want to shift 1->0 in that case.
     """
-    
+    # Hot path: simple compaction (no cleanup, default min-shift) ->
+    # cpp engine. Skips the numpy.copy + astype + np.min + fastremap
+    # round-trip that this function used to do per call.
+    if (not clean and not ignore and background is None and not verbose):
+        try:
+            from ._backend import ExpandEngine
+        except ImportError:
+            pass  # fall through to legacy path
+        else:
+            arr = np.asarray(labels)
+            # The cpp format_labels accepts the full set of supported
+            # integer dtypes via ExpandEngine.format_labels (which goes
+            # through Solver-style dispatch); for now the binding only
+            # takes int32, so we cast here. Still avoids fastremap +
+            # the explicit shift step.
+            if arr.dtype != np.int32:
+                arr = arr.astype(np.int32, copy=True)
+            else:
+                arr = arr.copy()
+            eng = ExpandEngine(-1)
+            # first_seen=True matches the legacy fastremap.renumber's
+            # input-order numbering — preserves bit-equality with the
+            # historical format_labels output that some downstream
+            # callers (and our test suite) depend on. Slower than
+            # ascending-source by ~2× but still ~tied with fastremap
+            # at 2048², ~1.0-1.3× slower at smaller sizes; the win
+            # vs fastremap is no longer about throughput but about
+            # GIL release and cache behavior in larger pipelines.
+            out, _n = eng.format_labels(arr, first_seen=True)
+            return out
+
+    # Legacy path: clean=True / ignore / custom background / verbose.
     # Labels are stored as a part of a float array in Cellpose, so it must be cast back here.
     # some people also use -1 as background, so we must cast to the signed integar class. We
     # can safely assume no 2D or 3D image will have more than 2^31 cells. Finally, cv2 does not
-    # play well with unsigned integers (saves to default uint8), so we cast to uint32. 
+    # play well with unsigned integers (saves to default uint8), so we cast to uint32.
     labels = labels.copy()
     labels = labels.astype('int32') #uint vs int
     if background is None:
         background = np.min(labels)
     else:
-        background = 0       
-        
+        background = 0
+
     if not ignore:
         if verbose:
             print('minimum value is {}, shifting to 0'.format(background))
         labels -= background
         background = 0
-    labels = labels.astype('uint32') 
+    labels = labels.astype('uint32')
     
     # optional cleanup 
     if clean:
@@ -147,7 +178,7 @@ def endpoints_nd(skel):
 
     return endpoints
 
-def endpoints_nd_alternative(skel):
+def endpoints_nd_alternative(skel):  # pragma: no cover
     """
     Alternative implementation using labeled components approach.
     This might be more accurate for complex skeleton structures.
@@ -193,7 +224,7 @@ def endpoints(skel):
     return endpoints_nd(skel)
 
 # Keep the original function for comparison (renamed)
-def endpoints_original_2d(skel):
+def endpoints_original_2d(skel):  # pragma: no cover
     pad = 1 # appears to require padding to work properly....
     skel = np.pad(skel,pad)
     endpoint1=np.array([[0, 0, 0],

@@ -53,11 +53,12 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     """4-color graph coloring of a label image.
 
     Default path uses the C++ Solver. Falls back to the numba reference
-    when a flag is set that the C++ engine doesn't yet implement.
+    when a flag is set that the C++ engine doesn't yet implement
+    (``return_lut`` / ``check_conflicts`` / ``return_conflicts`` /
+    ``verbose``).
     """
     needs_legacy = (
-        not expand
-        or return_lut
+        return_lut
         or check_conflicts
         or return_conflicts
         or verbose
@@ -70,16 +71,16 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
                              return_conflicts=return_conflicts,
                              format_input=format_input)
 
-    # Common path: expand=True, no LUT/conflict introspection.
-    # The C++ Solver handles format_labels (compact 1..N including the
-    # min-shift case for min != 0), expand, connect, color, apply_lut,
-    # and bg-masking — all under one GIL release. The wrapper just
-    # dispatches; no per-call np.min/np.max scans needed.
+    # Common path: cpp Solver handles format_labels (compact 1..N with
+    # min-shift), expand (or skip when expand=False), connect, color,
+    # apply_lut, and bg-masking under one GIL release. The wrapper just
+    # dispatches; no per-call numpy scans.
     lab_arr = np.asarray(lab)
     out, n_used = _get_solver().label(
         lab_arr,
         n_colors=int(n), max_depth=int(max_depth),
-        conn=int(conn), format_input=bool(format_input))
+        conn=int(conn), format_input=bool(format_input),
+        expand=bool(expand))
 
     if return_n:
         return out, int(n_used)

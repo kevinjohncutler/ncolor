@@ -406,14 +406,23 @@ public:
         const int64_t H = shape[0];
         const int64_t W = (ndim >= 2) ? shape[1] : 1;
 
+        // (itemsize, signedness) dispatch — see the parallel block in
+        // Solver.label for why this beats format-code matching.
         const std::string fmt = buf.format;
-        const bool is_int32  = fmt == py::format_descriptor<int32_t>::format();
-        const bool is_uint8  = fmt == py::format_descriptor<uint8_t>::format();
-        const bool is_uint16 = fmt == py::format_descriptor<uint16_t>::format();
-        const bool is_uint32 = fmt == py::format_descriptor<uint32_t>::format();
-        const bool is_int8   = fmt == py::format_descriptor<int8_t>::format();
-        const bool is_int16  = fmt == py::format_descriptor<int16_t>::format();
-        const bool is_int64  = fmt == py::format_descriptor<int64_t>::format();
+        const ssize_t itemsize = buf.itemsize;
+        bool is_signed = false, is_unsigned = false;
+        if (!fmt.empty()) {
+            const char c = fmt[0];
+            if (c == 'b' || c == 'h' || c == 'i' || c == 'l' || c == 'q' || c == 'n') is_signed = true;
+            else if (c == 'B' || c == 'H' || c == 'I' || c == 'L' || c == 'Q' || c == 'N') is_unsigned = true;
+        }
+        const bool is_uint8  = is_unsigned && itemsize == 1;
+        const bool is_uint16 = is_unsigned && itemsize == 2;
+        const bool is_uint32 = is_unsigned && itemsize == 4;
+        const bool is_int8   = is_signed   && itemsize == 1;
+        const bool is_int16  = is_signed   && itemsize == 2;
+        const bool is_int32  = is_signed   && itemsize == 4;
+        const bool is_int64  = is_signed   && itemsize == 8;
         if (!(is_int32 || is_uint8 || is_uint16 || is_uint32
               || is_int8 || is_int16 || is_int64)) {
             throw std::invalid_argument(
@@ -462,13 +471,13 @@ public:
                 std::vector<int64_t> nbs = neighbors_nd_padded(shape, conn);
                 int64_t total_padded = 1;
                 for (int64_t s : shape) total_padded *= (s + 2);
-                std::unique_ptr<int32_t[]> padded(new int32_t[total_padded]);
-                pad_nd_into<int32_t>(labels, padded.get(), shape, /*pad_value=*/0);
+                padded_.resize(static_cast<size_t>(total_padded));
+                pad_nd_into<int32_t>(labels, padded_.data(), shape, /*pad_value=*/0);
                 const int64_t ht_raw = 2 * static_cast<int64_t>(nbs.size())
                                         * static_cast<int64_t>(max_label);
                 const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
                 pairs = ncolor_cpp::search_hashset_parallel<int32_t>(
-                    padded.get(), total_padded, nbs.data(),
+                    padded_.data(), total_padded, nbs.data(),
                     static_cast<int>(nbs.size()),
                     static_cast<uint64_t>(ht_size), n_threads_, *pool_);
             }
@@ -489,7 +498,7 @@ public:
             py::array mask,
             int n_colors = 4, int max_depth = 30, int rand_period = 10,
             int conn = 2, int p = 2, bool capture_stages = false,
-            bool format_input = true) {
+            bool format_input = true, bool expand = true) {
         // Require C-contiguous; pybind11 doesn't enforce that for the
         // untyped py::array, so check explicitly. Common dtypes accepted
         // (uint8/uint16/uint32, int8/int16/int32/int64) and fused with
@@ -518,20 +527,40 @@ public:
         const int64_t H = shape[0];
         const int64_t W = (ndim >= 2) ? shape[1] : 1;
 
-        // Validate dtype now (with GIL) so we throw before releasing.
+        // Validate + classify dtype by (itemsize, signedness). Doing it
+        // by buf.format string runs into a platform quirk: numpy's int64
+        // is 'l' (long) on macOS / Linux LP64 while pybind11's
+        // format_descriptor<int64_t>::format() is 'q' (long long).
+        // (itemsize, signedness) is the underlying truth that's portable.
         const std::string fmt = buf.format;
-        const bool is_int32  = fmt == py::format_descriptor<int32_t>::format();
-        const bool is_uint8  = fmt == py::format_descriptor<uint8_t>::format();
-        const bool is_uint16 = fmt == py::format_descriptor<uint16_t>::format();
-        const bool is_uint32 = fmt == py::format_descriptor<uint32_t>::format();
-        const bool is_int8   = fmt == py::format_descriptor<int8_t>::format();
-        const bool is_int16  = fmt == py::format_descriptor<int16_t>::format();
-        const bool is_int64  = fmt == py::format_descriptor<int64_t>::format();
-        if (!(is_int32 || is_uint8 || is_uint16 || is_uint32
-              || is_int8 || is_int16 || is_int64)) {
+        const ssize_t itemsize = buf.itemsize;
+        bool is_signed = false, is_unsigned = false;
+        if (!fmt.empty()) {
+            const char c = fmt[0];
+            // pybind11 / numpy struct format codes.
+            if (c == 'b' || c == 'h' || c == 'i' || c == 'l' || c == 'q' || c == 'n')
+                is_signed = true;
+            else if (c == 'B' || c == 'H' || c == 'I' || c == 'L' || c == 'Q' || c == 'N')
+                is_unsigned = true;
+        }
+        if (!(is_signed || is_unsigned)) {
             throw std::invalid_argument(
                 "Solver.label: unsupported dtype '" + fmt +
                 "' (need one of: uint8, uint16, uint32, int8, int16, int32, int64)");
+        }
+        const bool is_uint8  = is_unsigned && itemsize == 1;
+        const bool is_uint16 = is_unsigned && itemsize == 2;
+        const bool is_uint32 = is_unsigned && itemsize == 4;
+        const bool is_int8   = is_signed   && itemsize == 1;
+        const bool is_int16  = is_signed   && itemsize == 2;
+        const bool is_int32  = is_signed   && itemsize == 4;
+        const bool is_int64  = is_signed   && itemsize == 8;
+        if (!(is_int32 || is_uint8 || is_uint16 || is_uint32
+              || is_int8 || is_int16 || is_int64)) {
+            throw std::invalid_argument(
+                "Solver.label: unsupported dtype (itemsize=" +
+                std::to_string(itemsize) + ", " +
+                (is_signed ? "signed" : "unsigned") + ")");
         }
         const void* src_ptr = buf.ptr;
 
@@ -614,20 +643,29 @@ public:
             }
         if (!early_exit_empty) {
 
-            // 1. Expand labels (Voronoi) — every pixel ends up labeled.
-            // Single ND driver dispatches on p at compile time:
-            // p=1 → Saito-Toriwaki sweep; p=2 → Felzenszwalb envelope.
-            // Result lands in expand_bufs_.lbl(); the L2 ``output ==
-            // bufs.lbl()`` self-copy is elided inside LpExpand<2>::expand,
-            // and L1's in-place sweep writes directly there. When
-            // format_input=true, expand_input == expanded already, and
-            // the in-place memcpys inside both LpExpand variants
-            // detect input==output and skip.
-            if (p == 2) {
-                ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_);
-            } else {
-                ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_);
+            // 1. Expand labels (Voronoi). With ``expand=False`` we skip
+            // this step entirely and let find_pairs / build_csr / color
+            // operate directly on the (possibly bg-heavy) cast+formatted
+            // buffer. find_pairs already skips lbl==0 cells, and the bg
+            // pattern is preserved through to apply_lut via bg_mask_, so
+            // the only difference is that the colored output retains the
+            // original bg pattern instead of the Voronoi-expanded one.
+            //
+            // When expand=True the ND driver dispatches on p at compile
+            // time: p=1 → Saito-Toriwaki sweep; p=2 → Felzenszwalb
+            // envelope. Result lands in expand_bufs_.lbl(); the
+            // ``input == output`` self-copy guards inside LpExpand
+            // variants make this a no-op when expand_input == expanded.
+            if (expand) {
+                if (p == 2) {
+                    ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_);
+                } else {
+                    ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_);
+                }
             }
+            // (Suppress unused-var warning when expand=false — expanded
+            // already equals expand_input == expand_bufs_.lbl().)
+            (void)expand_input;
             stage("expand");
 
             // 2. Find adjacency pairs.
@@ -642,24 +680,25 @@ public:
                 // Per-chunk partial maxes; final reduce on the main thread.
                 const size_t n_chunks = static_cast<size_t>(n_threads_) *
                                         ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD;
-                std::vector<int32_t> partials(n_chunks, 0);
+                partials_.assign(n_chunks, 0);
                 std::atomic<size_t> next{0};
                 const size_t total_sz = static_cast<size_t>(hw);
                 const size_t actual_chunks = std::min(n_chunks, total_sz);
                 const size_t chunk_sz = (total_sz + actual_chunks - 1) / actual_chunks;
                 const int32_t* ep = expanded;
-                pool_->parallel([&]() {
+                int32_t* partials_ptr = partials_.data();
+                pool_->parallel([&, partials_ptr]() {
                     size_t idx;
                     while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < actual_chunks) {
                         const size_t i0 = idx * chunk_sz;
                         const size_t i1 = std::min(i0 + chunk_sz, total_sz);
                         int32_t m = 0;
                         for (size_t i = i0; i < i1; ++i) if (ep[i] > m) m = ep[i];
-                        partials[idx] = m;
+                        partials_ptr[idx] = m;
                     }
                 });
                 for (size_t i = 0; i < actual_chunks; ++i) {
-                    if (partials[i] > max_label) max_label = partials[i];
+                    if (partials_[i] > max_label) max_label = partials_[i];
                 }
             }
             stage("max_scan");
@@ -678,13 +717,13 @@ public:
                 std::vector<int64_t> nbs = neighbors_nd_padded(shape, conn);
                 int64_t total_padded = 1;
                 for (int64_t s : shape) total_padded *= (s + 2);
-                std::unique_ptr<int32_t[]> padded(new int32_t[total_padded]);
-                pad_nd_into<int32_t>(expanded, padded.get(), shape, /*pad_value=*/0);
+                padded_.resize(static_cast<size_t>(total_padded));
+                pad_nd_into<int32_t>(expanded, padded_.data(), shape, /*pad_value=*/0);
                 const int64_t ht_raw = 2 * static_cast<int64_t>(nbs.size())
                                         * static_cast<int64_t>(max_label);
                 const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
                 pairs = ncolor_cpp::search_hashset_parallel<int32_t>(
-                    padded.get(), total_padded, nbs.data(),
+                    padded_.data(), total_padded, nbs.data(),
                     static_cast<int>(nbs.size()),
                     static_cast<uint64_t>(ht_size), n_threads_, *pool_);
             }
@@ -774,8 +813,9 @@ private:
     int n_threads_;
     std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
     ncolor_cpp::ExpandBuffers expand_bufs_;
-    std::vector<uint8_t> bg_mask_;  // captured from cast, used by apply_lut
-    std::vector<int32_t> padded_;
+    std::vector<uint8_t> bg_mask_;     // captured from cast, used by apply_lut
+    std::vector<int32_t> padded_;       // ND non-fast-2D connect path
+    std::vector<int32_t> partials_;     // max-reduce partials, reused across calls
     std::vector<int32_t> src_idx_, dst_idx_;
     std::vector<int32_t> indptr_, indices_;
     std::vector<uint8_t> colors_;
@@ -846,8 +886,8 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("max_depth") = 30, py::arg("rand_period") = 10,
              py::arg("conn") = 2,
              py::arg("p") = 2, py::arg("capture_stages") = false,
-             py::arg("format_input") = true,
-             "Run [format_labels →] expand → connect → CSR → color → apply_lut.\n"
+             py::arg("format_input") = true, py::arg("expand") = true,
+             "Run [format_labels →] [expand →] connect → CSR → color → apply_lut.\n"
              "Supports 2D and 3D inputs (any ndim ≥ 2 actually).\n"
              "conn: 2D ∈ {1, 2}, 3D ∈ {1, 2, 3}. Matches\n"
              "scipy.ndimage.generate_binary_structure semantics. The 2D conn=2\n"
