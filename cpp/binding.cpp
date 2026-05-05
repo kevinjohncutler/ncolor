@@ -778,25 +778,83 @@ public:
             // numba `_solver` retry chain (sans Kempe-chain swaps, which
             // are rarely triggered for the planar adjacency graphs ncolor
             // sees in practice).
+            //
+            // The ``attempts_per_n`` random-offset attempts at each cur_n
+            // are independent (they only differ in the LCG seed used for
+            // restarts), so we race them in parallel on the pool. Wall-clock
+            // is now max(attempt_time) per cur_n iteration instead of sum.
+            // For small graphs the dispatch overhead dominates the BFS, so
+            // we fall back to the serial path below a threshold.
             const int64_t max_iter = std::max<int64_t>(static_cast<int64_t>(indices_.size()) +
                                                       static_cast<int64_t>(indptr_.size()), 512);
             int cur_n = n_colors;
             const int attempts_per_n = 4;
             bool ok = false;
+            // Threshold tuned on M2 / 20-thread ForkJoinPool: below ~500
+            // edges the BFS finishes in <100 µs and dispatch eats the win.
+            const bool color_parallel = (n_threads_ > 1) &&
+                (static_cast<int64_t>(N) + M >= 500);
+            if (color_parallel) {
+                per_attempt_colors_.resize(attempts_per_n);
+                per_attempt_ok_.assign(attempts_per_n, 0);
+            }
             for (int depth = 0; depth < max_depth && !ok; ++depth) {
-                for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
-                    const bool finished = ncolor_cpp::color_graph_csr_legacy(
-                        indptr_.data(), indices_.data(), N,
-                        cur_n, rand_period, depth + attempt, max_iter, colors_);
-                    bool conflict = !finished || ncolor_cpp::has_conflict_csr(
-                        indptr_.data(), indices_.data(), N, colors_.data());
-                    if (conflict) {
-                        // Local greedy repair — fixes most leftovers cheaply.
-                        ok = ncolor_cpp::repair_coloring(
+                if (color_parallel) {
+                    // Run the attempts_per_n random-offset attempts in parallel.
+                    // Each attempt has its own colors buffer (the BFS internally
+                    // also allocates its own counter / queue, so attempts are
+                    // fully independent — no cross-thread state).
+                    std::atomic<int> next{0};
+                    const int A = attempts_per_n;
+                    const int local_cur_n = cur_n;
+                    const int local_depth = depth;
+                    const int32_t* ip = indptr_.data();
+                    const int32_t* ix = indices_.data();
+                    pool_->parallel([&, A, local_cur_n, local_depth, ip, ix]() {
+                        int idx;
+                        while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < A) {
+                            auto& cv = per_attempt_colors_[idx];
+                            const int attempt_offset = local_depth + idx;
+                            const bool finished = ncolor_cpp::color_graph_csr_legacy(
+                                ip, ix, N,
+                                local_cur_n, rand_period, attempt_offset, max_iter, cv);
+                            const bool conflict = !finished ||
+                                ncolor_cpp::has_conflict_csr(ip, ix, N, cv.data());
+                            bool a_ok;
+                            if (conflict) {
+                                a_ok = ncolor_cpp::repair_coloring(
+                                    ip, ix, N,
+                                    local_cur_n, std::max(4, max_depth), cv);
+                            } else {
+                                a_ok = true;
+                            }
+                            per_attempt_ok_[idx] = a_ok ? 1 : 0;
+                        }
+                    });
+                    // Take the lowest-index successful attempt (preserves
+                    // deterministic preference for the first random offset
+                    // when multiple attempts succeed).
+                    for (int a = 0; a < attempts_per_n; ++a) {
+                        if (per_attempt_ok_[a]) {
+                            colors_.swap(per_attempt_colors_[a]);
+                            ok = true;
+                            break;
+                        }
+                    }
+                } else {
+                    for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
+                        const bool finished = ncolor_cpp::color_graph_csr_legacy(
                             indptr_.data(), indices_.data(), N,
-                            cur_n, std::max(4, max_depth), colors_);
-                    } else {
-                        ok = true;
+                            cur_n, rand_period, depth + attempt, max_iter, colors_);
+                        bool conflict = !finished || ncolor_cpp::has_conflict_csr(
+                            indptr_.data(), indices_.data(), N, colors_.data());
+                        if (conflict) {
+                            ok = ncolor_cpp::repair_coloring(
+                                indptr_.data(), indices_.data(), N,
+                                cur_n, std::max(4, max_depth), colors_);
+                        } else {
+                            ok = true;
+                        }
                     }
                 }
                 if (!ok) ++cur_n;  // bump n only when all attempts at cur_n failed
@@ -872,6 +930,10 @@ private:
     std::vector<uint8_t> colors_;
     std::vector<uint8_t> lut_;
     int last_n_conflicts_ = 0;
+    // Per-attempt scratch for parallel coloring (one colors vector per
+    // racing attempt). Reused across calls.
+    std::vector<std::vector<uint8_t>> per_attempt_colors_;
+    std::vector<int> per_attempt_ok_;
 };
 
 PYBIND11_MODULE(_impl, m) {
