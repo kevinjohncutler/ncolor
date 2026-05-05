@@ -625,6 +625,12 @@ public:
             // straight copy (with bg-mask write); the alternative
             // pattern of "skip the copy when input is int32" was a tiny
             // saving but cost us the multi-dtype generality.
+            //
+            // Note: I tried fusing the min/max reduce from format_labels
+            // into this pass to "save a redundant read." It regressed:
+            // the data is still cache-hot from this pass when format
+            // does its own reduce, so we save no memory traffic, while
+            // the per-element min/max compares slow this kernel down.
             expand_bufs_.resize(total);
             bg_mask_.resize(static_cast<size_t>(total));
             int32_t* expanded = expand_bufs_.lbl();
@@ -747,13 +753,28 @@ public:
                 pairs = ncolor_cpp::find_pairs_2d_unpadded<int32_t>(
                     expanded, H, W, static_cast<uint64_t>(ht_size),
                     n_threads_, *pool_);
+            } else if (ndim == 3) {
+                // 3D: unpadded fast path. Same per-thread hashtable +
+                // parallel pairwise merge as the padded version, but
+                // bounds-checks each neighbour against (D, H, W) so we
+                // can skip the (D+2)(H+2)(W+2) padded buffer + pad_nd_into
+                // pass (~4 ms saved at 256³).
+                const int n_nbs = (conn == 1 ? 3 : (conn == 2 ? 9 : 13));
+                const int64_t ht_raw = 2 * static_cast<int64_t>(n_nbs)
+                                        * static_cast<int64_t>(max_label);
+                const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
+                pairs = ncolor_cpp::find_pairs_3d_unpadded<int32_t>(
+                    expanded, shape[0], shape[1], shape[2], conn,
+                    static_cast<uint64_t>(ht_size), n_threads_, *pool_);
             } else {
-                // ND or non-default conn: pad + generic search_hashset_parallel.
+                // ndim >= 4: still routes through the padded path (rare;
+                // not optimised for now).
                 std::vector<int64_t> nbs = neighbors_nd_padded(shape, conn);
                 int64_t total_padded = 1;
                 for (int64_t s : shape) total_padded *= (s + 2);
                 padded_.resize(static_cast<size_t>(total_padded));
                 pad_nd_into<int32_t>(expanded, padded_.data(), shape, /*pad_value=*/0);
+                stage("pad");
                 const int64_t ht_raw = 2 * static_cast<int64_t>(nbs.size())
                                         * static_cast<int64_t>(max_label);
                 const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));

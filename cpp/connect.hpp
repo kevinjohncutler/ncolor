@@ -263,6 +263,164 @@ find_pairs_2d_unpadded(const T* lbl, int64_t H, int64_t W,
     return out;
 }
 
+// 3D unpadded variant (analogous to find_pairs_2d_unpadded but for 3D
+// inputs). Skips the (D+2)(H+2)(W+2) padded buffer and the pad_nd_into
+// pass — saves ~4 ms at 256³ uint16 — by doing per-pixel bounds checks
+// against (D, H, W) on each forward-neighbour lookup.
+//
+// Forward-neighbour set encodes ``ncolor.color.connect(conn)``:
+//   conn=1 (face):           3 nbs   ( +z, +y, +x )
+//   conn=2 (face + edge):    9 nbs
+//   conn=3 (face + corner): 13 nbs
+// Each chosen offset has a strictly forward flat-index, so emitting
+// (vi, neighbour) only once per i suffices to count each pair once.
+template <typename T>
+std::vector<std::pair<int32_t, int32_t>>
+find_pairs_3d_unpadded(const T* lbl, int64_t D, int64_t H, int64_t W,
+                       int conn, uint64_t ht_size, int n_threads,
+                       ForkJoinPool& pool) {
+    if (conn < 1 || conn > 3) {
+        return {};  // caller is expected to pass conn ∈ {1,2,3}
+    }
+    const uint64_t ht_mask = ht_size - 1;
+    if (n_threads < 1) n_threads = 1;
+
+    // Pre-tabulate forward neighbour offsets (dz, dy, dx).
+    struct Nb { int dz, dy, dx; };
+    Nb nbs_buf[13];
+    int nb_n = 0;
+    auto add = [&](int dz, int dy, int dx) { nbs_buf[nb_n++] = {dz, dy, dx}; };
+    add(1, 0, 0); add(0, 1, 0); add(0, 0, 1);                          // conn>=1
+    if (conn >= 2) {
+        add(1, 1, 0); add(1, -1, 0);
+        add(1, 0, 1); add(1, 0, -1);
+        add(0, 1, 1); add(0, 1, -1);
+    }
+    if (conn >= 3) {
+        add(1, 1, 1); add(1, 1, -1);
+        add(1, -1, 1); add(1, -1, -1);
+    }
+
+    std::unique_ptr<uint64_t[]> hts(new uint64_t[static_cast<size_t>(n_threads) * ht_size]);
+
+    auto emit_pair = [ht_mask](uint64_t* ht, T vi, T vj) {
+        if (vj == 0 || vj == vi) return;
+        const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
+        const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
+        ht_insert(ht, ht_mask, (lo << 32) | hi);
+    };
+    // Pre-compute flat offsets for the interior path (no per-pixel
+    // multi-dim reconstruction needed).
+    int64_t flat_off[13];
+    for (int k = 0; k < nb_n; ++k) {
+        flat_off[k] = (int64_t)nbs_buf[k].dz * H * W
+                    + (int64_t)nbs_buf[k].dy * W
+                    + (int64_t)nbs_buf[k].dx;
+    }
+    // Bounds-checked path (for edge pixels).
+    auto scan_pixel_checked = [&](int64_t z, int64_t y, int64_t x, uint64_t* ht) {
+        const T vi = lbl[(z * H + y) * W + x];
+        if (vi == 0) return;
+        for (int k = 0; k < nb_n; ++k) {
+            const int64_t nz = z + nbs_buf[k].dz;
+            if (nz < 0 || nz >= D) continue;
+            const int64_t ny = y + nbs_buf[k].dy;
+            if (ny < 0 || ny >= H) continue;
+            const int64_t nx = x + nbs_buf[k].dx;
+            if (nx < 0 || nx >= W) continue;
+            emit_pair(ht, vi, lbl[(nz * H + ny) * W + nx]);
+        }
+    };
+    // Z-band scan: split into interior z (0 < z < D-1) and edge z (0 / D-1).
+    // For each interior y (0 < y < H-1), inner x split into edge cols
+    // (x=0, x=W-1) and interior cols (1 ≤ x ≤ W-2). The interior path
+    // uses a flat-offset loop with no bounds checks — that's where the
+    // bulk of work goes for D, H, W ≥ 3.
+    auto scan_band = [&](int64_t z0, int64_t z1, uint64_t* ht) {
+        for (int64_t z = z0; z < z1; ++z) {
+            const bool z_edge = (z == 0) || (z == D - 1);
+            if (z_edge || H < 3 || W < 3) {
+                for (int64_t y = 0; y < H; ++y)
+                    for (int64_t x = 0; x < W; ++x)
+                        scan_pixel_checked(z, y, x, ht);
+                continue;
+            }
+            // y = 0 row (edge)
+            for (int64_t x = 0; x < W; ++x) scan_pixel_checked(z, 0, x, ht);
+            // interior y rows
+            for (int64_t y = 1; y < H - 1; ++y) {
+                // x = 0 col (edge)
+                scan_pixel_checked(z, y, 0, ht);
+                // interior cols: no bounds checks needed (every neighbour
+                // is in-range because z, y, x are interior and dz/dy/dx
+                // are all in {-1, 0, 1}).
+                const T* row = lbl + (z * H + y) * W;
+                for (int64_t x = 1; x < W - 1; ++x) {
+                    const T vi = row[x];
+                    if (vi == 0) continue;
+                    const int64_t base = (z * H + y) * W + x;
+                    for (int k = 0; k < nb_n; ++k) {
+                        emit_pair(ht, vi, lbl[base + flat_off[k]]);
+                    }
+                }
+                // x = W-1 col (edge)
+                scan_pixel_checked(z, y, W - 1, ht);
+            }
+            // y = H-1 row (edge)
+            for (int64_t x = 0; x < W; ++x) scan_pixel_checked(z, H - 1, x, ht);
+        }
+    };
+
+    if (n_threads == 1 || D < 2) {
+        std::fill_n(hts.get(), ht_size, HT_EMPTY);
+        scan_band(0, D, hts.get());
+    } else {
+        // Phase 1: parallel scan over z-bands (each worker owns its HT).
+        {
+            std::atomic<int> next{0};
+            const int64_t per = (D + n_threads - 1) / n_threads;
+            pool.parallel([&]() {
+                int t;
+                while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_threads) {
+                    uint64_t* ht = hts.get() + static_cast<size_t>(t) * ht_size;
+                    std::fill_n(ht, ht_size, HT_EMPTY);
+                    const int64_t z0 = static_cast<int64_t>(t) * per;
+                    const int64_t z1 = std::min(z0 + per, D);
+                    if (z0 < z1) scan_band(z0, z1, ht);
+                }
+            });
+        }
+        // Phase 2: pairwise tree merge.
+        int stride = 1;
+        while (stride < n_threads) {
+            const int n_pairs = (n_threads + 2 * stride - 1) / (2 * stride);
+            std::atomic<int> next{0};
+            pool.parallel([&]() {
+                int p;
+                while ((p = next.fetch_add(1, std::memory_order_relaxed)) < n_pairs) {
+                    const int dst = p * 2 * stride;
+                    const int src = dst + stride;
+                    if (src >= n_threads) continue;
+                    uint64_t* dst_ht = hts.get() + static_cast<size_t>(dst) * ht_size;
+                    const uint64_t* src_ht = hts.get() + static_cast<size_t>(src) * ht_size;
+                    ht_merge(src_ht, dst_ht, ht_size);
+                }
+            });
+            stride *= 2;
+        }
+    }
+    std::vector<std::pair<int32_t, int32_t>> out;
+    out.reserve(64);
+    const uint64_t* root = hts.get();
+    for (uint64_t h = 0; h < ht_size; ++h) {
+        const uint64_t key = root[h];
+        if (key == HT_EMPTY) continue;
+        out.emplace_back(static_cast<int32_t>(key >> 32),
+                         static_cast<int32_t>(key & 0xFFFFFFFFull));
+    }
+    return out;
+}
+
 // Single-threaded variant (no pool, no merge) for the small-image case.
 template <typename T>
 std::vector<std::pair<int32_t, int32_t>>
