@@ -379,11 +379,124 @@ public:
     std::vector<std::pair<std::string, double>> last_stages_;
     std::vector<std::pair<std::string, double>> get_last_stages() const { return last_stages_; }
 
+    // Adjacency pairs for a label image, mirroring ncolor.color.connect.
+    // Takes the image directly (any of the supported integer dtypes) and
+    // returns an (M, 2) int32 array of unique (lo, hi) pairs of adjacent
+    // labels under connectivity ``conn`` (1..ndim). 2D conn=2 takes the
+    // unpadded fast path; everything else pads and uses the generic
+    // hashset parallel search.
+    py::array_t<int32_t> connect(py::array mask, int conn = 1) {
+        if (!(mask.flags() & py::array::c_style)) {
+            mask = py::array::ensure(mask, py::array::c_style);
+        }
+        const auto buf = mask.request();
+        const int ndim = static_cast<int>(buf.ndim);
+        if (ndim < 2) throw std::invalid_argument(
+            "Solver.connect expects a label image with ndim >= 2");
+        if (conn < 1 || conn > ndim) throw std::invalid_argument(
+            "Solver.connect: conn must be in [1, ndim]");
+
+        std::vector<int64_t> shape(ndim);
+        int64_t total = 1;
+        for (int d = 0; d < ndim; ++d) {
+            shape[d] = static_cast<int64_t>(buf.shape[d]);
+            total *= shape[d];
+        }
+        const bool fast_2d = (ndim == 2 && conn == 2);
+        const int64_t H = shape[0];
+        const int64_t W = (ndim >= 2) ? shape[1] : 1;
+
+        const std::string fmt = buf.format;
+        const bool is_int32  = fmt == py::format_descriptor<int32_t>::format();
+        const bool is_uint8  = fmt == py::format_descriptor<uint8_t>::format();
+        const bool is_uint16 = fmt == py::format_descriptor<uint16_t>::format();
+        const bool is_uint32 = fmt == py::format_descriptor<uint32_t>::format();
+        const bool is_int8   = fmt == py::format_descriptor<int8_t>::format();
+        const bool is_int16  = fmt == py::format_descriptor<int16_t>::format();
+        const bool is_int64  = fmt == py::format_descriptor<int64_t>::format();
+        if (!(is_int32 || is_uint8 || is_uint16 || is_uint32
+              || is_int8 || is_int16 || is_int64)) {
+            throw std::invalid_argument(
+                "Solver.connect: unsupported dtype '" + fmt + "'");
+        }
+        const void* src_ptr = buf.ptr;
+
+        std::vector<std::pair<int32_t, int32_t>> pairs;
+        {
+            py::gil_scoped_release release;
+            // Cast to int32 in expand_bufs_.lbl(); discard bg pattern
+            // (connect doesn't need it).
+            expand_bufs_.resize(total);
+            int32_t* labels = expand_bufs_.lbl();
+            bg_mask_.resize(static_cast<size_t>(total));
+            uint8_t* bg = bg_mask_.data();
+            if (is_int32) ncolor_cpp::cast_with_bg<int32_t>(
+                static_cast<const int32_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
+            else if (is_uint8) ncolor_cpp::cast_with_bg<uint8_t>(
+                static_cast<const uint8_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
+            else if (is_uint16) ncolor_cpp::cast_with_bg<uint16_t>(
+                static_cast<const uint16_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
+            else if (is_uint32) ncolor_cpp::cast_with_bg<uint32_t>(
+                static_cast<const uint32_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
+            else if (is_int8) ncolor_cpp::cast_with_bg<int8_t>(
+                static_cast<const int8_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
+            else if (is_int16) ncolor_cpp::cast_with_bg<int16_t>(
+                static_cast<const int16_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
+            else /* is_int64 */ ncolor_cpp::cast_with_bg<int64_t>(
+                static_cast<const int64_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
+
+            // Find max for hashtable sizing.
+            int32_t max_label = 0;
+            for (int64_t i = 0; i < total; ++i) {
+                if (labels[i] > max_label) max_label = labels[i];
+            }
+            if (max_label == 0) {
+                // Empty input — no pairs.
+            } else if (fast_2d) {
+                const int64_t ht_raw = 4 * static_cast<int64_t>(max_label);
+                const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
+                pairs = ncolor_cpp::find_pairs_2d_unpadded<int32_t>(
+                    labels, H, W, static_cast<uint64_t>(ht_size),
+                    n_threads_, *pool_);
+            } else {
+                std::vector<int64_t> nbs = neighbors_nd_padded(shape, conn);
+                int64_t total_padded = 1;
+                for (int64_t s : shape) total_padded *= (s + 2);
+                std::unique_ptr<int32_t[]> padded(new int32_t[total_padded]);
+                pad_nd_into<int32_t>(labels, padded.get(), shape, /*pad_value=*/0);
+                const int64_t ht_raw = 2 * static_cast<int64_t>(nbs.size())
+                                        * static_cast<int64_t>(max_label);
+                const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
+                pairs = ncolor_cpp::search_hashset_parallel<int32_t>(
+                    padded.get(), total_padded, nbs.data(),
+                    static_cast<int>(nbs.size()),
+                    static_cast<uint64_t>(ht_size), n_threads_, *pool_);
+            }
+        }
+
+        // Pack as (M, 2) int32 ndarray.
+        const py::ssize_t m = static_cast<py::ssize_t>(pairs.size());
+        py::array_t<int32_t> out({m, py::ssize_t{2}});
+        int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
+        for (py::ssize_t i = 0; i < m; ++i) {
+            out_ptr[i * 2 + 0] = pairs[i].first;
+            out_ptr[i * 2 + 1] = pairs[i].second;
+        }
+        return out;
+    }
+
     std::pair<py::array_t<uint8_t>, int> label(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> mask,
+            py::array mask,
             int n_colors = 4, int max_depth = 30, int rand_period = 10,
             int conn = 2, int p = 2, bool capture_stages = false,
             bool format_input = true) {
+        // Require C-contiguous; pybind11 doesn't enforce that for the
+        // untyped py::array, so check explicitly. Common dtypes accepted
+        // (uint8/uint16/uint32, int8/int16/int32/int64) and fused with
+        // the format_labels pass inside the GIL-released block.
+        if (!(mask.flags() & py::array::c_style)) {
+            mask = py::array::ensure(mask, py::array::c_style);
+        }
         const auto buf = mask.request();
         const int ndim = static_cast<int>(buf.ndim);
         if (ndim < 2) throw std::invalid_argument(
@@ -405,7 +518,22 @@ public:
         const int64_t H = shape[0];
         const int64_t W = (ndim >= 2) ? shape[1] : 1;
 
-        const int32_t* mask_ptr = static_cast<const int32_t*>(buf.ptr);
+        // Validate dtype now (with GIL) so we throw before releasing.
+        const std::string fmt = buf.format;
+        const bool is_int32  = fmt == py::format_descriptor<int32_t>::format();
+        const bool is_uint8  = fmt == py::format_descriptor<uint8_t>::format();
+        const bool is_uint16 = fmt == py::format_descriptor<uint16_t>::format();
+        const bool is_uint32 = fmt == py::format_descriptor<uint32_t>::format();
+        const bool is_int8   = fmt == py::format_descriptor<int8_t>::format();
+        const bool is_int16  = fmt == py::format_descriptor<int16_t>::format();
+        const bool is_int64  = fmt == py::format_descriptor<int64_t>::format();
+        if (!(is_int32 || is_uint8 || is_uint16 || is_uint32
+              || is_int8 || is_int16 || is_int64)) {
+            throw std::invalid_argument(
+                "Solver.label: unsupported dtype '" + fmt +
+                "' (need one of: uint8, uint16, uint32, int8, int16, int32, int64)");
+        }
+        const void* src_ptr = buf.ptr;
 
         std::vector<py::ssize_t> out_shape(ndim);
         for (int d = 0; d < ndim; ++d) out_shape[d] = static_cast<py::ssize_t>(shape[d]);
@@ -423,24 +551,68 @@ public:
                 std::chrono::duration<double, std::milli>(t_now - t_start).count());
             t_start = t_now;
         };
+        bool early_exit_empty = false;
         {
             py::gil_scoped_release release;
 
-            // 0. Optional format_labels: compact nonzero labels to 1..N
-            // in place inside expand_bufs_.lbl(). Subsequent stages see
-            // a normalized buffer; the original mask_ptr is preserved
-            // for the bg-mask step at the end.
+            // 0a. Cast input dtype → int32 (in expand_bufs_.lbl()) AND
+            // capture the bg pattern (input == 0) into bg_mask_, all in
+            // one parallel pass. For int32 input the cast is still a
+            // straight copy (with bg-mask write); the alternative
+            // pattern of "skip the copy when input is int32" was a tiny
+            // saving but cost us the multi-dtype generality.
             expand_bufs_.resize(total);
+            bg_mask_.resize(static_cast<size_t>(total));
             int32_t* expanded = expand_bufs_.lbl();
-            const int32_t* expand_input;
-            if (format_input) {
-                std::memcpy(expanded, mask_ptr, total * sizeof(int32_t));
-                ncolor_cpp::format_labels_inplace(expanded, total, *pool_, n_threads_);
-                expand_input = expanded;  // already in expand_bufs_.lbl()
-                stage("format");
-            } else {
-                expand_input = mask_ptr;
+            uint8_t* bg = bg_mask_.data();
+            if (is_int32) {
+                ncolor_cpp::cast_with_bg<int32_t>(
+                    static_cast<const int32_t*>(src_ptr),
+                    expanded, bg, total, *pool_, n_threads_);
+            } else if (is_uint8) {
+                ncolor_cpp::cast_with_bg<uint8_t>(
+                    static_cast<const uint8_t*>(src_ptr),
+                    expanded, bg, total, *pool_, n_threads_);
+            } else if (is_uint16) {
+                ncolor_cpp::cast_with_bg<uint16_t>(
+                    static_cast<const uint16_t*>(src_ptr),
+                    expanded, bg, total, *pool_, n_threads_);
+            } else if (is_uint32) {
+                ncolor_cpp::cast_with_bg<uint32_t>(
+                    static_cast<const uint32_t*>(src_ptr),
+                    expanded, bg, total, *pool_, n_threads_);
+            } else if (is_int8) {
+                ncolor_cpp::cast_with_bg<int8_t>(
+                    static_cast<const int8_t*>(src_ptr),
+                    expanded, bg, total, *pool_, n_threads_);
+            } else if (is_int16) {
+                ncolor_cpp::cast_with_bg<int16_t>(
+                    static_cast<const int16_t*>(src_ptr),
+                    expanded, bg, total, *pool_, n_threads_);
+            } else /* is_int64 */ {
+                ncolor_cpp::cast_with_bg<int64_t>(
+                    static_cast<const int64_t*>(src_ptr),
+                    expanded, bg, total, *pool_, n_threads_);
             }
+            stage("cast");
+
+            // 0b. Optional format_labels: compact nonzero labels to 1..N
+            // in place inside expand_bufs_.lbl(). When format_input=False
+            // the caller is asserting labels are already 1..N.
+            const int32_t* expand_input = expanded;
+            if (format_input) {
+                const int n_labels = ncolor_cpp::format_labels_inplace(
+                    expanded, total, *pool_, n_threads_);
+                stage("format");
+                // Empty / all-bg input: output is all zeros, no
+                // expansion / coloring needed.
+                if (n_labels == 0) {
+                    std::memset(out_ptr, 0,
+                                static_cast<size_t>(total) * sizeof(uint8_t));
+                    early_exit_empty = true;
+                }
+            }
+        if (!early_exit_empty) {
 
             // 1. Expand labels (Voronoi) — every pixel ends up labeled.
             // Single ND driver dispatches on p at compile time:
@@ -567,32 +739,34 @@ public:
             lut_.assign(static_cast<size_t>(N) + 1, 0);
             for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
 
-            // Apply LUT in parallel — bg pixels (0 in the original input) get
-            // color 0, foreground pixels get lut[expanded[i]]. The single-
-            // threaded version was costing ~5–10 ms at 2048² (4M loops with
-            // a branch each); pool-dispatched chunked write drops it to <1 ms.
+            // Apply LUT in parallel — bg pixels get color 0, foreground
+            // pixels get lut[expanded[i]]. The bg pattern was captured
+            // by ``cast_with_bg`` at the start (bg_mask_[i]==1 wherever
+            // the original input was 0); using a uint8 mask here keeps
+            // the inner loop typeless wrt the original dtype.
             {
                 const int nt = std::max(1, n_threads_);
+                const uint8_t* bg_p = bg_mask_.data();
+                const int32_t* ep = expanded;
+                const uint8_t* lp = lut_.data();
+                uint8_t* op = out_ptr;
                 if (nt == 1 || total < 8192) {
                     for (int64_t i = 0; i < total; ++i) {
-                        out_ptr[i] = (mask_ptr[i] != 0) ? lut_[expanded[i]] : 0;
+                        op[i] = bg_p[i] ? 0 : lp[ep[i]];
                     }
                 } else {
-                    const int32_t* mp = mask_ptr;
-                    const int32_t* ep = expanded;
-                    const uint8_t* lp = lut_.data();
-                    uint8_t* op = out_ptr;
                     ncolor_cpp::dispatch_parallel(*pool_, static_cast<size_t>(total),
                         static_cast<size_t>(nt) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
-                        [mp, ep, lp, op](size_t begin, size_t end) {
+                        [bg_p, ep, lp, op](size_t begin, size_t end) {
                             for (size_t i = begin; i < end; ++i) {
-                                op[i] = (mp[i] != 0) ? lp[ep[i]] : 0;
+                                op[i] = bg_p[i] ? 0 : lp[ep[i]];
                             }
                         });
                 }
             }
             stage("apply_lut");
-        }
+        }  // close: if (!early_exit_empty)
+        }  // close: gil_scoped_release scope
         return {std::move(out), n_used};
     }
 
@@ -600,6 +774,7 @@ private:
     int n_threads_;
     std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
     ncolor_cpp::ExpandBuffers expand_bufs_;
+    std::vector<uint8_t> bg_mask_;  // captured from cast, used by apply_lut
     std::vector<int32_t> padded_;
     std::vector<int32_t> src_idx_, dst_idx_;
     std::vector<int32_t> indptr_, indices_;
@@ -686,6 +861,12 @@ PYBIND11_MODULE(_impl, m) {
              "labels are already 1..N (saves ~one full-image pass).\n"
              "Background masking (output=0 wherever input=0) is always\n"
              "applied in the apply_lut step.")
+        .def("connect", &Solver::connect,
+             py::arg("mask"), py::arg("conn") = 1,
+             "Adjacency pairs for a label image. Returns an (M, 2) int32\n"
+             "array of unique (lo, hi) label pairs that share a boundary\n"
+             "under connectivity ``conn``. Mirrors ncolor.connect()'s\n"
+             "signature; runs the cpp connect kernel directly.")
         .def("get_last_stages", &Solver::get_last_stages,
              "Per-stage timing breakdown from the most recent label() call\n"
              "made with capture_stages=True.");

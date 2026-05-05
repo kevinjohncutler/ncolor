@@ -71,25 +71,13 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
                              format_input=format_input)
 
     # Common path: expand=True, no LUT/conflict introspection.
+    # The C++ Solver handles format_labels (compact 1..N including the
+    # min-shift case for min != 0), expand, connect, color, apply_lut,
+    # and bg-masking — all under one GIL release. The wrapper just
+    # dispatches; no per-call np.min/np.max scans needed.
     lab_arr = np.asarray(lab)
-    if lab_arr.size == 0 or int(lab_arr.max()) == 0:
-        # No labels — fall back; legacy handles the empty case cleanly.
-        return _legacy_label(lab, n=n, conn=conn, max_depth=max_depth,
-                             offset=offset, expand=expand, return_n=return_n,
-                             format_input=format_input)
-
-    # The C++ Solver does format_labels (compact 1..N), expand, connect,
-    # color, apply_lut, and bg-masking — all under one GIL release. We
-    # only need to ensure dtype + min==0 (bg) preconditions; if min!=0
-    # (legacy "treat min as bg") fall back to the numba reference path,
-    # which has the full shift semantics.
-    if format_input and int(lab_arr.min()) != 0:
-        return _legacy_label(lab, n=n, conn=conn, max_depth=max_depth,
-                             offset=offset, expand=expand, return_n=return_n,
-                             format_input=format_input)
-
     out, n_used = _get_solver().label(
-        lab_arr.astype(np.int32, copy=False),
+        lab_arr,
         n_colors=int(n), max_depth=int(max_depth),
         conn=int(conn), format_input=bool(format_input))
 
@@ -103,13 +91,7 @@ def connect(img, conn=1):
 
     Returns an ``(M, 2)`` int array of unique (lo, hi) label pairs.
     """
-    # Pairs API isn't yet exposed at the Solver level via a simple
-    # method that mirrors numba's connect output, so for now this
-    # delegates to the legacy numba implementation. (The C++ engine
-    # has the equivalent kernel internally — exposing it as a
-    # standalone public method is a small future change.)
-    from ._numba_legacy.color import connect as _legacy_connect
-    return _legacy_connect(img, conn)
+    return _get_solver().connect(img, conn=int(conn))
 
 
 def unique_nonzero(labels):
