@@ -11,6 +11,20 @@ def _lazy_import_skimage_morphology():
     return remove_small_holes
 
 
+# Module-level ExpandEngine singleton. Constructing one per call adds
+# ~5-10 ms of pool-spinup overhead — matches the rationale in color.py's
+# _SOLVER. Engine is thread-safe for sequential format_labels calls.
+_FORMAT_ENGINE = None
+
+
+def _get_format_engine():
+    global _FORMAT_ENGINE
+    if _FORMAT_ENGINE is None:
+        from ._backend import ExpandEngine
+        _FORMAT_ENGINE = ExpandEngine(-1)
+    return _FORMAT_ENGINE
+
+
 def format_labels(labels, clean=False, min_area=9, despur=False,
                   verbose=False, background=None, ignore=False):
     """
@@ -24,29 +38,22 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
     # round-trip that this function used to do per call.
     if (not clean and not ignore and background is None and not verbose):
         try:
-            from ._backend import ExpandEngine
+            eng = _get_format_engine()
         except ImportError:
             pass  # fall through to legacy path
         else:
-            arr = np.asarray(labels)
-            # The cpp format_labels accepts the full set of supported
-            # integer dtypes via ExpandEngine.format_labels (which goes
-            # through Solver-style dispatch); for now the binding only
-            # takes int32, so we cast here. Still avoids fastremap +
-            # the explicit shift step.
-            if arr.dtype != np.int32:
-                arr = arr.astype(np.int32, copy=True)
-            else:
-                arr = arr.copy()
-            eng = ExpandEngine(-1)
+            # Pass the original-dtype array straight to cpp. ExpandEngine
+            # casts to int32 in parallel inside the released-GIL block via
+            # cast_to_int32 — no numpy.astype + .copy() round-trip outside
+            # the GIL release (saves ~5 ms at 256³ uint16).
+            #
             # first_seen=True matches the legacy fastremap.renumber's
-            # input-order numbering — preserves bit-equality with the
+            # input-order numbering, preserving bit-equality with the
             # historical format_labels output that some downstream
-            # callers (and our test suite) depend on. Slower than
-            # ascending-source by ~2× but still ~tied with fastremap
-            # at 2048², ~1.0-1.3× slower at smaller sizes; the win
-            # vs fastremap is no longer about throughput but about
-            # GIL release and cache behavior in larger pipelines.
+            # callers (and our test suite) depend on. ~2× slower than
+            # ascending-source numbering, but the win vs fastremap is
+            # already in GIL release + cache behaviour, not throughput.
+            arr = np.ascontiguousarray(labels)
             out, _n = eng.format_labels(arr, first_seen=True)
             return out
 
