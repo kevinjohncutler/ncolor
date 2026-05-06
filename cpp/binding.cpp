@@ -161,11 +161,15 @@ public:
     // Python wrapper avoids a single-threaded numpy.astype + .copy()
     // round-trip outside the GIL release (~5 ms saved at 256³ uint16).
     //
-    // ``first_seen=False`` (default) uses ascending-source numbering
-    // (fast: parallel mark + serial scan over [1..max] + parallel
-    // apply). ``first_seen=True`` uses input-order numbering (matches
-    // fastremap.renumber bit-for-bit; build pass is serial through
-    // the input array — slower).
+    // Default (first_seen=false) uses ascending-source numbering: the
+    // new label assigned to source-label k is its rank among present
+    // labels — i.e. for source labels {3, 7, 12} the remap is
+    // {3→1, 7→2, 12→3}. Parallel build, faster.
+    //
+    // first_seen=true uses input-order numbering, matching
+    // fastremap.renumber bit-for-bit. Available for callers that depend
+    // on the historical fastremap output ordering. Build pass is serial
+    // (we only learn a label is new on first encounter), ~2× slower.
     //
     // Returns (formatted_array, n_labels).
     std::pair<py::array_t<int32_t>, int> format_labels(
@@ -1070,11 +1074,15 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("labels"), py::arg("first_seen") = false,
              "Compact nonzero labels to 1..N. If min(labels) != 0 the\n"
              "min is treated as background and everything is shifted\n"
-             "before compaction (matches legacy fastremap-based\n"
-             "format_labels). first_seen=True matches fastremap.renumber\n"
-             "bit-for-bit (input-order numbering, serial build pass);\n"
-             "default first_seen=False uses ascending-source numbering\n"
-             "(parallel build, faster). Returns (formatted_array, n_labels).")
+             "before compaction.\n"
+             "Default (first_seen=False) uses ascending-source numbering\n"
+             "(parallel build, faster); the new label is the source's\n"
+             "rank among present values. first_seen=True uses input-order\n"
+             "numbering matching fastremap.renumber bit-for-bit (serial\n"
+             "build, ~2× slower) — opt in when bit-equality matters.\n"
+             "Accepts uint8/uint16/uint32, int8/int16/int32, int64 input;\n"
+             "cast to int32 happens in parallel inside the released-GIL\n"
+             "block. Returns (formatted_array, n_labels).")
         .def("apply_lut", &ExpandEngine::apply_lut,
              py::arg("flat_lab"), py::arg("lut"),
              "Parallel scatter: out[i] = lut[flat_lab[i]]. Lut must be uint8 or int32.");

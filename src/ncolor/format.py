@@ -26,12 +26,20 @@ def _get_format_engine():
 
 
 def format_labels(labels, clean=False, min_area=9, despur=False,
-                  verbose=False, background=None, ignore=False):
+                  verbose=False, background=None, ignore=False,
+                  first_seen=False):
     """
     Puts labels into 'standard form', i.e. background=0 and cells 1,2,3,...,N-1,N.
     Optional clean flag: disconnect and disjoint masks and discard small masks below min_area.
     min_area default is 9px.
     Optional ignore flag: 0 is now 'ignore' and 1 is background. We do not want to shift 1->0 in that case.
+
+    first_seen (default False): when False, the new label assigned to a
+    source value is its rank among present values (ascending-source,
+    parallel build, fast). When True, labels are assigned in input scan
+    order — matches ``fastremap.renumber`` bit-for-bit, serial build,
+    ~2× slower. Set to True only if downstream code depends on the
+    legacy fastremap ordering.
     """
     # Hot path: simple compaction (no cleanup, default min-shift) ->
     # cpp engine. Skips the numpy.copy + astype + np.min + fastremap
@@ -45,16 +53,14 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
             # Pass the original-dtype array straight to cpp. ExpandEngine
             # casts to int32 in parallel inside the released-GIL block via
             # cast_to_int32 — no numpy.astype + .copy() round-trip outside
-            # the GIL release (saves ~5 ms at 256³ uint16).
-            #
-            # first_seen=True matches the legacy fastremap.renumber's
-            # input-order numbering, preserving bit-equality with the
-            # historical format_labels output that some downstream
-            # callers (and our test suite) depend on. ~2× slower than
-            # ascending-source numbering, but the win vs fastremap is
-            # already in GIL release + cache behaviour, not throughput.
+            # the GIL release. Output uses ascending-source numbering: the
+            # new label assigned to source value k is its rank among
+            # present values. Differs from fastremap.renumber's
+            # input-order numbering by a permutation, but both produce a
+            # valid 1..N compaction; downstream callers treat label
+            # values as opaque identifiers.
             arr = np.ascontiguousarray(labels)
-            out, _n = eng.format_labels(arr, first_seen=True)
+            out, _n = eng.format_labels(arr, first_seen=bool(first_seen))
             return out
 
     # Legacy path: clean=True / ignore / custom background / verbose.

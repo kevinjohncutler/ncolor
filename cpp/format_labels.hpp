@@ -35,18 +35,16 @@
 
 namespace ncolor_cpp {
 
-// First-seen-numbering variant: mirrors fastremap.renumber's output
-// exactly. Build pass is inherently serial — assigns a new sequential
-// label the first time each source value is encountered in input scan
-// order. Apply pass parallelizes. Used to bench the cost of bit-equality
-// with fastremap; production code uses ``format_labels_inplace`` (the
-// ascending-source variant) which is faster.
+// First-seen-numbering variant: assigns new labels in input scan order,
+// matching fastremap.renumber bit-for-bit. The build pass is inherently
+// serial (we only learn a label is new on first encounter); ~2× slower
+// than ascending-source. Available as an opt-in via
+// `ncolor.format_labels(arr, first_seen=True)` when the caller relies on
+// the historical fastremap output ordering.
 inline int32_t format_labels_inplace_first_seen(
         int32_t* lbl, int64_t total,
         ForkJoinPool& pool, int n_threads) {
     if (total <= 0) return 0;
-
-    // 1. Min/max reduce (parallel) — same as the ascending variant.
     constexpr int32_t INT32_MIN_VAL = std::numeric_limits<int32_t>::min();
     constexpr int32_t INT32_MAX_VAL = std::numeric_limits<int32_t>::max();
     int32_t min_lbl = INT32_MAX_VAL, max_lbl = INT32_MIN_VAL;
@@ -86,8 +84,6 @@ inline int32_t format_labels_inplace_first_seen(
         }
     }
     if (max_lbl <= min_lbl) return 0;
-
-    // 2. Min-shift if needed (parallel).
     if (min_lbl != 0) {
         const int32_t shift = -min_lbl;
         if (n_threads <= 1 || total < 500000) {
@@ -102,11 +98,8 @@ inline int32_t format_labels_inplace_first_seen(
         max_lbl += shift;
     }
     if (max_lbl <= 0) return 0;
-
-    // 3. SERIAL build: dense table[l] = remapped_label. The first time
-    // we encounter a label, assign next_lbl++ and remember. This is
-    // the part that's inherently sequential — fastremap's bit-equality
-    // requires this exact scan order.
+    // Serial build: dense table[l] = remapped_label, assigned on first
+    // encounter in input scan order.
     std::vector<int32_t> table(static_cast<size_t>(max_lbl) + 1, 0);
     int32_t next_lbl = 0;
     for (int64_t i = 0; i < total; ++i) {
@@ -116,8 +109,6 @@ inline int32_t format_labels_inplace_first_seen(
         }
     }
     if (next_lbl == 0) return 0;
-
-    // 4. Parallel apply.
     if (n_threads <= 1 || total < 500000) {
         for (int64_t i = 0; i < total; ++i) {
             lbl[i] = table[static_cast<size_t>(lbl[i])];
