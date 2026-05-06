@@ -53,7 +53,7 @@ inline void build_csr_from_pairs(
 inline bool color_graph_csr_legacy(
         const int32_t* indptr, const int32_t* indices, int32_t N,
         int32_t n_colors, int32_t rand_period, int32_t offset, int64_t max_iter,
-        std::vector<uint8_t>& colors) {
+        std::vector<uint8_t>& colors, bool welsh_powell = false) {
     colors.assign(static_cast<size_t>(N), 0);
     std::vector<int32_t> counter(static_cast<size_t>(N), 0);
 
@@ -63,7 +63,37 @@ inline bool color_graph_csr_legacy(
     std::vector<int32_t> q(static_cast<size_t>(qcap));
     int64_t head = 0;
     int64_t tail = N;
-    for (int32_t i = 0; i < N; ++i) q[i] = i;
+    if (welsh_powell) {
+        // Visit nodes in DESCENDING degree order. High-degree nodes are
+        // most constrained (most neighbours competing for distinct
+        // colours), so colouring them first reduces forced retries and
+        // tends to spread colour usage more evenly across the graph.
+        // Bucket sort: O(N + max_degree). For our planar / near-planar
+        // adjacency graphs, max_degree is small (typically ≤ 12).
+        int32_t max_deg = 0;
+        std::vector<int32_t> deg(static_cast<size_t>(N));
+        for (int32_t i = 0; i < N; ++i) {
+            deg[i] = indptr[i + 1] - indptr[i];
+            if (deg[i] > max_deg) max_deg = deg[i];
+        }
+        std::vector<int32_t> bucket_head(static_cast<size_t>(max_deg) + 2, 0);
+        for (int32_t i = 0; i < N; ++i) bucket_head[deg[i] + 1]++;
+        // Convert to write-index per bucket, ordered high → low.
+        std::vector<int32_t> wpos(static_cast<size_t>(max_deg) + 1, 0);
+        // Compute starting position of each bucket (degree d) in the
+        // descending-by-degree output. Bucket for degree max_deg starts
+        // at 0; bucket for degree max_deg-1 starts after that; ...
+        int32_t cum = 0;
+        for (int32_t d = max_deg; d >= 0; --d) {
+            wpos[d] = cum;
+            cum += bucket_head[d + 1];
+        }
+        for (int32_t i = 0; i < N; ++i) {
+            q[wpos[deg[i]]++] = i;
+        }
+    } else {
+        for (int32_t i = 0; i < N; ++i) q[i] = i;
+    }
 
     const uint32_t fullmask = (1u << (n_colors + 1)) - 2;
     int64_t count = 0;

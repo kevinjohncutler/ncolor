@@ -580,7 +580,7 @@ public:
             int conn = 2, int p = 2, bool capture_stages = false,
             bool format_input = true, bool expand = true,
             py::object out_arg = py::none(),
-            int color_mode = -1, bool wrap = false) {
+            int color_mode = -1, bool wrap = false, bool balance = false) {
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
         // coloring path without rebuilding the extension.
@@ -921,7 +921,7 @@ public:
                             const int attempt_offset = local_depth + idx;
                             const bool finished = ncolor_cpp::color_graph_csr_legacy(
                                 ip, ix, N,
-                                local_cur_n, rand_period, attempt_offset, max_iter, cv);
+                                local_cur_n, rand_period, attempt_offset, max_iter, cv, balance);
                             const bool conflict = !finished ||
                                 ncolor_cpp::has_conflict_csr(ip, ix, N, cv.data());
                             bool a_ok;
@@ -949,7 +949,7 @@ public:
                     for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
                         const bool finished = ncolor_cpp::color_graph_csr_legacy(
                             indptr_.data(), indices_.data(), N,
-                            cur_n, rand_period, depth + attempt, max_iter, colors_);
+                            cur_n, rand_period, depth + attempt, max_iter, colors_, balance);
                         bool conflict = !finished || ncolor_cpp::has_conflict_csr(
                             indptr_.data(), indices_.data(), N, colors_.data());
                         if (conflict) {
@@ -1116,7 +1116,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("p") = 2, py::arg("capture_stages") = false,
              py::arg("format_input") = true, py::arg("expand") = true,
              py::arg("out") = py::none(), py::arg("color_mode") = -1,
-             py::arg("wrap") = false,
+             py::arg("wrap") = false, py::arg("balance") = false,
              "Run [format_labels →] [expand →] connect → CSR → color → apply_lut.\n"
              "Supports 2D and 3D inputs (any ndim ≥ 2 actually).\n"
              "conn: 2D ∈ {1, 2}, 3D ∈ {1, 2, 3}. Matches\n"
@@ -1140,7 +1140,12 @@ PYBIND11_MODULE(_impl, m) {
              "around adjacencies between cells whose Voronoi territories\n"
              "land on opposite image edges. Useful for tile-equivalent or\n"
              "periodic-imaging assumptions; balances colour frequencies on\n"
-             "tightly-cropped microcolony images at ~zero runtime cost.")
+             "tightly-cropped microcolony images at ~zero runtime cost.\n"
+             "balance=True visits cells in descending-degree order during\n"
+             "the BFS coloring (Welsh-Powell heuristic). High-degree (most\n"
+             "constrained) cells are coloured first, which spreads colour\n"
+             "usage more evenly across the graph. ~zero runtime cost\n"
+             "(O(N) bucket sort). Recommended for visual uniformity.")
         .def("connect", &Solver::connect,
              py::arg("mask"), py::arg("conn") = 1, py::arg("wrap") = false,
              "Adjacency pairs for a label image. Returns an (M, 2) int32\n"

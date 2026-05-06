@@ -50,7 +50,7 @@ def _get_solver():
 def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           return_n=False, return_lut=False, verbose=False,
           check_conflicts=False, return_conflicts=False, format_input=True,
-          out=None, p=2, wrap=False):
+          out=None, p=2, wrap=False, balance=False):
     """4-color graph coloring of a label image.
 
     Default path uses the C++ Solver. ``verbose`` still falls back to the
@@ -70,8 +70,15 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     edges are neighbours, so cells on opposite image edges become
     adjacent in the colouring graph. Increases constraint pressure on
     perimeter cells and produces a more uniform colour distribution on
-    tightly-cropped images. Negligible runtime cost (only the boundary
-    pixels — <1% of the image — pay the wrap-aware lookup).
+    tightly-cropped images. Negligible runtime cost.
+
+    ``balance=True`` uses the Welsh-Powell heuristic in the BFS
+    coloring: cells are visited in descending-degree order so the
+    most-constrained cells get coloured first. Spreads colour usage
+    more evenly than the default label-ID order at ~zero runtime cost
+    (one O(N) bucket sort). Recommended for visual uniformity,
+    especially with p=1 where the BFS would otherwise concentrate
+    color 4 unevenly.
     """
     if verbose:
         return _legacy_label(lab, n=n, conn=conn, max_depth=max_depth,
@@ -96,7 +103,8 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
         lab_arr,
         n_colors=int(n), max_depth=int(max_depth),
         conn=int(conn), p=int(p), format_input=bool(format_input),
-        expand=bool(expand), out=out, wrap=bool(wrap))
+        expand=bool(expand), out=out, wrap=bool(wrap),
+        balance=bool(balance))
     out = out_array
 
     # return_lut / check_conflicts / return_conflicts: read accessors from

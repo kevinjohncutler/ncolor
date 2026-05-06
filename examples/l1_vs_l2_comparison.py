@@ -69,13 +69,14 @@ masks_fmt = ncolor.format_labels(masks.astype(np.int32))
 # adjacencies and the colouring uses 4 colours more uniformly.
 lut_l2 = ncolor.label(masks_fmt, expand=True, p=2, return_lut=True)
 lut_l1 = ncolor.label(masks_fmt, expand=True, p=1, return_lut=True)
-# wrap=True now invokes the proper toroidal expand (Python tile-and-crop +
-# cpp wrap-aware find_pairs), not just toroidal find_pairs.
 lut_l2w = ncolor.label(masks_fmt, expand=True, p=2, wrap=True, return_lut=True)
 lut_l1w = ncolor.label(masks_fmt, expand=True, p=1, wrap=True, return_lut=True)
+# wrap + balance: Welsh-Powell visit order (highest-degree first) on top
+# of toroidal Voronoi. Targets visual uniformity of the 4-colour count.
+lut_l2wb = ncolor.label(masks_fmt, expand=True, p=2, wrap=True, balance=True, return_lut=True)
+lut_l1wb = ncolor.label(masks_fmt, expand=True, p=1, wrap=True, balance=True, return_lut=True)
 exp_l2 = ncolor.expand_labels(masks_fmt, p=2)
 exp_l1 = ncolor.expand_labels(masks_fmt, p=1)
-# Toroidal expansions for the wrap row.
 exp_l2w = ncolor.expand_labels(masks_fmt, p=2, wrap=True)
 exp_l1w = ncolor.expand_labels(masks_fmt, p=1, wrap=True)
 
@@ -98,6 +99,10 @@ ncwrap_l1 = lut_l1w[exp_l1w][y1:y2, x1:x2]
 # bg-masked back to the original cell pattern.
 ncwrap_masked_l2 = (lut_l2w[exp_l2w] * (masks_fmt > 0))[y1:y2, x1:x2]
 ncwrap_masked_l1 = (lut_l1w[exp_l1w] * (masks_fmt > 0))[y1:y2, x1:x2]
+
+# Row 4 (wrap + balance, masked): adding Welsh-Powell visit ordering.
+ncwb_masked_l2 = (lut_l2wb[exp_l2w] * (masks_fmt > 0))[y1:y2, x1:x2]
+ncwb_masked_l1 = (lut_l1wb[exp_l1w] * (masks_fmt > 0))[y1:y2, x1:x2]
 
 # Stats.
 n_pix = m.size
@@ -135,13 +140,15 @@ def colored_panel(arr, mask, *, vmin=None, vmax=None):
     return rgba
 
 
-# Four-row layout (top → bottom):
+# Five-row layout (top → bottom):
 #   row 0 — wrap=False, masked (default ncolor.label output)
 #   row 1 — wrap=False, full Voronoi expansion (same LUT as row 0)
-#   row 2 — wrap=True,  masked (the *actual* user-facing output of
-#                                ncolor.label(..., wrap=True))
+#   row 2 — wrap=True,  masked
 #   row 3 — wrap=True,  full Voronoi expansion (toroidal)
-fig, axes = plt.subplots(4, 4, figsize=(16, 16),
+#   row 4 — wrap=True + balance=True, masked (recommended config —
+#           Welsh-Powell BFS ordering for the most uniform 4-colour
+#           distribution)
+fig, axes = plt.subplots(5, 4, figsize=(16, 20),
                          gridspec_kw={"wspace": 0.02, "hspace": 0.10})
 
 # Color values produced by ncolor.label are in {0, 1, ..., n_colors}.
@@ -150,7 +157,8 @@ fig, axes = plt.subplots(4, 4, figsize=(16, 16),
 n_colors = max(int(nc_l2.max()), int(nc_l1.max()),
                int(ncraw_l2.max()), int(ncraw_l1.max()),
                int(ncwrap_l2.max()), int(ncwrap_l1.max()),
-               int(ncwrap_masked_l2.max()), int(ncwrap_masked_l1.max()))
+               int(ncwrap_masked_l2.max()), int(ncwrap_masked_l1.max()),
+               int(ncwb_masked_l2.max()), int(ncwb_masked_l1.max()))
 COLOR_VMIN, COLOR_VMAX = 0, n_colors
 
 # Row 0 — masked output (only foreground cells visible).
@@ -223,6 +231,26 @@ wrap_diff_rgba[..., 3] = wrap_diff.astype(float)
 axes[3, 3].imshow(colored_panel(ncwrap_l2, full, vmin=COLOR_VMIN, vmax=COLOR_VMAX))
 axes[3, 3].imshow(wrap_diff_rgba, alpha=0.85)
 axes[3, 3].set_title(f"L1 ≠ L2 (red, wrap full)\n{wrap_diff_pct:.1f}% of all pixels",
+                     color="white", fontsize=10)
+
+# Row 4 — wrap + balance (Welsh-Powell), masked output.
+counts_l2wb = [int((lut_l2wb[1:] == c).sum()) for c in range(1, 5)]
+counts_l1wb = [int((lut_l1wb[1:] == c).sum()) for c in range(1, 5)]
+axes[4, 0].imshow(colored_panel(m, m))
+axes[4, 0].set_title("input masks", color="white", fontsize=11)
+axes[4, 1].imshow(colored_panel(ncwb_masked_l2, m, vmin=COLOR_VMIN, vmax=COLOR_VMAX))
+axes[4, 1].set_title(f"p=2, wrap=True, balance=True\ncounts: {counts_l2wb}",
+                     color="white", fontsize=10)
+axes[4, 2].imshow(colored_panel(ncwb_masked_l1, m, vmin=COLOR_VMIN, vmax=COLOR_VMAX))
+axes[4, 2].set_title(f"p=1, wrap=True, balance=True (recommended)\ncounts: {counts_l1wb}",
+                     color="white", fontsize=10)
+wb_diff = (ncwb_masked_l1 != ncwb_masked_l2) & (m > 0)
+wb_diff_rgba = np.zeros((*wb_diff.shape, 4))
+wb_diff_rgba[..., 0] = 1.0
+wb_diff_rgba[..., 3] = wb_diff.astype(float)
+axes[4, 3].imshow(colored_panel(ncwb_masked_l2, m, vmin=COLOR_VMIN, vmax=COLOR_VMAX))
+axes[4, 3].imshow(wb_diff_rgba, alpha=0.85)
+axes[4, 3].set_title(f"L1 ≠ L2 (wrap+balance, masked)\n{wb_diff.sum() / (m > 0).sum() * 100:.1f}% of fg",
                      color="white", fontsize=10)
 
 for ax in axes.ravel():
