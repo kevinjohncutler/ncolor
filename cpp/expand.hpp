@@ -311,18 +311,26 @@ inline void envelope_pass0_row(
         for (int64_t i = 0; i < N; ++i) dist[i] = INT32_MAX / 4;
         return;
     }
-    int32_t k = 0;
-    for (int64_t i = 0; i < N; ++i) {
-        // Advance k while position i is at-or-past the midpoint to seed k+1.
-        // Numba's parabolic envelope uses ``i >= z[k+1]`` (non-strict), so at
-        // the exact midpoint between two seeds the *later* seed wins. We match
-        // bit-for-bit with the integer form ``2*i >= s_k + s_{k+1}``.
-        while (k + 1 < n_seeds && 2 * static_cast<int32_t>(i) >= seeds[k] + seeds[k + 1]) {
-            ++k;
+    // Per-segment fill: for each consecutive seed pair (k, k+1), the midpoint
+    // ceil((s_k + s_{k+1}) / 2) is the first index that snaps to seed k+1
+    // (non-strict ``2*i >= s_k + s_{k+1}`` matches the integer envelope).
+    // Within each segment seeds[k] and lbl_save[k] are constant, so we can
+    // vectorise the (di*di + 0) write via envelope_fill_simd.
+    int64_t i_start = 0;
+    for (int32_t k = 0; k < n_seeds; ++k) {
+        int64_t i_end;
+        if (k + 1 == n_seeds) {
+            i_end = N;
+        } else {
+            const int32_t mid_sum = seeds[k] + seeds[k + 1];
+            // i_end = smallest i with 2*i >= mid_sum  =  ceil(mid_sum / 2).
+            const int64_t mid_ceil = (static_cast<int64_t>(mid_sum) + 1) >> 1;
+            i_end = mid_ceil > N ? N : mid_ceil;
         }
-        const int32_t di = static_cast<int32_t>(i) - seeds[k];
-        dist[i] = di * di;
-        lbl[i] = lbl_save[k];
+        if (i_end <= i_start) continue;
+        envelope_fill_simd(lbl, dist, i_start, i_end,
+                           lbl_save[k], /*g_j=*/0, seeds[k]);
+        i_start = i_end;
     }
 }
 
