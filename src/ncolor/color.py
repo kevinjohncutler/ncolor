@@ -50,7 +50,7 @@ def _get_solver():
 def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           return_n=False, return_lut=False, verbose=False,
           check_conflicts=False, return_conflicts=False, format_input=True,
-          out=None):
+          out=None, p=2):
     """4-color graph coloring of a label image.
 
     Default path uses the C++ Solver. ``verbose`` still falls back to the
@@ -58,6 +58,13 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
 
     Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
     across calls — useful for batch pipelines.
+
+    ``p`` selects the Voronoi expand metric:
+        p=2 — Felzenszwalb parabolic envelope (Euclidean², default)
+        p=1 — Saito-Toriwaki separable sweep (Manhattan)
+    L1 is ~2× faster than L2 and produces a different (but equally
+    valid) coloring at boundary tie-break regions; both satisfy the
+    4-coloring constraint.
     """
     if verbose:
         return _legacy_label(lab, n=n, conn=conn, max_depth=max_depth,
@@ -76,7 +83,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     out_array, n_used = solver.label(
         lab_arr,
         n_colors=int(n), max_depth=int(max_depth),
-        conn=int(conn), format_input=bool(format_input),
+        conn=int(conn), p=int(p), format_input=bool(format_input),
         expand=bool(expand), out=out)
     out = out_array
 
