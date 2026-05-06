@@ -48,7 +48,12 @@ struct LpExpand<2> {
     static void expand(const int32_t* input, int32_t* output,
                        ExpandBuffers& bufs,
                        const std::vector<int64_t>& shape,
-                       ForkJoinPool& pool, int n_threads) {
+                       ForkJoinPool& pool, int n_threads, bool wrap = false) {
+        // L2 toroidal expansion is not yet implemented natively — the
+        // public ncolor.expand_labels(wrap=True) routes through a
+        // np.pad(mode='wrap') prelude when p=2 (~9× cost on the expand
+        // step). TODO: native L2 wrap via ghost-seed envelopes.
+        (void)wrap;
         expand_labels_inplace(input, bufs, shape, pool, n_threads);
         if (output != bufs.lbl()) {
             std::memcpy(output, bufs.lbl(), bufs.size() * sizeof(int32_t));
@@ -68,7 +73,7 @@ struct LpExpand<1> {
     static void expand(const int32_t* input, int32_t* output,
                        ExpandBuffers& bufs,
                        const std::vector<int64_t>& shape,
-                       ForkJoinPool& pool, int n_threads) {
+                       ForkJoinPool& pool, int n_threads, bool wrap = false) {
         const int ndim = static_cast<int>(shape.size());
         int64_t total = 1;
         for (int64_t d : shape) total *= d;
@@ -78,10 +83,10 @@ struct LpExpand<1> {
         }
         if (ndim == 2) {
             chamfer_st_l1(output, bufs.dist(),
-                          shape[0], shape[1], pool, n_threads);
+                          shape[0], shape[1], pool, n_threads, wrap);
         } else {
             chamfer_st_l1_nd(output, bufs.dist(),
-                             shape, pool, n_threads);
+                             shape, pool, n_threads, wrap);
         }
     }
 };
@@ -92,8 +97,8 @@ template <int P>
 inline void expand_labels_lp(const int32_t* input, int32_t* output,
                              ExpandBuffers& bufs,
                              const std::vector<int64_t>& shape,
-                             ForkJoinPool& pool, int n_threads) {
-    LpExpand<P>::expand(input, output, bufs, shape, pool, n_threads);
+                             ForkJoinPool& pool, int n_threads, bool wrap = false) {
+    LpExpand<P>::expand(input, output, bufs, shape, pool, n_threads, wrap);
 }
 
 }  // namespace ncolor_cpp

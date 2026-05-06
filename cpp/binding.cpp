@@ -128,7 +128,7 @@ public:
     // p=2 (matches numba's ``expand_labels(metric='l2')``).
     py::array_t<int32_t> expand_labels(
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
-            int p = 2) {
+            int p = 2, bool wrap = false) {
         const auto buf = labels.request();
         std::vector<int64_t> shape(buf.ndim);
         for (int i = 0; i < buf.ndim; ++i) shape[i] = buf.shape[i];
@@ -140,9 +140,9 @@ public:
         {
             py::gil_scoped_release release;
             if (p == 2) {
-                ncolor_cpp::expand_labels_lp<2>(input, out_ptr, bufs_, shape, *pool_, n_threads_);
+                ncolor_cpp::expand_labels_lp<2>(input, out_ptr, bufs_, shape, *pool_, n_threads_, wrap);
             } else if (p == 1) {
-                ncolor_cpp::expand_labels_lp<1>(input, out_ptr, bufs_, shape, *pool_, n_threads_);
+                ncolor_cpp::expand_labels_lp<1>(input, out_ptr, bufs_, shape, *pool_, n_threads_, wrap);
             } else {
                 throw std::invalid_argument("expand_labels: p must be 1 or 2");
             }
@@ -777,9 +777,9 @@ public:
             // variants make this a no-op when expand_input == expanded.
             if (expand) {
                 if (p == 2) {
-                    ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_);
+                    ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
                 } else {
-                    ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_);
+                    ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
                 }
             }
             // (Suppress unused-var warning when expand=false — expanded
@@ -1063,11 +1063,17 @@ PYBIND11_MODULE(_impl, m) {
         .def(py::init<double>(), py::arg("n_threads") = -1.0)
         .def_property_readonly("n_threads", &ExpandEngine::n_threads)
         .def("expand_labels", &ExpandEngine::expand_labels,
-             py::arg("labels"), py::arg("p") = 2,
+             py::arg("labels"), py::arg("p") = 2, py::arg("wrap") = false,
              "Voronoi label expansion under L_p metric. p=1 (Manhattan,\n"
              "Saito-Toriwaki sweep) or p=2 (Euclidean², Felzenszwalb\n"
              "envelope). Same ND driver, dispatched at compile time on p.\n"
-             "Default p=2 matches numba's expand_labels(metric='l2').")
+             "Default p=2 matches numba's expand_labels(metric='l2').\n"
+             "wrap=True makes the expansion toroidal: cells whose Voronoi\n"
+             "territories cross the image edge wrap to the opposite side.\n"
+             "L1 implements this natively (~2× the per-axis sweep cost);\n"
+             "L2 currently falls back to the non-toroidal kernel here —\n"
+             "use ncolor.expand_labels(wrap=True) at the Python level for\n"
+             "L2 wrap (uses np.pad as a temporary 9× workaround).")
         .def("expand_labels_timed", &ExpandEngine::expand_labels_timed, py::arg("labels"),
              "expand_labels(p=2) + per-stage (name, ms) breakdown.")
         .def("format_labels", &ExpandEngine::format_labels,

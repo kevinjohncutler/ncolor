@@ -88,31 +88,25 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     lab_arr = np.asarray(lab)
     solver = _get_solver()
 
-    # wrap=True + expand=True: the cpp expand kernels are non-toroidal,
-    # so we pre-expand using np.pad(mode='wrap') + standard expand + crop
-    # (via ncolor.expand_labels(wrap=True)), then hand the fully-expanded
-    # label map to Solver.label with expand=False. We keep wrap=True on
-    # the Solver call so find_pairs also uses toroidal adjacency — this
-    # picks up any boundary edges the cropped center tile didn't fully
-    # encode (rare, but ensures consistency). bg-masking comes from the
-    # ORIGINAL label image, which we re-pass via the cast_with_bg step
-    # by giving Solver.label the formatted (un-expanded) input as a
-    # bg reference is not exposed; instead we mask in Python after.
-    if wrap and expand:
+    # wrap=True path:
+    #   - p=1: Solver.label's internal expand step is now natively
+    #     toroidal (chamfer with extra wrap-aware sweeps). Just pass
+    #     wrap=True straight through and let cpp do everything in one
+    #     released-GIL call.
+    #   - p=2: native toroidal L2 envelope is not implemented yet, so
+    #     for the expand=True case we fall back to a Python-level
+    #     np.pad(mode='wrap') + standard expand + center-crop, then
+    #     color with format_input=False, expand=False, wrap=True. ~9×
+    #     overhead on the expand stage; TODO replace with native cpp.
+    if wrap and expand and p == 2:
         from .format import format_labels as _format
         from .expand import expand_labels as _expand
-        # Format to 1..N so the LUT can be applied directly.
         lab_fmt = _format(lab_arr) if format_input else lab_arr.astype(np.int32, copy=False)
-        # Toroidal Voronoi expansion (np.pad + expand + crop).
-        exp = _expand(lab_fmt, p=int(p), wrap=True)
-        # Color the toroidally-expanded map; expand=False since we did it.
-        # find_pairs runs with wrap=True so cells whose territories meet
-        # at the cropped tile edges still get connected.
+        exp = _expand(lab_fmt, p=2, wrap=True)
         col_array, n_used = solver.label(
             exp, n_colors=int(n), max_depth=int(max_depth),
-            conn=int(conn), p=int(p), format_input=False,
+            conn=int(conn), p=2, format_input=False,
             expand=False, wrap=True)
-        # Mask back to the original foreground pattern.
         fg = (lab_fmt > 0)
         if out is not None:
             out[...] = col_array * fg
@@ -120,6 +114,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
         else:
             out_array = (col_array * fg).astype(np.uint8)
     else:
+        # Native cpp path (covers wrap=False any p, and wrap=True p=1).
         out_array, n_used = solver.label(
             lab_arr,
             n_colors=int(n), max_depth=int(max_depth),

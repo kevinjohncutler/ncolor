@@ -53,7 +53,7 @@ namespace ncolor_cpp {
 // but the parallel scaling is clean — no boundary fixup, predictable
 // O((H+W) × n_threads) throughput.
 inline void chamfer_st_l1(int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
-                          ForkJoinPool& pool, int n_threads) {
+                          ForkJoinPool& pool, int n_threads, bool wrap = false) {
     constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
 
     // Phase 1: per-row init + L1 1D transform. Init fused with forward sweep
@@ -83,6 +83,29 @@ inline void chamfer_st_l1(int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
             for (int64_t x = W - 2; x >= 0; --x) {
                 const int32_t cd = dr[x + 1] + 1;
                 if (cd < dr[x]) { dr[x] = cd; lr[x] = lr[x + 1]; }
+            }
+            // Toroidal extension: extra forward + backward sweep where the
+            // first cell inherits from the last (wrap-around). Shortest paths
+            // crossing the row boundary are picked up here.
+            if (wrap && W > 1) {
+                // Wrap-forward: dr[0] candidate = dr[W-1] + 1.
+                {
+                    const int32_t cd = dr[W - 1] + 1;
+                    if (cd < dr[0]) { dr[0] = cd; lr[0] = lr[W - 1]; }
+                }
+                for (int64_t x = 1; x < W; ++x) {
+                    const int32_t cd = dr[x - 1] + 1;
+                    if (cd < dr[x]) { dr[x] = cd; lr[x] = lr[x - 1]; }
+                }
+                // Wrap-backward: dr[W-1] candidate = dr[0] + 1.
+                {
+                    const int32_t cd = dr[0] + 1;
+                    if (cd < dr[W - 1]) { dr[W - 1] = cd; lr[W - 1] = lr[0]; }
+                }
+                for (int64_t x = W - 2; x >= 0; --x) {
+                    const int32_t cd = dr[x + 1] + 1;
+                    if (cd < dr[x]) { dr[x] = cd; lr[x] = lr[x + 1]; }
+                }
             }
         }
     };
@@ -114,6 +137,49 @@ inline void chamfer_st_l1(int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
             const int32_t* db = dist + (y + 1) * W;
             for (int64_t x = x0; x < x1; ++x) {
                 NCOLOR_L1_UPDATE(dr[x], lr[x], db[x] + 1, lb[x]);
+            }
+        }
+        // Toroidal extension: same idea as row_pass — one extra pair of
+        // forward+backward sweeps where the leading row inherits from the
+        // wrap-around opposite end.
+        if (wrap && H > 1) {
+            // Wrap-forward: dist[0][x] candidate = dist[H-1][x] + 1.
+            {
+                int32_t* lr0       = lbl;
+                int32_t* dr0       = dist;
+                const int32_t* llast = lbl  + (H - 1) * W;
+                const int32_t* dlast = dist + (H - 1) * W;
+                for (int64_t x = x0; x < x1; ++x) {
+                    NCOLOR_L1_UPDATE(dr0[x], lr0[x], dlast[x] + 1, llast[x]);
+                }
+            }
+            for (int64_t y = 1; y < H; ++y) {
+                int32_t* lr = lbl + y * W;
+                int32_t* dr = dist + y * W;
+                const int32_t* lt = lbl + (y - 1) * W;
+                const int32_t* dt = dist + (y - 1) * W;
+                for (int64_t x = x0; x < x1; ++x) {
+                    NCOLOR_L1_UPDATE(dr[x], lr[x], dt[x] + 1, lt[x]);
+                }
+            }
+            // Wrap-backward: dist[H-1][x] candidate = dist[0][x] + 1.
+            {
+                int32_t* lr_last       = lbl  + (H - 1) * W;
+                int32_t* dr_last       = dist + (H - 1) * W;
+                const int32_t* lfirst  = lbl;
+                const int32_t* dfirst  = dist;
+                for (int64_t x = x0; x < x1; ++x) {
+                    NCOLOR_L1_UPDATE(dr_last[x], lr_last[x], dfirst[x] + 1, lfirst[x]);
+                }
+            }
+            for (int64_t y = H - 2; y >= 0; --y) {
+                int32_t* lr = lbl + y * W;
+                int32_t* dr = dist + y * W;
+                const int32_t* lb = lbl + (y + 1) * W;
+                const int32_t* db = dist + (y + 1) * W;
+                for (int64_t x = x0; x < x1; ++x) {
+                    NCOLOR_L1_UPDATE(dr[x], lr[x], db[x] + 1, lb[x]);
+                }
             }
         }
     };
@@ -153,7 +219,7 @@ inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
                                  int32_t* __restrict dist,
                                  int64_t B, int64_t C,
                                  int64_t c0, int64_t c1,
-                                 bool init) {
+                                 bool init, bool wrap = false) {
     constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
     // Update macro is defined above (chamfer_st_l1's col_pass): branchful for
     // gcc/clang, branchless for MSVC. See note there for why.
@@ -200,6 +266,54 @@ inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
             NCOLOR_L1_UPDATE(dr[c], lr[c], dnext[c] + 1, lnext[c]);
         }
     }
+
+    // Toroidal extension: one extra pair of forward+backward sweeps where
+    // the leading edge inherits from the wrapped opposite end. Captures
+    // shortest paths that traverse the b=0/b=B-1 boundary. Two cycles of
+    // forward+backward suffice because each pair propagates O(B) along the
+    // axis, and the wrap distance is at most B/2. ~2× the standard cost.
+    if (wrap && B > 1) {
+        // Wrap-forward: dist[0][c] candidate = dist[B-1][c] + 1.
+        {
+            int32_t* lr0       = lbl;
+            int32_t* dr0       = dist;
+            const int32_t* llast = lbl  + (B - 1) * C;
+            const int32_t* dlast = dist + (B - 1) * C;
+            for (int64_t c = c0; c < c1; ++c) {
+                NCOLOR_L1_UPDATE(dr0[c], lr0[c], dlast[c] + 1, llast[c]);
+            }
+        }
+        // Forward propagate the updated dist[0] through to dist[B-1].
+        for (int64_t b = 1; b < B; ++b) {
+            const int32_t* lprev = lbl  + (b - 1) * C;
+            const int32_t* dprev = dist + (b - 1) * C;
+            int32_t* lr = lbl  + b * C;
+            int32_t* dr = dist + b * C;
+            for (int64_t c = c0; c < c1; ++c) {
+                NCOLOR_L1_UPDATE(dr[c], lr[c], dprev[c] + 1, lprev[c]);
+            }
+        }
+        // Wrap-backward: dist[B-1][c] candidate = dist[0][c] + 1.
+        {
+            int32_t* lr_last       = lbl  + (B - 1) * C;
+            int32_t* dr_last       = dist + (B - 1) * C;
+            const int32_t* lfirst  = lbl;
+            const int32_t* dfirst  = dist;
+            for (int64_t c = c0; c < c1; ++c) {
+                NCOLOR_L1_UPDATE(dr_last[c], lr_last[c], dfirst[c] + 1, lfirst[c]);
+            }
+        }
+        // Backward propagate the updated dist[B-1] through to dist[0].
+        for (int64_t b = B - 2; b >= 0; --b) {
+            const int32_t* lnext = lbl  + (b + 1) * C;
+            const int32_t* dnext = dist + (b + 1) * C;
+            int32_t* lr = lbl  + b * C;
+            int32_t* dr = dist + b * C;
+            for (int64_t c = c0; c < c1; ++c) {
+                NCOLOR_L1_UPDATE(dr[c], lr[c], dnext[c] + 1, lnext[c]);
+            }
+        }
+    }
 }
 
 // N-D Saito-Toriwaki separable L1 distance transform with label
@@ -222,7 +336,8 @@ inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
 // that the SIMD loop has real work to do.
 inline void chamfer_st_l1_nd(int32_t* lbl, int32_t* dist,
                              const std::vector<int64_t>& shape,
-                             ForkJoinPool& pool, int n_threads) {
+                             ForkJoinPool& pool, int n_threads,
+                             bool wrap = false) {
     const int ndim = static_cast<int>(shape.size());
     if (ndim == 0) return;
 
@@ -267,7 +382,7 @@ inline void chamfer_st_l1_nd(int32_t* lbl, int32_t* dist,
                 const int64_t c1  = std::min(C, c0 + band_w);
                 if (c0 >= c1) continue;
                 const int64_t off = a * B * C;
-                chamfer_l1_slab_pass(lbl + off, dist + off, B, C, c0, c1, first);
+                chamfer_l1_slab_pass(lbl + off, dist + off, B, C, c0, c1, first, wrap);
             }
         });
     }

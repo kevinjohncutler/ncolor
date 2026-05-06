@@ -57,14 +57,18 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
         return _legacy(label_image, metric="l2" if p == 2 else "l1")
 
     arr32 = arr.astype(np.int32, copy=False)
-    if wrap:
-        # Pad with wrap-mode in every axis (each side gets a full copy of
-        # the input), expand on the (3× per-dim) padded buffer, then crop
-        # the central tile — that tile's Voronoi territories are bounded
-        # by the wrap-around copies on every side, i.e. toroidal Voronoi.
+    if wrap and p == 1:
+        # L1 has a native toroidal kernel (chamfer with extra wrap-aware
+        # forward+backward sweeps per axis, ~2× the standard cost).
+        return _get_engine().expand_labels(arr32, p=1, wrap=True)
+    if wrap and p == 2:
+        # L2 toroidal kernel is not yet implemented natively. Fall back to
+        # np.pad(mode='wrap') + standard envelope + center-crop. Pays a 9×
+        # compute/memory cost (3× linear extent in each dim). TODO: native
+        # L2 wrap via ghost-seed envelopes (~2× cost like L1).
         pad_widths = tuple((s, s) for s in arr32.shape)
         padded = np.pad(arr32, pad_widths, mode="wrap")
-        expanded = _get_engine().expand_labels(padded, p=p)
+        expanded = _get_engine().expand_labels(padded, p=2)
         slices = tuple(slice(s, 2 * s) for s in arr32.shape)
         return np.ascontiguousarray(expanded[slices])
 
