@@ -402,9 +402,7 @@ public:
             shape[d] = static_cast<int64_t>(buf.shape[d]);
             total *= shape[d];
         }
-        const bool fast_2d = (ndim == 2 && conn == 2);
-        const int64_t H = shape[0];
-        const int64_t W = (ndim >= 2) ? shape[1] : 1;
+        // Unified ND unpadded find_pairs handles all (ndim, conn) cases.
 
         // (itemsize, signedness) dispatch — see the parallel block in
         // Solver.label for why this beats format-code matching.
@@ -461,24 +459,30 @@ public:
             }
             if (max_label == 0) {
                 // Empty input — no pairs.
-            } else if (fast_2d) {
-                const int64_t ht_raw = 4 * static_cast<int64_t>(max_label);
-                const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
-                pairs = ncolor_cpp::find_pairs_2d_unpadded<int32_t>(
-                    labels, H, W, static_cast<uint64_t>(ht_size),
-                    n_threads_, *pool_);
             } else {
-                std::vector<int64_t> nbs = neighbors_nd_padded(shape, conn);
-                int64_t total_padded = 1;
-                for (int64_t s : shape) total_padded *= (s + 2);
-                padded_.resize(static_cast<size_t>(total_padded));
-                pad_nd_into<int32_t>(labels, padded_.data(), shape, /*pad_value=*/0);
-                const int64_t ht_raw = 2 * static_cast<int64_t>(nbs.size())
-                                        * static_cast<int64_t>(max_label);
+                // Unified ND unpadded: count forward neighbours for sizing.
+                int64_t n_fwd = 0;
+                std::vector<int8_t> dc(ndim, -1);
+                while (true) {
+                    int n_nz = 0, first_nz = -1;
+                    for (int d = 0; d < ndim; ++d) if (dc[d] != 0) {
+                        if (first_nz < 0) first_nz = d;
+                        ++n_nz;
+                    }
+                    if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] == 1) ++n_fwd;
+                    int d = ndim - 1;
+                    while (d >= 0) {
+                        ++dc[d];
+                        if (dc[d] <= 1) break;
+                        dc[d] = -1;
+                        --d;
+                    }
+                    if (d < 0) break;
+                }
+                const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
                 const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
-                pairs = ncolor_cpp::search_hashset_parallel<int32_t>(
-                    padded_.data(), total_padded, nbs.data(),
-                    static_cast<int>(nbs.size()),
+                pairs = ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
+                    labels, shape, conn,
                     static_cast<uint64_t>(ht_size), n_threads_, *pool_);
             }
         }
@@ -528,9 +532,7 @@ public:
         }
         // 2D fast path uses the unpadded ConnectEngine optimisation; ND or
         // non-default conn falls back to the generic padded path.
-        const bool fast_2d = (ndim == 2 && conn == 2);
-        const int64_t H = shape[0];
-        const int64_t W = (ndim >= 2) ? shape[1] : 1;
+        // Unified ND unpadded find_pairs handles all (ndim, conn) cases.
 
         // Validate + classify dtype by (itemsize, signedness). Doing it
         // by buf.format string runs into a platform quirk: numpy's int64
@@ -744,43 +746,40 @@ public:
             }
             stage("max_scan");
             std::vector<std::pair<int32_t, int32_t>> pairs;
-            if (fast_2d) {
-                // 2D conn=2 fast path: skip padding (saves ~1 ms at 2048²).
-                // For 4 forward neighbours per pixel (right, down-left, down,
-                // down-right), ht_raw = 2 contribs/pair × 4 = 8N; round up.
-                const int64_t ht_raw = 4 * static_cast<int64_t>(max_label);
+            {
+                // Unified ND unpadded find_pairs: one path for any
+                // (ndim ≥ 2, conn ∈ [1, ndim]) combination. Same algorithm
+                // as the legacy padded search_hashset_parallel but skips
+                // the pad buffer + pad_nd_into pass. Forward-neighbour
+                // count for sizing ht: enumerate dc ∈ {-1,0,1}^ndim with
+                // 1 ≤ #nz ≤ conn and lex-first nonzero = +1.
+                int64_t n_fwd = 0;
+                {
+                    const int n = ndim;
+                    // Cheap closed-form: sum over k=1..conn of  C(n, k) * 2^{k-1} / 2 …
+                    // simpler to just enumerate the same way the kernel does.
+                    std::vector<int8_t> dc(n, -1);
+                    while (true) {
+                        int n_nz = 0, first_nz = -1;
+                        for (int d = 0; d < n; ++d) if (dc[d] != 0) {
+                            if (first_nz < 0) first_nz = d;
+                            ++n_nz;
+                        }
+                        if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] == 1) ++n_fwd;
+                        int d = n - 1;
+                        while (d >= 0) {
+                            ++dc[d];
+                            if (dc[d] <= 1) break;
+                            dc[d] = -1;
+                            --d;
+                        }
+                        if (d < 0) break;
+                    }
+                }
+                const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
                 const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
-                pairs = ncolor_cpp::find_pairs_2d_unpadded<int32_t>(
-                    expanded, H, W, static_cast<uint64_t>(ht_size),
-                    n_threads_, *pool_);
-            } else if (ndim == 3) {
-                // 3D: unpadded fast path. Same per-thread hashtable +
-                // parallel pairwise merge as the padded version, but
-                // bounds-checks each neighbour against (D, H, W) so we
-                // can skip the (D+2)(H+2)(W+2) padded buffer + pad_nd_into
-                // pass (~4 ms saved at 256³).
-                const int n_nbs = (conn == 1 ? 3 : (conn == 2 ? 9 : 13));
-                const int64_t ht_raw = 2 * static_cast<int64_t>(n_nbs)
-                                        * static_cast<int64_t>(max_label);
-                const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
-                pairs = ncolor_cpp::find_pairs_3d_unpadded<int32_t>(
-                    expanded, shape[0], shape[1], shape[2], conn,
-                    static_cast<uint64_t>(ht_size), n_threads_, *pool_);
-            } else {
-                // ndim >= 4: still routes through the padded path (rare;
-                // not optimised for now).
-                std::vector<int64_t> nbs = neighbors_nd_padded(shape, conn);
-                int64_t total_padded = 1;
-                for (int64_t s : shape) total_padded *= (s + 2);
-                padded_.resize(static_cast<size_t>(total_padded));
-                pad_nd_into<int32_t>(expanded, padded_.data(), shape, /*pad_value=*/0);
-                stage("pad");
-                const int64_t ht_raw = 2 * static_cast<int64_t>(nbs.size())
-                                        * static_cast<int64_t>(max_label);
-                const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
-                pairs = ncolor_cpp::search_hashset_parallel<int32_t>(
-                    padded_.data(), total_padded, nbs.data(),
-                    static_cast<int>(nbs.size()),
+                pairs = ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
+                    expanded, shape, conn,
                     static_cast<uint64_t>(ht_size), n_threads_, *pool_);
             }
             stage("find_pairs");
