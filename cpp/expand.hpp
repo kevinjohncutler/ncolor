@@ -647,11 +647,53 @@ inline void envelope_pass_strided_abc(
     });
 }
 
+// 4x4 in-register transpose for 32-bit elements. src is 4 rows of 4 ints
+// at stride sb; dst is 4 rows of 4 ints at stride db. Stage 1 does a
+// pairwise 32-bit interleave; stage 2 swaps the 64-bit halves to finish.
+#if defined(__aarch64__) || defined(__ARM_NEON)
+template <typename T>
+static inline void transpose_4x4_4byte(
+        const T* __restrict__ src, int64_t sb,
+        T* __restrict__ dst, int64_t db) {
+    static_assert(sizeof(T) == 4, "transpose_4x4_4byte requires 4-byte T");
+    uint32x4_t r0 = vld1q_u32(reinterpret_cast<const uint32_t*>(src + 0 * sb));
+    uint32x4_t r1 = vld1q_u32(reinterpret_cast<const uint32_t*>(src + 1 * sb));
+    uint32x4_t r2 = vld1q_u32(reinterpret_cast<const uint32_t*>(src + 2 * sb));
+    uint32x4_t r3 = vld1q_u32(reinterpret_cast<const uint32_t*>(src + 3 * sb));
+    uint32x4_t t0 = vtrn1q_u32(r0, r1);
+    uint32x4_t t1 = vtrn2q_u32(r0, r1);
+    uint32x4_t t2 = vtrn1q_u32(r2, r3);
+    uint32x4_t t3 = vtrn2q_u32(r2, r3);
+    uint32x4_t o0 = vreinterpretq_u32_u64(vtrn1q_u64(
+        vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2)));
+    uint32x4_t o2 = vreinterpretq_u32_u64(vtrn2q_u64(
+        vreinterpretq_u64_u32(t0), vreinterpretq_u64_u32(t2)));
+    uint32x4_t o1 = vreinterpretq_u32_u64(vtrn1q_u64(
+        vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3)));
+    uint32x4_t o3 = vreinterpretq_u32_u64(vtrn2q_u64(
+        vreinterpretq_u64_u32(t1), vreinterpretq_u64_u32(t3)));
+    vst1q_u32(reinterpret_cast<uint32_t*>(dst + 0 * db), o0);
+    vst1q_u32(reinterpret_cast<uint32_t*>(dst + 1 * db), o1);
+    vst1q_u32(reinterpret_cast<uint32_t*>(dst + 2 * db), o2);
+    vst1q_u32(reinterpret_cast<uint32_t*>(dst + 3 * db), o3);
+}
+#endif
+
 // Blocked batched transpose: src(A,B,C) → dst(A,C,B), for two arrays
 // in lockstep (label + dist). Tile size 64 matches edt::TRANSPOSE_BLOCK
 // (also matches the numba version's Bi=64). Uses atomic work-stealing
 // dispatch over tile triples (a, rb, cb) — load balances naturally even
 // when total_tiles is not a clean multiple of n_threads.
+//
+// Inside each tile:
+//   - The two streams (label + dist) are transposed in separate inner
+//     loops. Lockstep alternation forces the store buffer to drain to
+//     two different destination cache lines per iteration; splitting
+//     keeps each pass focused on one cache-line stream and lets the
+//     compiler schedule the loads/stores independently per stream.
+//   - On ARM64 with sizeof(T)==4 we transpose in 4×4 NEON sub-tiles,
+//     which is roughly 2× faster on the 2D 4096² L2 expand benchmark
+//     than scalar with the same blocking.
 template <typename T>
 void batch_transpose(
         const T* src_a, const T* src_b,
@@ -675,10 +717,51 @@ void batch_transpose(
             const int64_t c1  = std::min<int64_t>(c0 + Bi, C);
             const int64_t plane  = a * B * C;
             const int64_t tplane = a * C * B;
+#if defined(__aarch64__) || defined(__ARM_NEON)
+            if constexpr (sizeof(T) == 4) {
+                const int64_t b1m = b0 + ((b1 - b0) & ~3);
+                const int64_t c1m = c0 + ((c1 - c0) & ~3);
+                // Transpose the two streams in separate passes.
+                const T* base_sa = src_a + plane;
+                const T* base_sb = src_b + plane;
+                T*       base_da = dst_a + tplane;
+                T*       base_db = dst_b + tplane;
+                for (int pass = 0; pass < 2; ++pass) {
+                    const T* base_s = (pass == 0) ? base_sa : base_sb;
+                    T*       base_d = (pass == 0) ? base_da : base_db;
+                    for (int64_t b = b0; b < b1m; b += 4) {
+                        for (int64_t c = c0; c < c1m; c += 4) {
+                            transpose_4x4_4byte<T>(
+                                base_s + b * C + c, C,
+                                base_d + c * B + b, B);
+                        }
+                        // c-edge fragment (only when C is not multiple of 4).
+                        for (int64_t c = c1m; c < c1; ++c) {
+                            for (int64_t bb = b; bb < b + 4; ++bb) {
+                                base_d[c * B + bb] = base_s[bb * C + c];
+                            }
+                        }
+                    }
+                    // b-edge fragment.
+                    for (int64_t b = b1m; b < b1; ++b) {
+                        for (int64_t c = c0; c < c1; ++c) {
+                            base_d[c * B + b] = base_s[b * C + c];
+                        }
+                    }
+                }
+                continue;
+            }
+#endif
             for (int64_t b = b0; b < b1; ++b) {
+                const T* sa = src_a + plane + b * C;
                 for (int64_t c = c0; c < c1; ++c) {
-                    dst_a[tplane + c * B + b] = src_a[plane + b * C + c];
-                    dst_b[tplane + c * B + b] = src_b[plane + b * C + c];
+                    dst_a[tplane + c * B + b] = sa[c];
+                }
+            }
+            for (int64_t b = b0; b < b1; ++b) {
+                const T* sb = src_b + plane + b * C;
+                for (int64_t c = c0; c < c1; ++c) {
+                    dst_b[tplane + c * B + b] = sb[c];
                 }
             }
         }
