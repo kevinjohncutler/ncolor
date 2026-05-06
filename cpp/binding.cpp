@@ -461,7 +461,7 @@ public:
     // labels under connectivity ``conn`` (1..ndim). 2D conn=2 takes the
     // unpadded fast path; everything else pads and uses the generic
     // hashset parallel search.
-    py::array_t<int32_t> connect(py::array mask, int conn = 1) {
+    py::array_t<int32_t> connect(py::array mask, int conn = 1, bool wrap = false) {
         if (!(mask.flags() & py::array::c_style)) {
             mask = py::array::ensure(mask, py::array::c_style);
         }
@@ -559,7 +559,7 @@ public:
                 const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
                 pairs = ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
                     labels, shape, conn,
-                    static_cast<uint64_t>(ht_size), n_threads_, *pool_);
+                    static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap);
             }
         }
 
@@ -580,7 +580,7 @@ public:
             int conn = 2, int p = 2, bool capture_stages = false,
             bool format_input = true, bool expand = true,
             py::object out_arg = py::none(),
-            int color_mode = -1) {
+            int color_mode = -1, bool wrap = false) {
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
         // coloring path without rebuilding the extension.
@@ -856,7 +856,7 @@ public:
                 const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
                 pairs = ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
                     expanded, shape, conn,
-                    static_cast<uint64_t>(ht_size), n_threads_, *pool_);
+                    static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap);
             }
             stage("find_pairs");
 
@@ -1110,6 +1110,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("p") = 2, py::arg("capture_stages") = false,
              py::arg("format_input") = true, py::arg("expand") = true,
              py::arg("out") = py::none(), py::arg("color_mode") = -1,
+             py::arg("wrap") = false,
              "Run [format_labels →] [expand →] connect → CSR → color → apply_lut.\n"
              "Supports 2D and 3D inputs (any ndim ≥ 2 actually).\n"
              "conn: 2D ∈ {1, 2}, 3D ∈ {1, 2, 3}. Matches\n"
@@ -1127,13 +1128,22 @@ PYBIND11_MODULE(_impl, m) {
              "out: optional preallocated uint8 array of the same shape as\n"
              "mask. If supplied, results are written there and returned\n"
              "instead of allocating a new array — useful for batch\n"
-             "pipelines that reuse the same output buffer across calls.")
+             "pipelines that reuse the same output buffer across calls.\n"
+             "wrap=True treats the image as a torus (left/right edges are\n"
+             "neighbours, top/bottom edges are neighbours), adding wrap-\n"
+             "around adjacencies between cells whose Voronoi territories\n"
+             "land on opposite image edges. Useful for tile-equivalent or\n"
+             "periodic-imaging assumptions; balances colour frequencies on\n"
+             "tightly-cropped microcolony images at ~zero runtime cost.")
         .def("connect", &Solver::connect,
-             py::arg("mask"), py::arg("conn") = 1,
+             py::arg("mask"), py::arg("conn") = 1, py::arg("wrap") = false,
              "Adjacency pairs for a label image. Returns an (M, 2) int32\n"
              "array of unique (lo, hi) label pairs that share a boundary\n"
              "under connectivity ``conn``. Mirrors ncolor.connect()'s\n"
-             "signature; runs the cpp connect kernel directly.")
+             "signature; runs the cpp connect kernel directly.\n"
+             "wrap=True treats the image as a torus (opposite edges are\n"
+             "adjacent), adding wrap-around pairs between cells on the\n"
+             "image perimeter.")
         .def("get_last_stages", &Solver::get_last_stages,
              "Per-stage timing breakdown from the most recent label() call\n"
              "made with capture_stages=True.")

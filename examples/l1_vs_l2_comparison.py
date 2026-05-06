@@ -63,20 +63,35 @@ masks_fmt = ncolor.format_labels(masks.astype(np.int32))
 # indexed by formatted-expanded label values, so applying it to the same
 # `expand_labels` output gives the full-coverage Voronoi coloring with
 # the SAME color assignment as the bg-masked output.
+# wrap=False (top half of figure): standard non-toroidal topology.
+# wrap=True  (bottom row of figure): treat image as a torus — left/right
+# and top/bottom edges become neighbours, so perimeter cells gain
+# adjacencies and the colouring uses 4 colours more uniformly.
 lut_l2 = ncolor.label(masks_fmt, expand=True, p=2, return_lut=True)
 lut_l1 = ncolor.label(masks_fmt, expand=True, p=1, return_lut=True)
+# wrap=True now invokes the proper toroidal expand (Python tile-and-crop +
+# cpp wrap-aware find_pairs), not just toroidal find_pairs.
+lut_l2w = ncolor.label(masks_fmt, expand=True, p=2, wrap=True, return_lut=True)
+lut_l1w = ncolor.label(masks_fmt, expand=True, p=1, wrap=True, return_lut=True)
 exp_l2 = ncolor.expand_labels(masks_fmt, p=2)
 exp_l1 = ncolor.expand_labels(masks_fmt, p=1)
+# Toroidal expansions for the wrap row.
+exp_l2w = ncolor.expand_labels(masks_fmt, p=2, wrap=True)
+exp_l1w = ncolor.expand_labels(masks_fmt, p=1, wrap=True)
 
-# Top row (masked): fg pixels get lut[label], bg pixels get 0.
-# (Equivalent to ncolor.label(masks_fmt, expand=True, p=...), just done
-# manually so we can confirm consistency with the bottom row.)
+# Row 0 (masked): fg pixels get lut[label], bg pixels get 0.
 nc_l2 = (lut_l2[exp_l2] * (masks_fmt > 0))[y1:y2, x1:x2]
 nc_l1 = (lut_l1[exp_l1] * (masks_fmt > 0))[y1:y2, x1:x2]
 
-# Bottom row (full Voronoi): every pixel gets lut[label] — same LUT.
+# Row 1 (full Voronoi): every pixel gets lut[label] — same LUT as row 0.
 ncraw_l2 = lut_l2[exp_l2][y1:y2, x1:x2]
 ncraw_l1 = lut_l1[exp_l1][y1:y2, x1:x2]
+
+# Row 2 (wrap=True): toroidal Voronoi expansion AND toroidal find_pairs.
+# Apply LUT to the toroidal expansion (cells' territories now wrap across
+# image edges, so perimeter cells have full constraint pressure).
+ncwrap_l2 = lut_l2w[exp_l2w][y1:y2, x1:x2]
+ncwrap_l1 = lut_l1w[exp_l1w][y1:y2, x1:x2]
 
 # Stats.
 n_pix = m.size
@@ -85,6 +100,12 @@ print(f"Crop shape: {m.shape}")
 print(f"L2 colors used: {int(nc_l2.max())},  L1 colors used: {int(nc_l1.max())}")
 print(f"Pixels matching: {(1 - diff_pix / n_pix) * 100:.2f}%  ({n_pix - diff_pix:,} of {n_pix:,})")
 print(f"Pixels differing: {diff_pix:,}")
+print()
+print(f"Cell-count per color (using each LUT directly):")
+print(f"  L2 (no wrap):  {[int((lut_l2[1:]  == c).sum()) for c in range(1, 5)]}")
+print(f"  L1 (no wrap):  {[int((lut_l1[1:]  == c).sum()) for c in range(1, 5)]}")
+print(f"  L2 (wrap):     {[int((lut_l2w[1:] == c).sum()) for c in range(1, 5)]}")
+print(f"  L1 (wrap):     {[int((lut_l1w[1:] == c).sum()) for c in range(1, 5)]}")
 
 # Visual styling — match the notebook.
 plt.style.use("dark_background")
@@ -108,16 +129,19 @@ def colored_panel(arr, mask, *, vmin=None, vmax=None):
     return rgba
 
 
-# Two-row layout: top = masked-by-foreground (notebook style),
-# bottom = raw Voronoi expansion before bg-masking.
-fig, axes = plt.subplots(2, 4, figsize=(16, 8),
+# Three-row layout:
+#   row 0 — masked output (notebook style)
+#   row 1 — full Voronoi expansion, same LUT as row 0 (non-toroidal)
+#   row 2 — full Voronoi expansion with wrap=True (toroidal topology)
+fig, axes = plt.subplots(3, 4, figsize=(16, 12),
                          gridspec_kw={"wspace": 0.02, "hspace": 0.08})
 
 # Color values produced by ncolor.label are in {0, 1, ..., n_colors}.
 # Pin viridis bounds so the same color value renders identically in every
 # panel, regardless of whether bg pixels (value 0) are present or not.
 n_colors = max(int(nc_l2.max()), int(nc_l1.max()),
-               int(ncraw_l2.max()), int(ncraw_l1.max()))
+               int(ncraw_l2.max()), int(ncraw_l1.max()),
+               int(ncwrap_l2.max()), int(ncwrap_l1.max()))
 COLOR_VMIN, COLOR_VMAX = 0, n_colors
 
 # Row 0 — masked output (only foreground cells visible).
@@ -154,6 +178,25 @@ raw_diff_rgba[..., 3] = raw_diff.astype(float)
 axes[1, 3].imshow(colored_panel(ncraw_l2, full, vmin=COLOR_VMIN, vmax=COLOR_VMAX))
 axes[1, 3].imshow(raw_diff_rgba, alpha=0.85)
 axes[1, 3].set_title(f"L1 ≠ L2 (red, full)\n{raw_diff_pct:.1f}% of all pixels",
+                     color="white", fontsize=10)
+
+# Row 2 — wrap=True: toroidal Voronoi (expand AND find_pairs).
+axes[2, 0].imshow(colored_panel(exp_l1w[y1:y2, x1:x2], full))
+axes[2, 0].set_title("expand_labels(p=1, wrap=True)\ntoroidal Voronoi", color="white", fontsize=10)
+axes[2, 1].imshow(colored_panel(ncwrap_l2, full, vmin=COLOR_VMIN, vmax=COLOR_VMAX))
+axes[2, 1].set_title("p=2 + wrap=True\ntoroidal pipeline", color="white", fontsize=10)
+axes[2, 2].imshow(colored_panel(ncwrap_l1, full, vmin=COLOR_VMIN, vmax=COLOR_VMAX))
+axes[2, 2].set_title("p=1 + wrap=True\ntoroidal pipeline\n(most balanced)", color="white", fontsize=10)
+
+# Row-2 diff: do L1 wrap and L2 wrap converge to similar coloring?
+wrap_diff = ncwrap_l1 != ncwrap_l2
+wrap_diff_pct = wrap_diff.mean() * 100
+wrap_diff_rgba = np.zeros((*wrap_diff.shape, 4))
+wrap_diff_rgba[..., 0] = 1.0
+wrap_diff_rgba[..., 3] = wrap_diff.astype(float)
+axes[2, 3].imshow(colored_panel(ncwrap_l2, full, vmin=COLOR_VMIN, vmax=COLOR_VMAX))
+axes[2, 3].imshow(wrap_diff_rgba, alpha=0.85)
+axes[2, 3].set_title(f"L1 ≠ L2 (red, wrap)\n{wrap_diff_pct:.1f}% of all pixels",
                      color="white", fontsize=10)
 
 for ax in axes.ravel():

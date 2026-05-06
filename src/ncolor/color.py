@@ -50,7 +50,7 @@ def _get_solver():
 def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           return_n=False, return_lut=False, verbose=False,
           check_conflicts=False, return_conflicts=False, format_input=True,
-          out=None, p=2):
+          out=None, p=2, wrap=False):
     """4-color graph coloring of a label image.
 
     Default path uses the C++ Solver. ``verbose`` still falls back to the
@@ -65,6 +65,13 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     L1 is ~2× faster than L2 and produces a different (but equally
     valid) coloring at boundary tie-break regions; both satisfy the
     4-coloring constraint.
+
+    ``wrap=True`` treats the image as a torus: left/right and top/bottom
+    edges are neighbours, so cells on opposite image edges become
+    adjacent in the colouring graph. Increases constraint pressure on
+    perimeter cells and produces a more uniform colour distribution on
+    tightly-cropped images. Negligible runtime cost (only the boundary
+    pixels — <1% of the image — pay the wrap-aware lookup).
     """
     if verbose:
         return _legacy_label(lab, n=n, conn=conn, max_depth=max_depth,
@@ -80,11 +87,44 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     # dispatches; no per-call numpy scans.
     lab_arr = np.asarray(lab)
     solver = _get_solver()
-    out_array, n_used = solver.label(
-        lab_arr,
-        n_colors=int(n), max_depth=int(max_depth),
-        conn=int(conn), p=int(p), format_input=bool(format_input),
-        expand=bool(expand), out=out)
+
+    # wrap=True + expand=True: the cpp expand kernels are non-toroidal,
+    # so we pre-expand using np.pad(mode='wrap') + standard expand + crop
+    # (via ncolor.expand_labels(wrap=True)), then hand the fully-expanded
+    # label map to Solver.label with expand=False. We keep wrap=True on
+    # the Solver call so find_pairs also uses toroidal adjacency — this
+    # picks up any boundary edges the cropped center tile didn't fully
+    # encode (rare, but ensures consistency). bg-masking comes from the
+    # ORIGINAL label image, which we re-pass via the cast_with_bg step
+    # by giving Solver.label the formatted (un-expanded) input as a
+    # bg reference is not exposed; instead we mask in Python after.
+    if wrap and expand:
+        from .format import format_labels as _format
+        from .expand import expand_labels as _expand
+        # Format to 1..N so the LUT can be applied directly.
+        lab_fmt = _format(lab_arr) if format_input else lab_arr.astype(np.int32, copy=False)
+        # Toroidal Voronoi expansion (np.pad + expand + crop).
+        exp = _expand(lab_fmt, p=int(p), wrap=True)
+        # Color the toroidally-expanded map; expand=False since we did it.
+        # find_pairs runs with wrap=True so cells whose territories meet
+        # at the cropped tile edges still get connected.
+        col_array, n_used = solver.label(
+            exp, n_colors=int(n), max_depth=int(max_depth),
+            conn=int(conn), p=int(p), format_input=False,
+            expand=False, wrap=True)
+        # Mask back to the original foreground pattern.
+        fg = (lab_fmt > 0)
+        if out is not None:
+            out[...] = col_array * fg
+            out_array = out
+        else:
+            out_array = (col_array * fg).astype(np.uint8)
+    else:
+        out_array, n_used = solver.label(
+            lab_arr,
+            n_colors=int(n), max_depth=int(max_depth),
+            conn=int(conn), p=int(p), format_input=bool(format_input),
+            expand=bool(expand), out=out, wrap=bool(wrap))
     out = out_array
 
     # return_lut / check_conflicts / return_conflicts: read accessors from

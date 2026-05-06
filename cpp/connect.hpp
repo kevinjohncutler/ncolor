@@ -217,7 +217,7 @@ inline void build_forward_neighbours(
 // pairs into a single hashtable. Templated on NDIM so 2D and 3D get hand-
 // coded nested loops with explicit boundary/interior splits; NDIM>=4 falls
 // through to the generic odometer path.
-template <typename T, int NDIM>
+template <typename T, int NDIM, bool Wrap = false>
 inline void scan_band_unpadded(
         const T* lbl, const std::vector<int64_t>& shape,
         const int64_t* strides, const int64_t* nb_flat,
@@ -230,20 +230,40 @@ inline void scan_band_unpadded(
         const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
         ht_insert(h, ht_mask, (lo << 32) | hi);
     };
+    // Boundary scan kernel.
+    //   Wrap=false (default): out-of-bounds neighbours are skipped — matches
+    //     the legacy padded-buffer behaviour (no edges across the image edge).
+    //   Wrap=true: out-of-bounds neighbours wrap to the opposite edge of the
+    //     same axis (toroidal topology). For each OOB axis we recompute the
+    //     wrapped coord and rebuild the flat offset directly, since the
+    //     pre-computed nb_flat[k] assumed no wrap. Interior pixels never
+    //     hit this path so the fast loop's pre-computed offsets stay valid
+    //     under both modes.
     auto scan_pixel_checked = [&](const int64_t* coords, uint32_t bnd_mask, int64_t flat) {
         const T vi = lbl[flat];
         if (vi == 0) return;
         for (int k = 0; k < n_nbs; ++k) {
             const int8_t* dc = nb_dc + k * NDIM;
-            bool valid = true;
-            uint32_t m = bnd_mask;
-            while (m) {
-                const int d = __builtin_ctz(m);
-                m &= m - 1;
-                const int64_t nc = coords[d] + dc[d];
-                if (nc < 0 || nc >= shape[d]) { valid = false; break; }
+            if constexpr (Wrap) {
+                int64_t neigh_flat = 0;
+                for (int d = 0; d < NDIM; ++d) {
+                    int64_t nc = coords[d] + dc[d];
+                    if (nc < 0) nc += shape[d];
+                    else if (nc >= shape[d]) nc -= shape[d];
+                    neigh_flat += nc * strides[d];
+                }
+                emit_pair(ht, vi, lbl[neigh_flat]);
+            } else {
+                bool valid = true;
+                uint32_t m = bnd_mask;
+                while (m) {
+                    const int d = __builtin_ctz(m);
+                    m &= m - 1;
+                    const int64_t nc = coords[d] + dc[d];
+                    if (nc < 0 || nc >= shape[d]) { valid = false; break; }
+                }
+                if (valid) emit_pair(ht, vi, lbl[flat + nb_flat[k]]);
             }
-            if (valid) emit_pair(ht, vi, lbl[flat + nb_flat[k]]);
         }
     };
 
@@ -362,7 +382,7 @@ inline void scan_band_unpadded(
 
 // Internal: per-NDIM driver — generates neighbours, allocates HTs, parallel-
 // scans dim-0 strips, merges. The public dispatcher below routes here.
-template <typename T, int NDIM>
+template <typename T, int NDIM, bool Wrap = false>
 inline std::vector<std::pair<int32_t, int32_t>>
 find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
                          int conn, uint64_t ht_size, int n_threads,
@@ -378,9 +398,9 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
     std::unique_ptr<uint64_t[]> hts(new uint64_t[static_cast<size_t>(n_threads) * ht_size]);
     if (n_threads == 1 || shape[0] < 2) {
         std::fill_n(hts.get(), ht_size, HT_EMPTY);
-        scan_band_unpadded<T, NDIM>(lbl, shape, strides.data(), nb_flat.data(),
-                                    nb_dc.data(), n_nbs, 0, shape[0],
-                                    hts.get(), ht_mask);
+        scan_band_unpadded<T, NDIM, Wrap>(lbl, shape, strides.data(), nb_flat.data(),
+                                          nb_dc.data(), n_nbs, 0, shape[0],
+                                          hts.get(), ht_mask);
     } else {
         // Phase 1: per-worker scan + first-touch HT (NUCA-local).
         std::atomic<int> next{0};
@@ -393,9 +413,9 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
                 const int64_t z0 = static_cast<int64_t>(t) * per;
                 const int64_t z1 = std::min(z0 + per, shape[0]);
                 if (z0 < z1) {
-                    scan_band_unpadded<T, NDIM>(lbl, shape, strides.data(), nb_flat.data(),
-                                                nb_dc.data(), n_nbs, z0, z1,
-                                                ht, ht_mask);
+                    scan_band_unpadded<T, NDIM, Wrap>(lbl, shape, strides.data(), nb_flat.data(),
+                                                      nb_dc.data(), n_nbs, z0, z1,
+                                                      ht, ht_mask);
                 }
             }
         });
@@ -436,13 +456,21 @@ template <typename T>
 std::vector<std::pair<int32_t, int32_t>>
 find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
                        int conn, uint64_t ht_size, int n_threads,
-                       ForkJoinPool& pool) {
+                       ForkJoinPool& pool, bool wrap = false) {
     const int ndim = static_cast<int>(shape.size());
     if (ndim < 2 || conn < 1 || conn > ndim) return {};
+    if (wrap) {
+        switch (ndim) {
+            case 2: return find_pairs_unpadded_impl<T, 2, true>(lbl, shape, conn, ht_size, n_threads, pool);
+            case 3: return find_pairs_unpadded_impl<T, 3, true>(lbl, shape, conn, ht_size, n_threads, pool);
+            case 4: return find_pairs_unpadded_impl<T, 4, true>(lbl, shape, conn, ht_size, n_threads, pool);
+            default: return {};
+        }
+    }
     switch (ndim) {
-        case 2: return find_pairs_unpadded_impl<T, 2>(lbl, shape, conn, ht_size, n_threads, pool);
-        case 3: return find_pairs_unpadded_impl<T, 3>(lbl, shape, conn, ht_size, n_threads, pool);
-        case 4: return find_pairs_unpadded_impl<T, 4>(lbl, shape, conn, ht_size, n_threads, pool);
+        case 2: return find_pairs_unpadded_impl<T, 2, false>(lbl, shape, conn, ht_size, n_threads, pool);
+        case 3: return find_pairs_unpadded_impl<T, 3, false>(lbl, shape, conn, ht_size, n_threads, pool);
+        case 4: return find_pairs_unpadded_impl<T, 4, false>(lbl, shape, conn, ht_size, n_threads, pool);
         default: return {};  // ndim ≥ 5: caller should fall back to padded path
     }
 }
