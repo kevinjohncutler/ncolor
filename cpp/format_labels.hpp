@@ -179,10 +179,13 @@ inline int32_t format_labels_inplace(int32_t* lbl, int64_t total,
     }
     if (max_lbl <= min_lbl) return 0;  // empty or constant array.
 
-    // 2. If min != 0, shift every label by -min so the new min is 0.
-    // Treats ``min`` as the background marker (matches the legacy
-    // ``format_labels`` "shift to 0" semantics).
-    if (min_lbl != 0) {
+    // Shift to put bg at 0 ONLY when min is negative (e.g. -1 used as bg
+    // by some segmenters). For min >= 0 the input either already has bg
+    // at 0 OR has no bg (every pixel labeled — typical for already-
+    // expanded label maps); shifting in the latter case would absorb
+    // the smallest cell into the bg. Same fix as in
+    // format_labels_inplace_first_seen — both variants must agree.
+    if (min_lbl < 0) {
         const int32_t shift = -min_lbl;
         if (n_threads <= 1 || total < 500000) {
             for (int64_t i = 0; i < total; ++i) lbl[i] += shift;

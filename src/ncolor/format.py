@@ -71,15 +71,22 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
     labels = labels.copy()
     labels = labels.astype('int32') #uint vs int
     if background is None:
-        background = np.min(labels)
+        # Treat min as bg ONLY when negative (e.g. -1 used as bg by some
+        # segmenters). For min >= 0 the input either already has bg at 0
+        # or has no bg (every pixel labeled — typical for already-expanded
+        # label maps); shifting in those cases would absorb the smallest
+        # cell into the bg. Mirrors the cpp fix in format_labels_inplace.
+        m = int(np.min(labels))
+        background = m if m < 0 else 0
     else:
         background = 0
 
     if not ignore:
         if verbose:
             print('minimum value is {}, shifting to 0'.format(background))
-        labels -= background
-        background = 0
+        if background != 0:
+            labels -= background
+            background = 0
     labels = labels.astype('uint32')
     
     # optional cleanup 
