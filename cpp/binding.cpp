@@ -919,9 +919,21 @@ public:
                         while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < A) {
                             auto& cv = per_attempt_colors_[idx];
                             const int attempt_offset = local_depth + idx;
+                            // Welsh-Powell ordering on the first
+                            // attempts_per_n - 1 attempts (each with its
+                            // own random offset for the BFS restart
+                            // logic), with the last attempt reserved as
+                            // a label-ID fallback. WP can occasionally
+                            // paint itself into a corner (e.g. L2 + wrap
+                            // pushes some cells to a 5th colour); the
+                            // fallback recovers the 4-colouring without
+                            // bumping cur_n. Lowest-index successful
+                            // attempt wins, so a working WP is always
+                            // preferred over the label-ID fallback.
+                            const bool wp = balance && (idx < A - 1);
                             const bool finished = ncolor_cpp::color_graph_csr_legacy(
                                 ip, ix, N,
-                                local_cur_n, rand_period, attempt_offset, max_iter, cv, balance);
+                                local_cur_n, rand_period, attempt_offset, max_iter, cv, wp);
                             const bool conflict = !finished ||
                                 ncolor_cpp::has_conflict_csr(ip, ix, N, cv.data());
                             bool a_ok;
@@ -932,12 +944,20 @@ public:
                             } else {
                                 a_ok = true;
                             }
-                            per_attempt_ok_[idx] = a_ok ? 1 : 0;
+                            // For Welsh-Powell attempts (all but the last
+                            // when balance=true), require a CLEAN result
+                            // — repair tends to merge colours unevenly,
+                            // so a repaired WP coloring is usually less
+                            // balanced than the label-ID fallback. The
+                            // last attempt (label-ID safety net) accepts
+                            // any successful result.
+                            const bool require_clean = wp;
+                            per_attempt_ok_[idx] = (a_ok && (!require_clean || !conflict)) ? 1 : 0;
                         }
                     });
-                    // Take the lowest-index successful attempt (preserves
-                    // deterministic preference for the first random offset
-                    // when multiple attempts succeed).
+                    // Take the lowest-index successful attempt
+                    // (preserves deterministic preference for the first
+                    // random offset when multiple attempts succeed).
                     for (int a = 0; a < attempts_per_n; ++a) {
                         if (per_attempt_ok_[a]) {
                             colors_.swap(per_attempt_colors_[a]);
@@ -947,18 +967,27 @@ public:
                     }
                 } else {
                     for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
+                        // See parallel branch — Welsh-Powell on the
+                        // first attempts_per_n - 1 attempts; last is
+                        // label-ID fallback. WP attempts must be clean
+                        // (no repair) to count, so a repaired WP doesn't
+                        // pre-empt the label-ID safety net.
+                        const bool wp = balance && (attempt < attempts_per_n - 1);
                         const bool finished = ncolor_cpp::color_graph_csr_legacy(
                             indptr_.data(), indices_.data(), N,
-                            cur_n, rand_period, depth + attempt, max_iter, colors_, balance);
+                            cur_n, rand_period, depth + attempt, max_iter, colors_, wp);
                         bool conflict = !finished || ncolor_cpp::has_conflict_csr(
                             indptr_.data(), indices_.data(), N, colors_.data());
+                        bool a_ok;
                         if (conflict) {
-                            ok = ncolor_cpp::repair_coloring(
+                            a_ok = ncolor_cpp::repair_coloring(
                                 indptr_.data(), indices_.data(), N,
                                 cur_n, std::max(4, max_depth), colors_);
                         } else {
-                            ok = true;
+                            a_ok = true;
                         }
+                        // Same gate as parallel: WP only counts when clean.
+                        if (a_ok && (!wp || !conflict)) ok = true;
                     }
                 }
                 if (!ok) ++cur_n;  // bump n only when all attempts at cur_n failed
