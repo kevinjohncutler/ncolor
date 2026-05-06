@@ -84,7 +84,13 @@ inline int32_t format_labels_inplace_first_seen(
         }
     }
     if (max_lbl <= min_lbl) return 0;
-    if (min_lbl != 0) {
+    // Shift to put bg at 0 ONLY when min is negative (e.g. -1 used as bg
+    // by some segmenters). When min == 0 the input already has its bg
+    // at 0; when min > 0 there is no implied bg (every pixel is fg —
+    // typical for already-expanded label maps), so leaving the values
+    // alone preserves the smallest cell rather than absorbing it into
+    // the bg via shift.
+    if (min_lbl < 0) {
         const int32_t shift = -min_lbl;
         if (n_threads <= 1 || total < 500000) {
             for (int64_t i = 0; i < total; ++i) lbl[i] += shift;
