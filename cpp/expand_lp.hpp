@@ -49,12 +49,14 @@ struct LpExpand<2> {
                        ExpandBuffers& bufs,
                        const std::vector<int64_t>& shape,
                        ForkJoinPool& pool, int n_threads, bool wrap = false) {
-        // L2 toroidal expansion is not yet implemented natively — the
-        // public ncolor.expand_labels(wrap=True) routes through a
-        // np.pad(mode='wrap') prelude when p=2 (~9× cost on the expand
-        // step). TODO: native L2 wrap via ghost-seed envelopes.
-        (void)wrap;
-        expand_labels_inplace(input, bufs, shape, pool, n_threads);
+        // wrap=true routes the inner envelope sweeps through their
+        // ghost-seed (toroidal) variants — see expand.hpp's
+        // envelope_pass_row_contig_impl<true> for the algorithm. The
+        // innermost-axis pass0 fast path is skipped in wrap mode (its
+        // midpoint trick doesn't generalise cleanly to torus tie-break);
+        // expand_labels_inplace falls back to envelope_pass(wrap=true)
+        // there. ~2-3× the standard envelope cost.
+        expand_labels_inplace(input, bufs, shape, pool, n_threads, wrap);
         if (output != bufs.lbl()) {
             std::memcpy(output, bufs.lbl(), bufs.size() * sizeof(int32_t));
         }

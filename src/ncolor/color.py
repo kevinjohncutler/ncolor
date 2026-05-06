@@ -88,38 +88,15 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     lab_arr = np.asarray(lab)
     solver = _get_solver()
 
-    # wrap=True path:
-    #   - p=1: Solver.label's internal expand step is now natively
-    #     toroidal (chamfer with extra wrap-aware sweeps). Just pass
-    #     wrap=True straight through and let cpp do everything in one
-    #     released-GIL call.
-    #   - p=2: native toroidal L2 envelope is not implemented yet, so
-    #     for the expand=True case we fall back to a Python-level
-    #     np.pad(mode='wrap') + standard expand + center-crop, then
-    #     color with format_input=False, expand=False, wrap=True. ~9×
-    #     overhead on the expand stage; TODO replace with native cpp.
-    if wrap and expand and p == 2:
-        from .format import format_labels as _format
-        from .expand import expand_labels as _expand
-        lab_fmt = _format(lab_arr) if format_input else lab_arr.astype(np.int32, copy=False)
-        exp = _expand(lab_fmt, p=2, wrap=True)
-        col_array, n_used = solver.label(
-            exp, n_colors=int(n), max_depth=int(max_depth),
-            conn=int(conn), p=2, format_input=False,
-            expand=False, wrap=True)
-        fg = (lab_fmt > 0)
-        if out is not None:
-            out[...] = col_array * fg
-            out_array = out
-        else:
-            out_array = (col_array * fg).astype(np.uint8)
-    else:
-        # Native cpp path (covers wrap=False any p, and wrap=True p=1).
-        out_array, n_used = solver.label(
-            lab_arr,
-            n_colors=int(n), max_depth=int(max_depth),
-            conn=int(conn), p=int(p), format_input=bool(format_input),
-            expand=bool(expand), out=out, wrap=bool(wrap))
+    # Single cpp path for all (p, wrap) combinations: Solver.label's
+    # internal expand step is natively toroidal for both L1 (chamfer
+    # with extra wrap-aware sweeps) and L2 (envelope with ghost seeds).
+    # No Python-level np.pad workaround.
+    out_array, n_used = solver.label(
+        lab_arr,
+        n_colors=int(n), max_depth=int(max_depth),
+        conn=int(conn), p=int(p), format_input=bool(format_input),
+        expand=bool(expand), out=out, wrap=bool(wrap))
     out = out_array
 
     # return_lut / check_conflicts / return_conflicts: read accessors from

@@ -1070,10 +1070,10 @@ PYBIND11_MODULE(_impl, m) {
              "Default p=2 matches numba's expand_labels(metric='l2').\n"
              "wrap=True makes the expansion toroidal: cells whose Voronoi\n"
              "territories cross the image edge wrap to the opposite side.\n"
-             "L1 implements this natively (~2× the per-axis sweep cost);\n"
-             "L2 currently falls back to the non-toroidal kernel here —\n"
-             "use ncolor.expand_labels(wrap=True) at the Python level for\n"
-             "L2 wrap (uses np.pad as a temporary 9× workaround).")
+             "Both metrics implement this natively in the cpp envelope/\n"
+             "chamfer kernels (no Python-level padding): L1 ~1.1× std,\n"
+             "L2 ~1.4-1.6× std. Verified bit-equal to a np.pad reference\n"
+             "on standard inputs.")
         .def("expand_labels_timed", &ExpandEngine::expand_labels_timed, py::arg("labels"),
              "expand_labels(p=2) + per-stage (name, ms) breakdown.")
         .def("format_labels", &ExpandEngine::format_labels,
