@@ -51,7 +51,7 @@ def unique_nonzero(labels):
         return np.array([], dtype=labels.dtype)
         
 
-def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False, return_lut=False, verbose=False, check_conflicts=False, return_conflicts=False, format_input=True):
+def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False, return_lut=False, verbose=False, check_conflicts=False, return_conflicts=False, format_input=True, balance=False):
     # needs to be in standard label form
     # but also needs to be in int32 data type to work properly; the formatting automatically
     # puts it into the smallest datatype to save space
@@ -84,6 +84,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True, return_n=False,
         max_depth=max_depth,
         offset=offset,
         format_input=False,  # already formatted above
+        balance=balance,
     )
     if colored_expanded is None:
         raise ValueError("Default solver failed to produce a valid coloring.")
@@ -126,7 +127,7 @@ def _apply_lut(flat_lab, lut):
     return out
 
 
-def _solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
+def _solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True, balance=False):
     lab = format_labels(lab).astype(np.int32) if format_input else lab.astype(np.int32, copy=False)
     idx = connect(lab, conn)
     max_label = int(lab.max())
@@ -148,7 +149,13 @@ def _solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
     for _ in range(max_depth):
         for attempt in range(attempts_per_n):
             attempt_offset = offset + attempt
-            colors, unfinished = _color_graph_csr_legacy(indptr, indices, cur_n, rand=10, offset=attempt_offset, max_iter=max_iter)
+            # Welsh-Powell on the first attempts_per_n - 1 attempts, with
+            # the last attempt as a label-ID safety net (mirrors cpp's
+            # behaviour). WP attempts only count as ok when CLEAN (no
+            # repair), since repair tends to merge colours unevenly.
+            wp = balance and (attempt < attempts_per_n - 1)
+            colors, unfinished = _color_graph_csr_legacy(indptr, indices, cur_n, rand=10, offset=attempt_offset, max_iter=max_iter, welsh_powell=wp)
+            initial_clean = not unfinished and not (colors == 0).any()
             needs_repair = unfinished or (colors == 0).any()
             if needs_repair:
                 colors, conflict = _repair_coloring(indptr, indices, colors, cur_n, max_passes=max(4, max_depth))
@@ -156,6 +163,12 @@ def _solver(lab, n=4, conn=2, max_depth=5, offset=0, format_input=True):
             if needs_repair:
                 colors, conflict = _kempe_repair_csr(indptr, indices, colors, cur_n, max_passes=max(2, max_depth))
                 needs_repair = conflict or (colors == 0).any()
+            # Welsh-Powell attempts only count as successful when the BFS
+            # converged cleanly (no repair). A repaired WP coloring is
+            # usually worse than the label-ID fallback, so skip it and
+            # let the next attempt try.
+            if wp and not initial_clean:
+                continue
             if not needs_repair:
                 if _has_conflict_csr(indptr, indices, colors):
                     continue
@@ -429,7 +442,8 @@ def connect(img, conn=1):
 
 
 @njit(cache=True)
-def _color_graph_csr_legacy(indptr, indices, n, rand, offset, max_iter):
+def _color_graph_csr_legacy(indptr, indices, n, rand, offset, max_iter,
+                             welsh_powell=False):
     N = indptr.size - 1
     colors = np.zeros(N, np.uint8)
     counter = np.zeros(N, np.int32)
@@ -438,8 +452,31 @@ def _color_graph_csr_legacy(indptr, indices, n, rand, offset, max_iter):
     q = np.empty(qcap, np.int32)
     head = 0
     tail = N
-    for i in range(N):
-        q[i] = i
+    if welsh_powell:
+        # Visit nodes in DESCENDING degree order so the most-constrained
+        # cells are coloured first. Bucket sort: O(N + max_degree).
+        # Mirrors the cpp implementation in color.hpp.
+        max_deg = 0
+        deg = np.empty(N, np.int32)
+        for i in range(N):
+            deg[i] = indptr[i + 1] - indptr[i]
+            if deg[i] > max_deg:
+                max_deg = deg[i]
+        # Cumulative starts per bucket, ordered high → low.
+        bucket_count = np.zeros(max_deg + 2, np.int32)
+        for i in range(N):
+            bucket_count[deg[i] + 1] += 1
+        wpos = np.zeros(max_deg + 1, np.int32)
+        cum = 0
+        for d in range(max_deg, -1, -1):
+            wpos[d] = cum
+            cum += bucket_count[d + 1]
+        for i in range(N):
+            q[wpos[deg[i]]] = i
+            wpos[deg[i]] += 1
+    else:
+        for i in range(N):
+            q[i] = i
 
     fullmask = (1 << (n + 1)) - 2
     count = 0
