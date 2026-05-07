@@ -133,6 +133,73 @@ inline void build_forward_neighbours(
 
 }  // namespace detail
 
+// Inner-axis fast scan: walk the open interval (x_start, x_end) of a
+// row, emit forward-neighbour pairs to ``ht`` using pre-computed flat
+// offsets. Templated on ``N_NBS`` so the per-pixel inner loop unrolls;
+// the offsets are hoisted into local int64s so the compiler keeps them
+// in registers across the x sweep.
+template <typename T, int N_NBS>
+static inline void scan_inner_axis_fast(
+        const T* row, int64_t x_start, int64_t x_end,
+        const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask) {
+    int64_t nb[N_NBS];
+    for (int i = 0; i < N_NBS; ++i) nb[i] = nb_flat[i];
+    for (int64_t x = x_start; x < x_end; ++x) {
+        const T vi = row[x];
+        if (vi == 0) continue;
+        const T* p = row + x;
+        // Compile-time-bounded; clang fully unrolls.
+        #pragma GCC unroll 16
+        for (int k = 0; k < N_NBS; ++k) {
+            const T vj = p[nb[k]];
+            if (vj == 0 || vj == vi) continue;
+            const T lo = vi < vj ? vi : vj;
+            const T hi = vi < vj ? vj : vi;
+            ht_insert(ht, ht_mask,
+                (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+        }
+    }
+}
+
+// Runtime-N_NBS fallback for cases that don't hit the dispatch table
+// (e.g. ndim ≥ 5 with custom conn). Identical body, just no unroll.
+template <typename T>
+static inline void scan_inner_axis_fast_runtime(
+        const T* row, int64_t x_start, int64_t x_end,
+        int n_nbs, const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask) {
+    for (int64_t x = x_start; x < x_end; ++x) {
+        const T vi = row[x];
+        if (vi == 0) continue;
+        const T* p = row + x;
+        for (int k = 0; k < n_nbs; ++k) {
+            const T vj = p[nb_flat[k]];
+            if (vj == 0 || vj == vi) continue;
+            const T lo = vi < vj ? vi : vj;
+            const T hi = vi < vj ? vj : vi;
+            ht_insert(ht, ht_mask,
+                (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+        }
+    }
+}
+
+// Dispatch on the actual forward-neighbour counts produced by
+// (ndim, conn): 2D conn=1 → 2; 2D conn=2 → 4; 3D conn=1 → 3; conn=2 → 9;
+// conn=3 → 13. Other counts (5D+ or non-default conn) take the runtime
+// fallback.
+template <typename T>
+static inline void scan_inner_axis_dispatch(
+        const T* row, int64_t x_start, int64_t x_end,
+        int n_nbs, const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask) {
+    switch (n_nbs) {
+        case 2:  scan_inner_axis_fast<T, 2 >(row, x_start, x_end, nb_flat, ht, ht_mask); break;
+        case 3:  scan_inner_axis_fast<T, 3 >(row, x_start, x_end, nb_flat, ht, ht_mask); break;
+        case 4:  scan_inner_axis_fast<T, 4 >(row, x_start, x_end, nb_flat, ht, ht_mask); break;
+        case 9:  scan_inner_axis_fast<T, 9 >(row, x_start, x_end, nb_flat, ht, ht_mask); break;
+        case 13: scan_inner_axis_fast<T, 13>(row, x_start, x_end, nb_flat, ht, ht_mask); break;
+        default: scan_inner_axis_fast_runtime<T>(row, x_start, x_end, n_nbs, nb_flat, ht, ht_mask); break;
+    }
+}
+
 // Internal scan kernel: walks one strip of axis-0, emits forward-neighbour
 // pairs into a single hashtable. Generic ND odometer — interior pixels use
 // the pre-computed flat offsets in nb_flat; boundary pixels rebuild offsets
@@ -220,16 +287,12 @@ inline void scan_band_unpadded(
             }
         } else {
             // Outer coords all interior, W ≥ 3: fast path on the
-            // open interval (0, W-1).
+            // open interval (0, W-1) — fully unrolled at the n_nbs the
+            // (ndim, conn) connectivity actually produces.
             coords[inner] = 0;
             scan_pixel_checked(coords, inner_bit, row_base);
-            for (int64_t x = 1; x < W - 1; ++x) {
-                const T vi = lbl[row_base + x];
-                if (vi == 0) continue;
-                for (int k = 0; k < n_nbs; ++k) {
-                    emit_pair(ht, vi, lbl[row_base + x + nb_flat[k]]);
-                }
-            }
+            scan_inner_axis_dispatch<T>(
+                lbl + row_base, 1, W - 1, n_nbs, nb_flat, ht, ht_mask);
             coords[inner] = W - 1;
             scan_pixel_checked(coords, inner_bit, row_base + (W - 1));
         }
