@@ -208,73 +208,6 @@ public:
         return {std::move(out), n_labels};
     }
 
-    // Same as expand_labels but returns a (output, list[(stage_name, ms)])
-    // tuple — used by callers that want to attribute time to expand /
-    // find_pairs / build_csr / color / apply_lut. p=2 only for now.
-    std::pair<py::array_t<int32_t>, std::vector<std::pair<std::string, double>>>
-    expand_labels_timed(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels) {
-        const auto buf = labels.request();
-        std::vector<int64_t> shape(buf.ndim);
-        for (int i = 0; i < buf.ndim; ++i) shape[i] = buf.shape[i];
-        const int32_t* input = static_cast<const int32_t*>(buf.ptr);
-        py::array_t<int32_t> out(buf.shape);
-        int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
-        std::vector<std::pair<std::string, double>> stages;
-        {
-            py::gil_scoped_release release;
-            ncolor_cpp::expand_labels_inplace_timed(input, bufs_, shape, *pool_, n_threads_,
-                [&](const char* name, double ms) { stages.emplace_back(name, ms); });
-            std::memcpy(out_ptr, bufs_.lbl(), bufs_.size() * sizeof(int32_t));
-        }
-        return {std::move(out), std::move(stages)};
-    }
-
-    // Parallel scatter: out[i] = lut[flat_lab[i]] for every i. Used by
-    // ncolor's coloring step to apply the per-label color LUT to the image.
-    template <typename LutT>
-    py::array_t<LutT> apply_lut_impl(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> flat_lab,
-            py::array_t<LutT, py::array::c_style | py::array::forcecast> lut) {
-        const auto lab_buf = flat_lab.request();
-        const auto lut_buf = lut.request();
-        const int64_t total = lab_buf.size;
-        const int32_t* lab_ptr = static_cast<const int32_t*>(lab_buf.ptr);
-        const LutT* lut_ptr = static_cast<const LutT*>(lut_buf.ptr);
-        py::array_t<LutT> out(lab_buf.shape);
-        LutT* out_ptr = static_cast<LutT*>(out.request().ptr);
-
-        py::gil_scoped_release release;
-        const int n_threads = n_threads_;
-        if (n_threads <= 1 || total < 4096) {
-            for (int64_t i = 0; i < total; ++i) {
-                out_ptr[i] = lut_ptr[lab_ptr[i]];
-            }
-            return out;
-        }
-        ncolor_cpp::dispatch_parallel(*pool_, static_cast<size_t>(total),
-            static_cast<size_t>(n_threads) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
-            [lab_ptr, lut_ptr, out_ptr](size_t begin, size_t end) {
-                for (size_t i = begin; i < end; ++i) {
-                    out_ptr[i] = lut_ptr[lab_ptr[i]];
-                }
-            });
-        return out;
-    }
-
-    py::array apply_lut(py::array flat_lab, py::array lut) {
-        // Dispatch on lut dtype (uint8 for ncolor coloring; int32 generally).
-        const auto kind = lut.dtype().kind();
-        const auto itemsize = lut.dtype().itemsize();
-        if (kind == 'u' && itemsize == 1) {
-            return apply_lut_impl<uint8_t>(flat_lab, lut);
-        }
-        if (kind == 'i' && itemsize == 4) {
-            return apply_lut_impl<int32_t>(flat_lab, lut);
-        }
-        throw std::invalid_argument("apply_lut: lut dtype must be uint8 or int32");
-    }
-
 private:
     int n_threads_;
     std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
@@ -795,7 +728,7 @@ PYBIND11_MODULE(_impl, m) {
               "ForkJoinPool. Public Python API in ncolor.color, ncolor.expand "
               "wraps the engines exposed here.";
     py::class_<ExpandEngine>(m, "ExpandEngine",
-        "Persistent threadpool wrapper for expand_labels + apply_lut.\n"
+        "Persistent threadpool wrapper for expand_labels + format_labels.\n"
         "One engine per pipeline; the pool and intermediate buffers are\n"
         "reused across calls.")
         .def(py::init<double>(), py::arg("n_threads") = -1.0)
@@ -812,8 +745,6 @@ PYBIND11_MODULE(_impl, m) {
              "chamfer kernels (no Python-level padding): L1 ~1.1× std,\n"
              "L2 ~1.4-1.6× std. Verified bit-equal to a np.pad reference\n"
              "on standard inputs.")
-        .def("expand_labels_timed", &ExpandEngine::expand_labels_timed, py::arg("labels"),
-             "expand_labels(p=2) + per-stage (name, ms) breakdown.")
         .def("format_labels", &ExpandEngine::format_labels,
              py::arg("labels"), py::arg("first_seen") = false,
              "Compact nonzero labels to 1..N. If min(labels) != 0 the\n"
@@ -826,10 +757,7 @@ PYBIND11_MODULE(_impl, m) {
              "build, ~2× slower) — opt in when bit-equality matters.\n"
              "Accepts uint8/uint16/uint32, int8/int16/int32, int64 input;\n"
              "cast to int32 happens in parallel inside the released-GIL\n"
-             "block. Returns (formatted_array, n_labels).")
-        .def("apply_lut", &ExpandEngine::apply_lut,
-             py::arg("flat_lab"), py::arg("lut"),
-             "Parallel scatter: out[i] = lut[flat_lab[i]]. Lut must be uint8 or int32.");
+             "block. Returns (formatted_array, n_labels).");
 
     py::class_<Solver>(m, "Solver",
         "End-to-end ncolor.label() equivalent for 2D conn=1 inputs.\n"

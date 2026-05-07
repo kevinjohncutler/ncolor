@@ -664,58 +664,6 @@ inline void expand_labels_inplace(
     }
 }
 
-// Profile breakdown helper — times each stage. Same algorithm as
-// expand_labels_inplace, but emits per-stage durations via callback.
-template <typename Cb>
-inline void expand_labels_inplace_timed(
-        const int32_t* input, ExpandBuffers& bufs,
-        const std::vector<int64_t>& shape,
-        ForkJoinPool& pool, int n_threads,
-        Cb&& report_ms) {
-    const int ndim = static_cast<int>(shape.size());
-    int64_t total = 1;
-    for (int64_t d : shape) total *= d;
-    bufs.resize(total);
-    int32_t* h_lbl = bufs.lbl();
-    int32_t* h_dist = bufs.dist();
-    int32_t* t_lbl = bufs.lbl_T();
-    int32_t* t_dist = bufs.dist_T();
-
-    auto t0 = std::chrono::steady_clock::now();
-    auto stage = [&](const char* name) {
-        auto t1 = std::chrono::steady_clock::now();
-        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        report_ms(name, ms);
-        t0 = t1;
-    };
-
-    if (input != h_lbl) {
-        std::memcpy(h_lbl, input, total * sizeof(int32_t));
-    }
-    stage("memcpy_in");
-
-    for (int ax = ndim - 1; ax >= 0; --ax) {
-        const int64_t n = shape[ax];
-        if (ax == ndim - 1) {
-            const int64_t n_slices = total / n;
-            envelope_pass0(h_lbl, h_dist, n_slices, n, pool, n_threads, bufs.scratch());
-            stage("pass0_axis1");
-        } else {
-            int64_t A = 1;
-            for (int d = 0; d < ax; ++d) A *= shape[d];
-            int64_t C = 1;
-            for (int d = ax + 1; d < ndim; ++d) C *= shape[d];
-            const int64_t B = n;
-            batch_transpose<int32_t>(h_lbl, h_dist, t_lbl, t_dist, A, B, C, pool, n_threads);
-            stage("transpose_fwd");
-            envelope_pass(t_lbl, t_dist, A * C, B, pool, n_threads, bufs.scratch());
-            stage("parabolic_axis0");
-            batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads);
-            stage("transpose_back");
-        }
-    }
-}
-
 } // namespace ncolor_cpp
 
 #endif // NCOLOR_EXPAND_HPP

@@ -272,28 +272,6 @@ inline void cast_to_int32<int32_t>(const int32_t* src, int32_t* dst,
     }
 }
 
-// Apply background mask: out_ptr[i] = 0 wherever input_mask[i] == 0.
-// Used as the final stage of Solver.label when ``mask_bg=True`` to
-// match numba's ``colored * (lab != 0)`` semantics.
-template <typename OutT>
-inline void apply_bg_mask(const int32_t* input_mask, OutT* out_ptr,
-                          int64_t total,
-                          ForkJoinPool& pool, int n_threads) {
-    if (n_threads <= 1 || total < 500000) {
-        for (int64_t i = 0; i < total; ++i) {
-            if (input_mask[i] == 0) out_ptr[i] = 0;
-        }
-        return;
-    }
-    dispatch_parallel(pool, static_cast<size_t>(total),
-        static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD,
-        [input_mask, out_ptr](size_t i0, size_t i1) {
-            for (size_t i = i0; i < i1; ++i) {
-                if (input_mask[i] == 0) out_ptr[i] = 0;
-            }
-        });
-}
-
 }  // namespace ncolor_cpp
 
 #endif  // NCOLOR_FORMAT_LABELS_HPP
