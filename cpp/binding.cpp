@@ -53,6 +53,48 @@ static int resolve_threads(double v) {
     return static_cast<int>(std::max<long>(1, static_cast<long>(v + 0.5)));
 }
 
+// Dispatch on a numpy buffer's dtype, calling `f<T>()` with the matched
+// integer type. `f` is a generic lambda that takes a tag pointer:
+//
+//   dispatch_int_dtype(fmt, itemsize, "Solver.label", [&](auto* tag) {
+//       using T = std::remove_pointer_t<decltype(tag)>;
+//       ncolor_cpp::cast_with_bg<T>(static_cast<const T*>(src), ...);
+//   });
+//
+// Resolves dtype by (itemsize, signedness) so the same code handles macOS
+// `l` (int64) and pybind11 `q` (long long) — relying on format-code matching
+// alone breaks across platforms. Throws on unsupported dtype with `api_name`
+// in the error message.
+template <typename Func>
+static inline void dispatch_int_dtype(const std::string& fmt, ssize_t itemsize,
+                                      const char* api_name, Func&& f) {
+    bool is_signed = false, is_unsigned = false;
+    if (!fmt.empty()) {
+        const char c = fmt[0];
+        if (c == 'b' || c == 'h' || c == 'i' || c == 'l' || c == 'q' || c == 'n')
+            is_signed = true;
+        else if (c == 'B' || c == 'H' || c == 'I' || c == 'L' || c == 'Q' || c == 'N')
+            is_unsigned = true;
+    }
+    if (is_signed) {
+        switch (itemsize) {
+            case 1: f(static_cast<int8_t*>(nullptr));  return;
+            case 2: f(static_cast<int16_t*>(nullptr)); return;
+            case 4: f(static_cast<int32_t*>(nullptr)); return;
+            case 8: f(static_cast<int64_t*>(nullptr)); return;
+        }
+    } else if (is_unsigned) {
+        switch (itemsize) {
+            case 1: f(static_cast<uint8_t*>(nullptr));  return;
+            case 2: f(static_cast<uint16_t*>(nullptr)); return;
+            case 4: f(static_cast<uint32_t*>(nullptr)); return;
+        }
+    }
+    throw std::invalid_argument(std::string(api_name) +
+        ": unsupported dtype '" + fmt + "' (need uint8/uint16/uint32/"
+        "int8/int16/int32/int64)");
+}
+
 class ConnectEngine {
 public:
     explicit ConnectEngine(double n_threads)
@@ -178,45 +220,12 @@ public:
         }
         const auto buf = labels.request();
         const int64_t total = buf.size;
-        // Detect dtype by (itemsize, signedness) — same approach as
-        // Solver.label (handles macOS 'l' vs pybind11 'q' for int64).
-        const std::string fmt = buf.format;
-        const ssize_t itemsize = buf.itemsize;
-        bool is_signed = false, is_unsigned = false;
-        if (!fmt.empty()) {
-            const char c = fmt[0];
-            if (c == 'b' || c == 'h' || c == 'i' || c == 'l' || c == 'q' || c == 'n')
-                is_signed = true;
-            else if (c == 'B' || c == 'H' || c == 'I' || c == 'L' || c == 'Q' || c == 'N')
-                is_unsigned = true;
-        }
-        if (!(is_signed || is_unsigned)) {
-            throw std::invalid_argument(
-                "ExpandEngine.format_labels: unsupported dtype '" + fmt +
-                "' (need uint8/uint16/uint32/int8/int16/int32/int64)");
-        }
-        const bool is_uint8  = is_unsigned && itemsize == 1;
-        const bool is_uint16 = is_unsigned && itemsize == 2;
-        const bool is_uint32 = is_unsigned && itemsize == 4;
-        const bool is_int8   = is_signed   && itemsize == 1;
-        const bool is_int16  = is_signed   && itemsize == 2;
-        const bool is_int32  = is_signed   && itemsize == 4;
-        const bool is_int64  = is_signed   && itemsize == 8;
-        if (!(is_int32 || is_uint8 || is_uint16 || is_uint32
-              || is_int8 || is_int16 || is_int64)) {
-            throw std::invalid_argument(
-                "ExpandEngine.format_labels: unsupported dtype (itemsize=" +
-                std::to_string(itemsize) + ")");
-        }
         const void* src_ptr = buf.ptr;
 
-        // Allocate int32 output array. pybind11 will value-init (memset 0)
-        // from the main thread — that pre-touches the pages, but we want
-        // first-touch from worker threads in cast_to_int32 for NUCA-locality.
-        // Allocate via shape vector (same effect; pybind value-inits as
-        // before, but the cast immediately rewrites every byte from the
-        // worker that owns each chunk, and modern allocators don't zero
-        // freshly-mapped pages anyway).
+        // Allocate int32 output array. pybind11 value-inits (memset 0) from
+        // the main thread, but cast_to_int32 immediately rewrites every byte
+        // from the worker that owns each chunk, and modern allocators don't
+        // zero freshly-mapped pages anyway — net cost is negligible.
         std::vector<py::ssize_t> out_shape(buf.ndim);
         for (ssize_t d = 0; d < buf.ndim; ++d) out_shape[d] = buf.shape[d];
         py::array_t<int32_t> out(out_shape);
@@ -226,28 +235,13 @@ public:
         {
             py::gil_scoped_release release;
             // Cast to int32 in parallel inside the released-GIL block.
-            if (is_int32) {
-                ncolor_cpp::cast_to_int32<int32_t>(
-                    static_cast<const int32_t*>(src_ptr), out_ptr, total, *pool_, n_threads_);
-            } else if (is_uint8) {
-                ncolor_cpp::cast_to_int32<uint8_t>(
-                    static_cast<const uint8_t*>(src_ptr), out_ptr, total, *pool_, n_threads_);
-            } else if (is_uint16) {
-                ncolor_cpp::cast_to_int32<uint16_t>(
-                    static_cast<const uint16_t*>(src_ptr), out_ptr, total, *pool_, n_threads_);
-            } else if (is_uint32) {
-                ncolor_cpp::cast_to_int32<uint32_t>(
-                    static_cast<const uint32_t*>(src_ptr), out_ptr, total, *pool_, n_threads_);
-            } else if (is_int8) {
-                ncolor_cpp::cast_to_int32<int8_t>(
-                    static_cast<const int8_t*>(src_ptr), out_ptr, total, *pool_, n_threads_);
-            } else if (is_int16) {
-                ncolor_cpp::cast_to_int32<int16_t>(
-                    static_cast<const int16_t*>(src_ptr), out_ptr, total, *pool_, n_threads_);
-            } else /* is_int64 */ {
-                ncolor_cpp::cast_to_int32<int64_t>(
-                    static_cast<const int64_t*>(src_ptr), out_ptr, total, *pool_, n_threads_);
-            }
+            dispatch_int_dtype(buf.format, buf.itemsize,
+                "ExpandEngine.format_labels", [&](auto* tag) {
+                    using T = std::remove_pointer_t<decltype(tag)>;
+                    ncolor_cpp::cast_to_int32<T>(
+                        static_cast<const T*>(src_ptr), out_ptr, total,
+                        *pool_, n_threads_);
+                });
             n_labels = first_seen
                 ? ncolor_cpp::format_labels_inplace_first_seen(
                     out_ptr, total, *pool_, n_threads_)
@@ -388,54 +382,26 @@ public:
             total *= shape[d];
         }
         // Unified ND unpadded find_pairs handles all (ndim, conn) cases.
-
-        // (itemsize, signedness) dispatch — see the parallel block in
-        // Solver.label for why this beats format-code matching.
-        const std::string fmt = buf.format;
-        const ssize_t itemsize = buf.itemsize;
-        bool is_signed = false, is_unsigned = false;
-        if (!fmt.empty()) {
-            const char c = fmt[0];
-            if (c == 'b' || c == 'h' || c == 'i' || c == 'l' || c == 'q' || c == 'n') is_signed = true;
-            else if (c == 'B' || c == 'H' || c == 'I' || c == 'L' || c == 'Q' || c == 'N') is_unsigned = true;
-        }
-        const bool is_uint8  = is_unsigned && itemsize == 1;
-        const bool is_uint16 = is_unsigned && itemsize == 2;
-        const bool is_uint32 = is_unsigned && itemsize == 4;
-        const bool is_int8   = is_signed   && itemsize == 1;
-        const bool is_int16  = is_signed   && itemsize == 2;
-        const bool is_int32  = is_signed   && itemsize == 4;
-        const bool is_int64  = is_signed   && itemsize == 8;
-        if (!(is_int32 || is_uint8 || is_uint16 || is_uint32
-              || is_int8 || is_int16 || is_int64)) {
-            throw std::invalid_argument(
-                "Solver.connect: unsupported dtype '" + fmt + "'");
-        }
         const void* src_ptr = buf.ptr;
 
         std::vector<std::pair<int32_t, int32_t>> pairs;
         {
             py::gil_scoped_release release;
-            // Cast to int32 in expand_bufs_.lbl(); discard bg pattern
-            // (connect doesn't need it).
+            // Cast to int32 in expand_bufs_.lbl(); the bg mask is unused
+            // here (Solver.connect never applies a LUT) but cast_with_bg
+            // is the parallel cast we already use elsewhere — bg writes
+            // are cheap and let us share the kernel.
             expand_bufs_.resize(total);
             int32_t* labels = expand_bufs_.lbl();
             bg_mask_.resize(static_cast<size_t>(total));
             uint8_t* bg = bg_mask_.data();
-            if (is_int32) ncolor_cpp::cast_with_bg<int32_t>(
-                static_cast<const int32_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
-            else if (is_uint8) ncolor_cpp::cast_with_bg<uint8_t>(
-                static_cast<const uint8_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
-            else if (is_uint16) ncolor_cpp::cast_with_bg<uint16_t>(
-                static_cast<const uint16_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
-            else if (is_uint32) ncolor_cpp::cast_with_bg<uint32_t>(
-                static_cast<const uint32_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
-            else if (is_int8) ncolor_cpp::cast_with_bg<int8_t>(
-                static_cast<const int8_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
-            else if (is_int16) ncolor_cpp::cast_with_bg<int16_t>(
-                static_cast<const int16_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
-            else /* is_int64 */ ncolor_cpp::cast_with_bg<int64_t>(
-                static_cast<const int64_t*>(src_ptr), labels, bg, total, *pool_, n_threads_);
+            dispatch_int_dtype(buf.format, buf.itemsize, "Solver.connect",
+                [&](auto* tag) {
+                    using T = std::remove_pointer_t<decltype(tag)>;
+                    ncolor_cpp::cast_with_bg<T>(
+                        static_cast<const T*>(src_ptr), labels, bg, total,
+                        *pool_, n_threads_);
+                });
 
             // Find max for hashtable sizing.
             int32_t max_label = 0;
@@ -522,38 +488,6 @@ public:
         // Validate + classify dtype by (itemsize, signedness). Doing it
         // by buf.format string runs into a platform quirk: numpy's int64
         // is 'l' (long) on macOS / Linux LP64 while pybind11's
-        // format_descriptor<int64_t>::format() is 'q' (long long).
-        // (itemsize, signedness) is the underlying truth that's portable.
-        const std::string fmt = buf.format;
-        const ssize_t itemsize = buf.itemsize;
-        bool is_signed = false, is_unsigned = false;
-        if (!fmt.empty()) {
-            const char c = fmt[0];
-            // pybind11 / numpy struct format codes.
-            if (c == 'b' || c == 'h' || c == 'i' || c == 'l' || c == 'q' || c == 'n')
-                is_signed = true;
-            else if (c == 'B' || c == 'H' || c == 'I' || c == 'L' || c == 'Q' || c == 'N')
-                is_unsigned = true;
-        }
-        if (!(is_signed || is_unsigned)) {
-            throw std::invalid_argument(
-                "Solver.label: unsupported dtype '" + fmt +
-                "' (need one of: uint8, uint16, uint32, int8, int16, int32, int64)");
-        }
-        const bool is_uint8  = is_unsigned && itemsize == 1;
-        const bool is_uint16 = is_unsigned && itemsize == 2;
-        const bool is_uint32 = is_unsigned && itemsize == 4;
-        const bool is_int8   = is_signed   && itemsize == 1;
-        const bool is_int16  = is_signed   && itemsize == 2;
-        const bool is_int32  = is_signed   && itemsize == 4;
-        const bool is_int64  = is_signed   && itemsize == 8;
-        if (!(is_int32 || is_uint8 || is_uint16 || is_uint32
-              || is_int8 || is_int16 || is_int64)) {
-            throw std::invalid_argument(
-                "Solver.label: unsupported dtype (itemsize=" +
-                std::to_string(itemsize) + ", " +
-                (is_signed ? "signed" : "unsigned") + ")");
-        }
         const void* src_ptr = buf.ptr;
 
         std::vector<py::ssize_t> out_shape(ndim);
@@ -622,35 +556,13 @@ public:
             bg_mask_.resize(static_cast<size_t>(total));
             int32_t* expanded = expand_bufs_.lbl();
             uint8_t* bg = bg_mask_.data();
-            if (is_int32) {
-                ncolor_cpp::cast_with_bg<int32_t>(
-                    static_cast<const int32_t*>(src_ptr),
-                    expanded, bg, total, *pool_, n_threads_);
-            } else if (is_uint8) {
-                ncolor_cpp::cast_with_bg<uint8_t>(
-                    static_cast<const uint8_t*>(src_ptr),
-                    expanded, bg, total, *pool_, n_threads_);
-            } else if (is_uint16) {
-                ncolor_cpp::cast_with_bg<uint16_t>(
-                    static_cast<const uint16_t*>(src_ptr),
-                    expanded, bg, total, *pool_, n_threads_);
-            } else if (is_uint32) {
-                ncolor_cpp::cast_with_bg<uint32_t>(
-                    static_cast<const uint32_t*>(src_ptr),
-                    expanded, bg, total, *pool_, n_threads_);
-            } else if (is_int8) {
-                ncolor_cpp::cast_with_bg<int8_t>(
-                    static_cast<const int8_t*>(src_ptr),
-                    expanded, bg, total, *pool_, n_threads_);
-            } else if (is_int16) {
-                ncolor_cpp::cast_with_bg<int16_t>(
-                    static_cast<const int16_t*>(src_ptr),
-                    expanded, bg, total, *pool_, n_threads_);
-            } else /* is_int64 */ {
-                ncolor_cpp::cast_with_bg<int64_t>(
-                    static_cast<const int64_t*>(src_ptr),
-                    expanded, bg, total, *pool_, n_threads_);
-            }
+            dispatch_int_dtype(buf.format, buf.itemsize, "Solver.label",
+                [&](auto* tag) {
+                    using T = std::remove_pointer_t<decltype(tag)>;
+                    ncolor_cpp::cast_with_bg<T>(
+                        static_cast<const T*>(src_ptr), expanded, bg, total,
+                        *pool_, n_threads_);
+                });
             stage("cast");
 
             // 0b. Optional format_labels: compact nonzero labels to 1..N
