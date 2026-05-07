@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish: 'no' (artifact only), 'testpypi', or 'pypi'"
+        description: "Publish target"
         type: choice
         required: true
-        default: "no"
-        options: [no, testpypi, pypi]
+        default: "none"
+        options: ["none", "testpypi", "pypi"]
   push:
     tags: ["v*"]
 
