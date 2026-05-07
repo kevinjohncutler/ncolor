@@ -54,6 +54,40 @@ inline void dispatch_parallel(ForkJoinPool& pool, size_t total,
     });
 }
 
+// Like ``dispatch_parallel`` but threads each own a slot in a caller-managed
+// scratch pool. Each worker first claims a unique ``tid`` (so it gets its own
+// ``scratch_pool[tid]``), then atomic-claims chunks. ``work`` is called once
+// per chunk with ``(scratch_ref, begin, end)``.
+//
+// Caller must size ``scratch_pool`` to at least ``n_threads`` entries before
+// calling — and must initialise each entry's per-row capacity (``ScratchT``
+// has its own resize protocol).
+template <typename ScratchT, typename Work>
+inline void dispatch_parallel_with_scratch(
+        ForkJoinPool& pool, int n_threads,
+        size_t n_items, size_t max_chunks,
+        std::vector<ScratchT>& scratch_pool, Work work) {
+    if (n_threads <= 1 || n_items < 2) {
+        work(scratch_pool[0], size_t{0}, n_items);
+        return;
+    }
+    const size_t n_chunks = std::min<size_t>(n_items, max_chunks);
+    const size_t chunk_sz = (n_items + n_chunks - 1) / n_chunks;
+    std::atomic<int> tid_next{0};
+    std::atomic<size_t> chunk_next{0};
+    pool.parallel([&]() {
+        const int my_tid = tid_next.fetch_add(1, std::memory_order_relaxed);
+        if (my_tid >= n_threads) return;
+        ScratchT& sc = scratch_pool[my_tid];
+        size_t idx;
+        while ((idx = chunk_next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
+            const size_t begin = idx * chunk_sz;
+            const size_t end = std::min(n_items, begin + chunk_sz);
+            work(sc, begin, end);
+        }
+    });
+}
+
 // Per-pass thread cap (verbatim from edt/src/edt.hpp::compute_threads).
 // For small passes the per-chunk overhead exceeds the work, so capping at
 // 4-12 threads is a clean win. For large passes we use the caller's

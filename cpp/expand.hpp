@@ -333,35 +333,17 @@ inline void envelope_pass0(
     const size_t cap = static_cast<size_t>(N) + 1;
     for (int t = 0; t < eff_threads; ++t) scratch[t].resize(cap);
 
-    if (eff_threads == 1 || n_slices < 2) {
-        for (int64_t s = 0; s < n_slices; ++s) {
-            envelope_pass0_row(h_lbl + s * N, h_dist + s * N, N,
-                               scratch[0].v.data(), scratch[0].lblstk.data());
-        }
-        return;
-    }
-
-    // Atomic work-stealing: split slices into chunks, each thread claims a
-    // tid once (so it can reuse its scratch[tid]) then loops claiming chunks.
-    const int n_chunks = static_cast<int>(std::min<int64_t>(
-        n_slices, static_cast<int64_t>(eff_threads) * DISPATCH_CHUNKS_PER_THREAD));
-    const int64_t chunk_sz = (n_slices + n_chunks - 1) / n_chunks;
-    std::atomic<int> tid_next{0};
-    std::atomic<int> chunk_next{0};
-    pool.parallel([&]() {
-        const int my_tid = tid_next.fetch_add(1, std::memory_order_relaxed);
-        if (my_tid >= eff_threads) return;
-        int32_t* sp = scratch[my_tid].v.data();
-        int32_t* lp = scratch[my_tid].lblstk.data();
-        int idx;
-        while ((idx = chunk_next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
-            const int64_t s0 = static_cast<int64_t>(idx) * chunk_sz;
-            const int64_t s1 = std::min(s0 + chunk_sz, n_slices);
-            for (int64_t s = s0; s < s1; ++s) {
+    dispatch_parallel_with_scratch(pool, eff_threads,
+        static_cast<size_t>(n_slices),
+        static_cast<size_t>(eff_threads) * DISPATCH_CHUNKS_PER_THREAD,
+        scratch,
+        [&](EnvelopeScratch& sc, size_t s0, size_t s1) {
+            int32_t* sp = sc.v.data();
+            int32_t* lp = sc.lblstk.data();
+            for (size_t s = s0; s < s1; ++s) {
                 envelope_pass0_row(h_lbl + s * N, h_dist + s * N, N, sp, lp);
             }
-        }
-    });
+        });
 }
 
 // Pass over (n_slices, N) row-major arrays in parallel.
@@ -381,46 +363,22 @@ inline void envelope_pass(
     const size_t cap = static_cast<size_t>(wrap ? 3 * N : N) + 1;
     for (int t = 0; t < eff_threads; ++t) scratch[t].resize(cap);
 
-    auto run_row = [&](int32_t* l, int32_t* d, int32_t* vp, int32_t* lp,
-                       int32_t* gp, double* zp, double* vdp, double* vdsqp) {
-        if (wrap) envelope_pass_row_wrap(l, d, N, /*stride=*/1, vp, lp, gp, zp, vdp, vdsqp);
-        else      envelope_pass_row     (l, d, N, /*stride=*/1, vp, lp, gp, zp, vdp, vdsqp);
-    };
-
-    if (eff_threads == 1 || n_slices < 2) {
-        auto& sc = scratch[0];
-        for (int64_t s = 0; s < n_slices; ++s) {
-            run_row(h_lbl + s * N, h_dist + s * N,
-                    sc.v.data(), sc.lblstk.data(), sc.g.data(),
-                    sc.z.data(), sc.vd.data(), sc.vd_sq.data());
-        }
-        return;
-    }
-
-    const int n_chunks = static_cast<int>(std::min<int64_t>(
-        n_slices, static_cast<int64_t>(eff_threads) * DISPATCH_CHUNKS_PER_THREAD));
-    const int64_t chunk_sz = (n_slices + n_chunks - 1) / n_chunks;
-    std::atomic<int> tid_next{0};
-    std::atomic<int> chunk_next{0};
-    pool.parallel([&]() {
-        const int my_tid = tid_next.fetch_add(1, std::memory_order_relaxed);
-        if (my_tid >= eff_threads) return;
-        auto& sc = scratch[my_tid];
-        int32_t* vp = sc.v.data();
-        int32_t* lp = sc.lblstk.data();
-        int32_t* gp = sc.g.data();
-        double* zp = sc.z.data();
-        double* vdp = sc.vd.data();
-        double* vdsqp = sc.vd_sq.data();
-        int idx;
-        while ((idx = chunk_next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
-            const int64_t s0 = static_cast<int64_t>(idx) * chunk_sz;
-            const int64_t s1 = std::min(s0 + chunk_sz, n_slices);
-            for (int64_t s = s0; s < s1; ++s) {
-                run_row(h_lbl + s * N, h_dist + s * N, vp, lp, gp, zp, vdp, vdsqp);
+    dispatch_parallel_with_scratch(pool, eff_threads,
+        static_cast<size_t>(n_slices),
+        static_cast<size_t>(eff_threads) * DISPATCH_CHUNKS_PER_THREAD,
+        scratch,
+        [&](EnvelopeScratch& sc, size_t s0, size_t s1) {
+            int32_t* vp = sc.v.data(); int32_t* lp = sc.lblstk.data();
+            int32_t* gp = sc.g.data();
+            double* zp = sc.z.data();  double* vdp = sc.vd.data();
+            double* vdsqp = sc.vd_sq.data();
+            for (size_t s = s0; s < s1; ++s) {
+                int32_t* l = h_lbl + s * N;
+                int32_t* d = h_dist + s * N;
+                if (wrap) envelope_pass_row_wrap(l, d, N, /*stride=*/1, vp, lp, gp, zp, vdp, vdsqp);
+                else      envelope_pass_row     (l, d, N, /*stride=*/1, vp, lp, gp, zp, vdp, vdsqp);
             }
-        }
-    });
+        });
 }
 
 // ABC strided variant: sweep axis B in an (A, B, C)-laid-out array.
@@ -438,62 +396,35 @@ inline void envelope_pass_strided_abc(
         ForkJoinPool& pool, int n_threads,
         std::vector<EnvelopeScratch>& scratch, bool wrap = false) {
     if (n_threads < 1) n_threads = 1;
+    const int64_t n_lines = A * C;
     const int eff_threads = static_cast<int>(compute_threads(
         static_cast<size_t>(n_threads),
-        static_cast<size_t>(A * C),
+        static_cast<size_t>(n_lines),
         static_cast<size_t>(B)));
     if (static_cast<int>(scratch.size()) < eff_threads) scratch.resize(eff_threads);
     // Wrap may push up to 3B seeds (ghost copies); see envelope_pass.
     const size_t cap = static_cast<size_t>(wrap ? 3 * B : B) + 1;
     for (int t = 0; t < eff_threads; ++t) scratch[t].resize(cap);
 
-    auto run_row = [&](int32_t* l, int32_t* d, int32_t* vp, int32_t* lp,
-                       int32_t* gp, double* zp, double* vdp, double* vdsqp) {
-        if (wrap) envelope_pass_row_wrap(l, d, B, /*stride=*/C, vp, lp, gp, zp, vdp, vdsqp);
-        else      envelope_pass_row     (l, d, B, /*stride=*/C, vp, lp, gp, zp, vdp, vdsqp);
-    };
-
-    const int64_t n_lines = A * C;
-    if (eff_threads == 1 || n_lines < 2) {
-        auto& sc = scratch[0];
-        for (int64_t k = 0; k < n_lines; ++k) {
-            const int64_t a = k / C;
-            const int64_t c = k % C;
-            const int64_t base = a * B * C + c;
-            run_row(h_lbl + base, h_dist + base,
-                    sc.v.data(), sc.lblstk.data(), sc.g.data(),
-                    sc.z.data(), sc.vd.data(), sc.vd_sq.data());
-        }
-        return;
-    }
-
-    const int n_chunks = static_cast<int>(std::min<int64_t>(
-        n_lines, static_cast<int64_t>(eff_threads) * DISPATCH_CHUNKS_PER_THREAD));
-    const int64_t chunk_sz = (n_lines + n_chunks - 1) / n_chunks;
-    std::atomic<int> tid_next{0};
-    std::atomic<int> chunk_next{0};
-    pool.parallel([&]() {
-        const int my_tid = tid_next.fetch_add(1, std::memory_order_relaxed);
-        if (my_tid >= eff_threads) return;
-        auto& sc = scratch[my_tid];
-        int32_t* vp = sc.v.data();
-        int32_t* lp = sc.lblstk.data();
-        int32_t* gp = sc.g.data();
-        double* zp = sc.z.data();
-        double* vdp = sc.vd.data();
-        double* vdsqp = sc.vd_sq.data();
-        int idx;
-        while ((idx = chunk_next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
-            const int64_t k0 = static_cast<int64_t>(idx) * chunk_sz;
-            const int64_t k1 = std::min(k0 + chunk_sz, n_lines);
-            for (int64_t k = k0; k < k1; ++k) {
-                const int64_t a = k / C;
-                const int64_t c = k % C;
+    dispatch_parallel_with_scratch(pool, eff_threads,
+        static_cast<size_t>(n_lines),
+        static_cast<size_t>(eff_threads) * DISPATCH_CHUNKS_PER_THREAD,
+        scratch,
+        [&](EnvelopeScratch& sc, size_t k0, size_t k1) {
+            int32_t* vp = sc.v.data(); int32_t* lp = sc.lblstk.data();
+            int32_t* gp = sc.g.data();
+            double* zp = sc.z.data();  double* vdp = sc.vd.data();
+            double* vdsqp = sc.vd_sq.data();
+            for (size_t k = k0; k < k1; ++k) {
+                const int64_t a = static_cast<int64_t>(k) / C;
+                const int64_t c = static_cast<int64_t>(k) % C;
                 const int64_t base = a * B * C + c;
-                run_row(h_lbl + base, h_dist + base, vp, lp, gp, zp, vdp, vdsqp);
+                int32_t* l = h_lbl + base;
+                int32_t* d = h_dist + base;
+                if (wrap) envelope_pass_row_wrap(l, d, B, /*stride=*/C, vp, lp, gp, zp, vdp, vdsqp);
+                else      envelope_pass_row     (l, d, B, /*stride=*/C, vp, lp, gp, zp, vdp, vdsqp);
             }
-        }
-    });
+        });
 }
 
 // 4x4 in-register transpose for 32-bit elements. src is 4 rows of 4 ints
