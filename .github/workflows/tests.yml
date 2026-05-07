@@ -1,0 +1,47 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ["*"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test ${{ matrix.os }} Py ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package + test deps
+        env:
+          NCOLOR_NO_CALIBRATE: "1"
+          NCOLOR_MARCH_NATIVE: "0"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade build pytest pytest-cov
+          python -m pip install -e .
+
+      - name: Run tests
+        run: pytest -q --cov=ncolor --cov-report=xml --junitxml=junit.xml
+
+      - name: Upload coverage + junit (macOS only)
+        if: matrix.os == 'macos-latest' && matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            coverage.xml
+            junit.xml
+          if-no-files-found: warn

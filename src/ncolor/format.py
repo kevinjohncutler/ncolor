@@ -176,9 +176,8 @@ def endpoints_nd(skel):
 
     ndim = skel.ndim
 
-    # Choose connectivity based on dimensionality
-    # For 2D, use 8-connectivity to match the original mahotas implementation
-    # For higher dimensions, use face connectivity
+    # Choose connectivity by dimensionality: 8-conn (diagonals) for 2D
+    # — mahotas-compatible default; face-only for ndim ≥ 3.
     if ndim == 2:
         connectivity = ndimage.generate_binary_structure(ndim, 2)  # 8-connectivity
     else:
@@ -198,101 +197,13 @@ def endpoints_nd(skel):
 
     return endpoints
 
-def endpoints_nd_alternative(skel):  # pragma: no cover
-    """
-    Alternative implementation using labeled components approach.
-    This might be more accurate for complex skeleton structures.
-    """
-    from scipy import ndimage
-
-    # Create connectivity structure
-    ndim = skel.ndim
-    connectivity = ndimage.generate_binary_structure(ndim, 1)
-
-    # For each foreground pixel, count connected foreground neighbors
-    # We'll use a more sophisticated approach with binary_dilation
-
-    # Dilate by 1 pixel to get neighborhood
-    dilated = ndimage.binary_dilation(skel, connectivity)
-
-    # The difference gives us the boundary
-    boundary = dilated & ~skel
-
-    # For each foreground pixel, count how many boundary pixels it touches
-    # This is equivalent to counting neighbors
-
-    # Use distance transform to find pixels with minimal connectivity
-    # Actually, let's use a simpler approach with convolution
-
-    # Create a kernel that counts neighbors
-    kernel = connectivity.astype(np.float32)
-    kernel[tuple(np.array(kernel.shape) // 2)] = 0  # Don't count center
-
-    # Count neighbors
-    neighbor_count = ndimage.convolve(skel.astype(np.float32), kernel, mode='constant', cval=0)
-
-    # Endpoints have exactly 1 neighbor
-    endpoints = (skel > 0) & (neighbor_count == 1)
-
-    return endpoints
-
 # Current endpoints function - uses the ND version
 def endpoints(skel):
     """
-    Detect endpoints in a skeleton. Now uses the N-dimensional implementation.
+    Detect endpoints in a skeleton. Uses the ND scipy.ndimage implementation.
     """
     return endpoints_nd(skel)
 
-# Keep the original function for comparison (renamed)
-def endpoints_original_2d(skel):  # pragma: no cover
-    pad = 1 # appears to require padding to work properly....
-    skel = np.pad(skel,pad)
-    endpoint1=np.array([[0, 0, 0],
-                        [0, 1, 0],
-                        [2, 1, 2]])
-    
-    endpoint2=np.array([[0, 0, 0],
-                        [0, 1, 2],
-                        [0, 2, 1]])
-    
-    endpoint3=np.array([[0, 0, 2],
-                        [0, 1, 1],
-                        [0, 0, 2]])
-    
-    endpoint4=np.array([[0, 2, 1],
-                        [0, 1, 2],
-                        [0, 0, 0]])
-    
-    endpoint5=np.array([[2, 1, 2],
-                        [0, 1, 0],
-                        [0, 0, 0]])
-    
-    endpoint6=np.array([[1, 2, 0],
-                        [2, 1, 0],
-                        [0, 0, 0]])
-    
-    endpoint7=np.array([[2, 0, 0],
-                        [1, 1, 0],
-                        [2, 0, 0]])
-    
-    endpoint8=np.array([[0, 0, 0],
-                        [2, 1, 0],
-                        [1, 2, 0]])
-    
-    import mahotas as mh
-    ep1=mh.morph.hitmiss(skel,endpoint1)
-    ep2=mh.morph.hitmiss(skel,endpoint2)
-    ep3=mh.morph.hitmiss(skel,endpoint3)
-    ep4=mh.morph.hitmiss(skel,endpoint4)
-    ep5=mh.morph.hitmiss(skel,endpoint5)
-    ep6=mh.morph.hitmiss(skel,endpoint6)
-    ep7=mh.morph.hitmiss(skel,endpoint7)
-    ep8=mh.morph.hitmiss(skel,endpoint8)
-    ep = ep1+ep2+ep3+ep4+ep5+ep6+ep7+ep8
-    unpad =  tuple([slice(pad,-pad)]*ep.ndim)
-    ep = ep[unpad]
-    return ep
-    
 
 # import sys
 # sys.modules[__name__] = format_labels

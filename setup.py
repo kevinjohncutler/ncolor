@@ -37,25 +37,34 @@ install_deps = [
     "scipy",
     "fastremap",
     "scikit-image",
-    "mahotas>=1.4.13",
     "platformdirs",  # used by the SMT calibration cache + native loader
 ]
 
 extra_compile_args = []
 extra_link_args = []
 USE_CLANG_CL = os.environ.get("NCOLOR_USE_CLANG_CL") == "1"
+# -march=native picks AVX2/AVX512 on Zen, NEON 4×4 transpose on Apple
+# Silicon, etc. — but produces wheels that crash on older CPUs. Default
+# ON for source builds (developer machines), OFF in cibuildwheel where
+# we want a portable baseline. The arm64 SIMD paths in expand.hpp are
+# gated on ``__aarch64__`` (always true on apple-arm) so they stay on
+# regardless of the march flag.
+MARCH_NATIVE = os.environ.get("NCOLOR_MARCH_NATIVE", "1") == "1"
 
 if sys.platform == "win32":
-    extra_compile_args += ["/std:c++17", "/O2", "/arch:AVX2", "/EHsc"]
+    extra_compile_args += ["/std:c++17", "/O2", "/EHsc"]
+    if MARCH_NATIVE:
+        extra_compile_args += ["/arch:AVX2"]
     if USE_CLANG_CL:
-        # clang-cl maps /O2 -> -O2; push to -O3 + -march=native via /clang:.
-        # Without LTO the host MS link.exe is fine; with LTO use lld-link.
+        # clang-cl maps /O2 -> -O2; push to -O3 + (optionally) -march=native
+        # via /clang:. Without LTO the host MS link.exe is fine.
         extra_compile_args += [
             "/clang:-O3",
-            "/clang:-march=native",
             "/clang:-ffp-contract=fast",
             "/clang:-funroll-loops",
         ]
+        if MARCH_NATIVE:
+            extra_compile_args += ["/clang:-march=native"]
         # Monkey-patch distutils' MSVC compiler to invoke clang-cl instead
         # of cl.exe. clang-cl is an MSVC-compatible Clang frontend (same
         # switches) — distutils sees it as just another `cl.exe`.
@@ -71,11 +80,11 @@ else:
         "-O3",
         "-fPIC",
         "-pthread",
-        # -march=native picks AVX2/AVX512 on Zen, NEON on Apple Silicon.
-        "-march=native",
         "-ffp-contract=fast",  # fuse mul+add -> FMA, matches numba LLVM emission
         "-funroll-loops",
     ]
+    if MARCH_NATIVE:
+        extra_compile_args += ["-march=native"]
     extra_link_args += ["-pthread"]
     if sys.platform == "darwin":
         extra_compile_args += ["-mmacosx-version-min=10.14"]

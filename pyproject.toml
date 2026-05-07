@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61", "wheel", "setuptools_scm"]
+requires = ["setuptools>=61", "wheel", "setuptools_scm", "pybind11>=2.11"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,6 +13,34 @@ dynamic = ["version", "description", "readme", "authors", "classifiers", "depend
 
 [tool.setuptools_scm]
 write_to = "src/ncolor/_version.py"
+# Avoid date-stamped local versions (post-commit dev tags) in built wheels —
+# PyPI rejects "+local" version suffixes anyway.
+local_scheme = "no-local-version"
+
+[tool.cibuildwheel]
+# Supported stable CPython versions. Bump as new ones land / EOLs roll off.
+build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+# Skip musl Linux (no numba wheel for musllinux at time of writing).
+skip = ["*-musllinux*"]
+# build is the modern PEP 517 frontend (replaces legacy setup.py bdist_wheel).
+build-frontend = "build"
+# Build-time env: skip the SMT calibration (the cache it writes is host-
+# specific and would bake the build-host's calibration into the wheel),
+# and turn off -march=native so wheels are portable across CPU vintages.
+environment = { NCOLOR_NO_CALIBRATE = "1", NCOLOR_MARCH_NATIVE = "0" }
+# Smoke-test each wheel inside the cibuildwheel container.
+test-requires = ["pytest"]
+test-command = "pytest -q {project}/tests"
+
+[tool.cibuildwheel.macos]
+# Match the floor in setup.py's -mmacosx-version-min so the wheel tag and
+# the actual binary agree.
+environment = { NCOLOR_NO_CALIBRATE = "1", NCOLOR_MARCH_NATIVE = "0", MACOSX_DEPLOYMENT_TARGET = "10.14" }
+
+[tool.cibuildwheel.windows]
+# arm64 build doesn't have CPython 3.10 wheels available; cibuildwheel
+# already picks the Python versions it can find — leaving this here in
+# case we need to override per-arch later.
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "test_files"]
