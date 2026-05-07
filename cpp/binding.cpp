@@ -239,28 +239,14 @@ public:
 
     int n_threads() const { return n_threads_; }
 
-    // ncolor.label(mask, n=4, expand=True, return_n=False) for 2D conn=1.
-    // Returns (colored_image, n_colors_used).
-    // The coloring step is single-attempt with 4 colors — for the rare graph
-    // where 4 colors aren't enough or BFS fails to converge, the caller
-    // should fall back to ncolor.label (which has the full repair chain).
-    //
-    // ``p`` selects the expand metric: p=2 (Felzenszwalb parabolic
-    // envelope, default — bit-identical to numba's L2 expand) or p=1
-    // (Saito-Toriwaki sweep — Manhattan distance, ~5× faster at 2048²).
-    // Boundary placement under p=1 differs from p=2 at ~5% of pixels;
-    // the adjacency graph is nearly always isomorphic — the 4-coloring
-    // still works either way.
-    // Per-stage timing breakdown (filled by `label` when capture_stages=true).
-    std::vector<std::pair<std::string, double>> last_stages_;
+    // Per-stage timing breakdown of the most recent label() call. Empty
+    // unless capture_stages=true was passed.
     std::vector<std::pair<std::string, double>> get_last_stages() const { return last_stages_; }
 
-    // Adjacency pairs for a label image, mirroring ncolor.color.connect.
-    // Takes the image directly (any of the supported integer dtypes) and
-    // returns an (M, 2) int32 array of unique (lo, hi) pairs of adjacent
-    // labels under connectivity ``conn`` (1..ndim). 2D conn=2 takes the
-    // unpadded fast path; everything else pads and uses the generic
-    // hashset parallel search.
+    // Adjacency pairs for a label image. Takes the image directly (any of
+    // the supported integer dtypes) and returns an (M, 2) int32 array of
+    // unique (lo, hi) pairs of adjacent labels under connectivity ``conn``
+    // (1..ndim). Routes through the unified ND unpadded scan kernel.
     py::array_t<int32_t> connect(py::array mask, int conn = 1, bool wrap = false) {
         if (!(mask.flags() & py::array::c_style)) {
             mask = py::array::ensure(mask, py::array::c_style);
@@ -717,6 +703,7 @@ private:
     std::vector<uint8_t> colors_;
     std::vector<uint8_t> lut_;
     int last_n_conflicts_ = 0;
+    std::vector<std::pair<std::string, double>> last_stages_;
     // Per-attempt scratch for parallel coloring (one colors vector per
     // racing attempt). Reused across calls.
     std::vector<std::vector<uint8_t>> per_attempt_colors_;
@@ -760,13 +747,14 @@ PYBIND11_MODULE(_impl, m) {
              "block. Returns (formatted_array, n_labels).");
 
     py::class_<Solver>(m, "Solver",
-        "End-to-end ncolor.label() equivalent for 2D conn=1 inputs.\n"
-        "Wraps a single ThreadPool and re-uses all intermediate buffers,\n"
-        "so the per-call cost is just task enqueue + the actual work.\n"
-        "Returns (colored_image_uint8, n_colors_used).\n"
+        "End-to-end ncolor.label() equivalent. Wraps a single ThreadPool\n"
+        "and re-uses all intermediate buffers, so the per-call cost is just\n"
+        "task enqueue + the actual work. Returns (colored_image_uint8,\n"
+        "n_colors_used).\n"
         "\n"
-        "Supports 2D and 3D inputs. ``Solver.label(mask, conn=2)`` mirrors\n"
-        "ncolor.label's 2D default (8-connectivity); for 3D pass conn∈{1,2,3}.\n"
+        "Supports any ndim ≥ 2. conn ∈ [1, ndim] with\n"
+        "scipy.ndimage.generate_binary_structure semantics (e.g. 2D conn=2\n"
+        "is 8-connectivity; 3D conn=3 is 26-connectivity).\n"
         "\n"
         "n_threads conventions:\n"
         "  -1 (default), 0, negative  → auto (use cached calibration)\n"
@@ -783,20 +771,17 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("format_input") = true, py::arg("expand") = true,
              py::arg("out") = py::none(), py::arg("color_mode") = -1,
              py::arg("wrap") = false, py::arg("balance") = false,
-             "Run [format_labels →] [expand →] connect → CSR → color → apply_lut.\n"
-             "Supports 2D and 3D inputs (any ndim ≥ 2 actually).\n"
-             "conn: 2D ∈ {1, 2}, 3D ∈ {1, 2, 3}. Matches\n"
-             "scipy.ndimage.generate_binary_structure semantics. The 2D conn=2\n"
-             "case takes a fast path that skips padding (~1 ms saved at 2048²).\n"
-             "p selects the expand metric: p=2 (Felzenszwalb parabolic\n"
-             "envelope, default) or p=1 (Saito-Toriwaki sweep, ~5× faster\n"
-             "with slightly different boundary placement at ties).\n"
+             "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
+             "Any ndim ≥ 2; conn ∈ [1, ndim].\n"
+             "p selects the expand metric: p=1 (Saito-Toriwaki sweep,\n"
+             "Manhattan, default) or p=2 (Felzenszwalb parabolic envelope,\n"
+             "Euclidean²) — different boundary placement at ties.\n"
              "format_input=True (default) compacts non-sequential nonzero\n"
              "labels to 1..N in-place inside the released-GIL section.\n"
              "Precondition: bg=0 in the input. Pass format_input=False if\n"
              "labels are already 1..N (saves ~one full-image pass).\n"
              "Background masking (output=0 wherever input=0) is always\n"
-             "applied in the apply_lut step.\n"
+             "applied alongside the LUT in the final stage.\n"
              "out: optional preallocated uint8 array of the same shape as\n"
              "mask. If supplied, results are written there and returned\n"
              "instead of allocating a new array — useful for batch\n"

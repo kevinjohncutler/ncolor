@@ -51,12 +51,11 @@ struct LpExpand<2> {
                        const std::vector<int64_t>& shape,
                        ForkJoinPool& pool, int n_threads, bool wrap = false) {
         // wrap=true routes the inner envelope sweeps through their
-        // ghost-seed (toroidal) variants — see expand.hpp's
-        // envelope_pass_row_contig_impl<true> for the algorithm. The
-        // innermost-axis pass0 fast path is skipped in wrap mode (its
-        // midpoint trick doesn't generalise cleanly to torus tie-break);
-        // expand_labels_inplace falls back to envelope_pass(wrap=true)
-        // there. ~2-3× the standard envelope cost.
+        // ghost-seed (toroidal) variants — see envelope_pass_row_impl
+        // <Wrap=true> in expand.hpp. The innermost-axis pass0 fast path
+        // is skipped in wrap mode (its midpoint trick doesn't generalise
+        // cleanly to torus tie-break); expand_labels_inplace falls back
+        // to envelope_pass(wrap=true) there. ~2-3× the standard cost.
         expand_labels_inplace(input, bufs, shape, pool, n_threads, wrap);
         if (output != bufs.lbl()) {
             std::memcpy(output, bufs.lbl(), bufs.size() * sizeof(int32_t));

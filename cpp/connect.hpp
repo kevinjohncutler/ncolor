@@ -30,6 +30,11 @@ constexpr uint64_t HT_EMPTY = 0xFFFFFFFFFFFFFFFFull;
 // Knuth's golden-ratio multiplicative hash (matches ncolor's @njit constant).
 constexpr uint64_t HT_HASH_MUL = 11400714819323198485ull;
 
+// Realistic upper bound for ndim. Used to size stack-allocated coord
+// arrays in the scan kernels. Limits exotic >16D inputs; the public
+// dispatcher rejects ndim above this.
+constexpr int FIND_PAIRS_MAX_NDIM = 16;
+
 // Insert ``key`` into a power-of-two-sized linear-probing hashtable.
 // ``ht_mask`` must be ``ht_size - 1``.  Idempotent (silently ignores duplicates).
 inline void ht_insert(uint64_t* ht, uint64_t ht_mask, uint64_t key) {
@@ -262,11 +267,10 @@ inline void scan_band_unpadded(
     // had: split inner axis into [0], [1, W-1), [W-1] and the middle slice
     // touches only the pre-computed nb_flat[k] offsets — no per-pixel
     // coord arithmetic, no boundary mask updates.
-    constexpr int MAX_NDIM = 16;  // realistic upper bound; trips fast in practice
     const int inner = ndim - 1;
     const int64_t W = shape[inner];           // inner-axis length
     const uint32_t inner_bit = 1u << inner;
-    int64_t coords[MAX_NDIM] = {0};
+    int64_t coords[FIND_PAIRS_MAX_NDIM] = {0};
     coords[0] = outer_start;
     uint32_t outer_bnd = 0;                   // bnd mask for coords[0..ndim-2]
     for (int d = 0; d < inner; ++d) {
@@ -396,7 +400,7 @@ find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
                        int conn, uint64_t ht_size, int n_threads,
                        ForkJoinPool& pool, bool wrap = false) {
     const int ndim = static_cast<int>(shape.size());
-    if (ndim < 2 || ndim > 16 || conn < 1 || conn > ndim) return {};
+    if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM || conn < 1 || conn > ndim) return {};
     return wrap
         ? find_pairs_unpadded_impl<T, true >(lbl, shape, conn, ht_size, n_threads, pool)
         : find_pairs_unpadded_impl<T, false>(lbl, shape, conn, ht_size, n_threads, pool);
