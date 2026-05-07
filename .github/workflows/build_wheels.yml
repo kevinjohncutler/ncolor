@@ -31,13 +31,14 @@ jobs:
             archs_linux: "aarch64"
           - os: windows-latest
             archs_windows: "AMD64"
-          - os: windows-11-arm
-            archs_windows: "ARM64"
-            cibw_build: "cp311-* cp312-* cp313-* cp314-*"  # cp310 lacks win_arm64 wheels
-          - os: macos-13
-            archs_macos: "x86_64"
           - os: macos-latest
             archs_macos: "arm64"
+        # Skipped (covered by sdist):
+        #   - macos-13 x86_64   — Apple stopped shipping Intel hardware in
+        #                          2020; user base ≈ 0 in 2026, GitHub's
+        #                          Intel runners have multi-hour queues.
+        #   - windows-11-arm    — numba's llvmlite has no win_arm64 wheel
+        #                          and won't source-build cleanly.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,9 +49,6 @@ jobs:
         with:
           output-dir: ./wheelhouse
         env:
-          # ``cibw_build`` matrix override beats the [tool.cibuildwheel] default
-          # for the Windows ARM64 row.
-          CIBW_BUILD: ${{ matrix.cibw_build || '' }}
           CIBW_ARCHS_LINUX: ${{ matrix.archs_linux }}
           CIBW_ARCHS_WINDOWS: ${{ matrix.archs_windows }}
           CIBW_ARCHS_MACOS: ${{ matrix.archs_macos }}
