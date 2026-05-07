@@ -88,7 +88,10 @@ static inline void envelope_fill_simd(
         vst1q_s32(dist + i, v_dist);
         v_i = vaddq_s32(v_i, v_four);
     }
-#elif defined(__SSE2__)
+#elif defined(__SSE4_1__)
+    // SSE4.1 (Penryn / Bulldozer +). Pure SSE2 lacks _mm_mullo_epi32, and
+    // the scalar tail below covers that case at no perf cost (the caller
+    // typically processes whole 4-wide blocks on modern x86_64 anyway).
     const __m128i v_lbl = _mm_set1_epi32(lbl_j);
     const __m128i v_g   = _mm_set1_epi32(g_j);
     const __m128i v_vj  = _mm_set1_epi32(v_j);
@@ -96,15 +99,9 @@ static inline void envelope_fill_simd(
     __m128i v_i = _mm_add_epi32(_mm_set1_epi32(static_cast<int32_t>(i_start)),
                                 _mm_set_epi32(3, 2, 1, 0));
     for (; i + 4 <= i_end; i += 4) {
-        __m128i v_di = _mm_sub_epi32(v_i, v_vj);
-        // _mm_mullo_epi32 needs SSE4.1; fall back to scalar tail otherwise.
-    #if defined(__SSE4_1__)
+        __m128i v_di    = _mm_sub_epi32(v_i, v_vj);
         __m128i v_di_sq = _mm_mullo_epi32(v_di, v_di);
-    #else
-        // SSE2-only: spill to scalar
-        break;
-    #endif
-        __m128i v_dist = _mm_add_epi32(v_di_sq, v_g);
+        __m128i v_dist  = _mm_add_epi32(v_di_sq, v_g);
         _mm_storeu_si128(reinterpret_cast<__m128i*>(lbl + i), v_lbl);
         _mm_storeu_si128(reinterpret_cast<__m128i*>(dist + i), v_dist);
         v_i = _mm_add_epi32(v_i, v_four);

@@ -66,7 +66,7 @@ static int resolve_threads(double v) {
 // alone breaks across platforms. Throws on unsupported dtype with `api_name`
 // in the error message.
 template <typename Func>
-static inline void dispatch_int_dtype(const std::string& fmt, ssize_t itemsize,
+static inline void dispatch_int_dtype(const std::string& fmt, py::ssize_t itemsize,
                                       const char* api_name, Func&& f) {
     bool is_signed = false, is_unsigned = false;
     if (!fmt.empty()) {
@@ -184,7 +184,7 @@ public:
         // from the worker that owns each chunk, and modern allocators don't
         // zero freshly-mapped pages anyway — net cost is negligible.
         std::vector<py::ssize_t> out_shape(buf.ndim);
-        for (ssize_t d = 0; d < buf.ndim; ++d) out_shape[d] = buf.shape[d];
+        for (py::ssize_t d = 0; d < buf.ndim; ++d) out_shape[d] = buf.shape[d];
         py::array_t<int32_t> out(out_shape);
         int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
 
