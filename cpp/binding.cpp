@@ -95,6 +95,19 @@ static inline void dispatch_int_dtype(const std::string& fmt, ssize_t itemsize,
         "int8/int16/int32/int64)");
 }
 
+// Pack a vector of (lo, hi) adjacency pairs into a fresh (M, 2) int32 array.
+static inline py::array_t<int32_t> pairs_to_array(
+        const std::vector<std::pair<int32_t, int32_t>>& pairs) {
+    const py::ssize_t m = static_cast<py::ssize_t>(pairs.size());
+    py::array_t<int32_t> out({m, py::ssize_t{2}});
+    int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
+    for (py::ssize_t i = 0; i < m; ++i) {
+        out_ptr[i * 2 + 0] = pairs[i].first;
+        out_ptr[i * 2 + 1] = pairs[i].second;
+    }
+    return out;
+}
+
 class ConnectEngine {
 public:
     explicit ConnectEngine(double n_threads)
@@ -134,16 +147,7 @@ public:
                 line_ptr, total, nbs_ptr, n_nbs, ht_size);
         }
 
-        // Pack into (M, 2) int32 ndarray.
-        const py::ssize_t m = static_cast<py::ssize_t>(pairs.size());
-        py::array_t<int32_t> out({m, py::ssize_t{2}});
-        auto out_buf = out.request();
-        int32_t* out_ptr = static_cast<int32_t*>(out_buf.ptr);
-        for (py::ssize_t i = 0; i < m; ++i) {
-            out_ptr[i * 2 + 0] = pairs[i].first;
-            out_ptr[i * 2 + 1] = pairs[i].second;
-        }
-        return out;
+        return pairs_to_array(pairs);
     }
 
 private:
@@ -421,15 +425,7 @@ public:
             }
         }
 
-        // Pack as (M, 2) int32 ndarray.
-        const py::ssize_t m = static_cast<py::ssize_t>(pairs.size());
-        py::array_t<int32_t> out({m, py::ssize_t{2}});
-        int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
-        for (py::ssize_t i = 0; i < m; ++i) {
-            out_ptr[i * 2 + 0] = pairs[i].first;
-            out_ptr[i * 2 + 1] = pairs[i].second;
-        }
-        return out;
+        return pairs_to_array(pairs);
     }
 
     std::pair<py::array_t<uint8_t>, int> label(
