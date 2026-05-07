@@ -36,20 +36,25 @@
 
 namespace ncolor_cpp {
 
-// First-seen-numbering variant: assigns new labels in input scan order,
-// matching fastremap.renumber bit-for-bit. The build pass is inherently
-// serial (we only learn a label is new on first encounter); ~2× slower
-// than ascending-source. Available as an opt-in via
-// `ncolor.format_labels(arr, first_seen=True)` when the caller relies on
-// the historical fastremap output ordering.
-inline int32_t format_labels_inplace_first_seen(
-        int32_t* lbl, int64_t total,
-        ForkJoinPool& pool, int n_threads) {
-    if (total <= 0) return 0;
+namespace detail {
+
+// Threshold below which we run serial (parallel overhead exceeds work).
+constexpr int64_t FORMAT_LABELS_SERIAL_THRESHOLD = 500000;
+
+// Shared prologue for the two format_labels_inplace variants:
+//   1. Parallel (min, max) reduce over the array.
+//   2. If min < 0: shift every element by -min so bg moves to 0. Skipped
+//      for min ≥ 0 — the input either already has bg at 0, or has no bg
+//      (every pixel labeled — typical for already-expanded label maps);
+//      shifting would absorb the smallest cell into bg.
+// Returns max_lbl after the optional shift; -1 if the array is empty,
+// constant, or all-non-positive (caller should return 0).
+inline int32_t format_labels_minmax_and_shift(
+        int32_t* lbl, int64_t total, ForkJoinPool& pool, int n_threads) {
     constexpr int32_t INT32_MIN_VAL = std::numeric_limits<int32_t>::min();
     constexpr int32_t INT32_MAX_VAL = std::numeric_limits<int32_t>::max();
     int32_t min_lbl = INT32_MAX_VAL, max_lbl = INT32_MIN_VAL;
-    if (n_threads <= 1 || total < 500000) {
+    if (n_threads <= 1 || total < FORMAT_LABELS_SERIAL_THRESHOLD) {
         for (int64_t i = 0; i < total; ++i) {
             const int32_t v = lbl[i];
             if (v < min_lbl) min_lbl = v;
@@ -84,16 +89,10 @@ inline int32_t format_labels_inplace_first_seen(
             if (maxs[i] > max_lbl) max_lbl = maxs[i];
         }
     }
-    if (max_lbl <= min_lbl) return 0;
-    // Shift to put bg at 0 ONLY when min is negative (e.g. -1 used as bg
-    // by some segmenters). When min == 0 the input already has its bg
-    // at 0; when min > 0 there is no implied bg (every pixel is fg —
-    // typical for already-expanded label maps), so leaving the values
-    // alone preserves the smallest cell rather than absorbing it into
-    // the bg via shift.
+    if (max_lbl <= min_lbl) return -1;
     if (min_lbl < 0) {
         const int32_t shift = -min_lbl;
-        if (n_threads <= 1 || total < 500000) {
+        if (n_threads <= 1 || total < FORMAT_LABELS_SERIAL_THRESHOLD) {
             for (int64_t i = 0; i < total; ++i) lbl[i] += shift;
         } else {
             dispatch_parallel(pool, static_cast<size_t>(total),
@@ -104,7 +103,25 @@ inline int32_t format_labels_inplace_first_seen(
         }
         max_lbl += shift;
     }
-    if (max_lbl <= 0) return 0;
+    if (max_lbl <= 0) return -1;
+    return max_lbl;
+}
+
+}  // namespace detail
+
+// First-seen-numbering variant: assigns new labels in input scan order,
+// matching fastremap.renumber bit-for-bit. The build pass is inherently
+// serial (we only learn a label is new on first encounter); ~2× slower
+// than ascending-source. Available as an opt-in via
+// `ncolor.format_labels(arr, first_seen=True)` when the caller relies on
+// the historical fastremap output ordering.
+inline int32_t format_labels_inplace_first_seen(
+        int32_t* lbl, int64_t total,
+        ForkJoinPool& pool, int n_threads) {
+    if (total <= 0) return 0;
+    const int32_t max_lbl =
+        detail::format_labels_minmax_and_shift(lbl, total, pool, n_threads);
+    if (max_lbl < 0) return 0;
     // Serial build: dense table[l] = remapped_label, assigned on first
     // encounter in input scan order.
     std::vector<int32_t> table(static_cast<size_t>(max_lbl) + 1, 0);
@@ -116,7 +133,7 @@ inline int32_t format_labels_inplace_first_seen(
         }
     }
     if (next_lbl == 0) return 0;
-    if (n_threads <= 1 || total < 500000) {
+    if (n_threads <= 1 || total < detail::FORMAT_LABELS_SERIAL_THRESHOLD) {
         for (int64_t i = 0; i < total; ++i) {
             lbl[i] = table[static_cast<size_t>(lbl[i])];
         }
@@ -136,76 +153,15 @@ inline int32_t format_labels_inplace_first_seen(
 inline int32_t format_labels_inplace(int32_t* lbl, int64_t total,
                                      ForkJoinPool& pool, int n_threads) {
     if (total <= 0) return 0;
-
-    // 1. Parallel min/max reduce in one pass.
-    constexpr int32_t INT32_MIN_VAL = std::numeric_limits<int32_t>::min();
-    constexpr int32_t INT32_MAX_VAL = std::numeric_limits<int32_t>::max();
-    int32_t min_lbl = INT32_MAX_VAL;
-    int32_t max_lbl = INT32_MIN_VAL;
-    if (n_threads <= 1 || total < 500000) {
-        for (int64_t i = 0; i < total; ++i) {
-            const int32_t v = lbl[i];
-            if (v < min_lbl) min_lbl = v;
-            if (v > max_lbl) max_lbl = v;
-        }
-    } else {
-        const size_t n_chunks =
-            static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD;
-        const size_t total_sz = static_cast<size_t>(total);
-        const size_t actual_chunks = std::min(n_chunks, total_sz);
-        const size_t chunk_sz = (total_sz + actual_chunks - 1) / actual_chunks;
-        std::vector<int32_t> mins(actual_chunks, INT32_MAX_VAL);
-        std::vector<int32_t> maxs(actual_chunks, INT32_MIN_VAL);
-        std::atomic<size_t> next{0};
-        pool.parallel([&]() {
-            size_t idx;
-            while ((idx = next.fetch_add(1, std::memory_order_relaxed))
-                   < actual_chunks) {
-                const size_t i0 = idx * chunk_sz;
-                const size_t i1 = std::min(i0 + chunk_sz, total_sz);
-                int32_t mn = INT32_MAX_VAL, mx = INT32_MIN_VAL;
-                for (size_t i = i0; i < i1; ++i) {
-                    const int32_t v = lbl[i];
-                    if (v < mn) mn = v;
-                    if (v > mx) mx = v;
-                }
-                mins[idx] = mn;
-                maxs[idx] = mx;
-            }
-        });
-        for (size_t i = 0; i < actual_chunks; ++i) {
-            if (mins[i] < min_lbl) min_lbl = mins[i];
-            if (maxs[i] > max_lbl) max_lbl = maxs[i];
-        }
-    }
-    if (max_lbl <= min_lbl) return 0;  // empty or constant array.
-
-    // Shift to put bg at 0 ONLY when min is negative (e.g. -1 used as bg
-    // by some segmenters). For min >= 0 the input either already has bg
-    // at 0 OR has no bg (every pixel labeled — typical for already-
-    // expanded label maps); shifting in the latter case would absorb
-    // the smallest cell into the bg. Same fix as in
-    // format_labels_inplace_first_seen — both variants must agree.
-    if (min_lbl < 0) {
-        const int32_t shift = -min_lbl;
-        if (n_threads <= 1 || total < 500000) {
-            for (int64_t i = 0; i < total; ++i) lbl[i] += shift;
-        } else {
-            dispatch_parallel(pool, static_cast<size_t>(total),
-                static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD,
-                [lbl, shift](size_t i0, size_t i1) {
-                    for (size_t i = i0; i < i1; ++i) lbl[i] += shift;
-                });
-        }
-        max_lbl += shift;  // min_lbl is now 0.
-    }
-    if (max_lbl <= 0) return 0;
+    const int32_t max_lbl =
+        detail::format_labels_minmax_and_shift(lbl, total, pool, n_threads);
+    if (max_lbl < 0) return 0;
 
     // 2. Mark present labels. Concurrent writes of value 1 to the same
     // byte are a benign race in practice; std::memory_order_relaxed
     // atomics aren't strictly needed (every write is value-stable).
     std::vector<uint8_t> present(static_cast<size_t>(max_lbl) + 1, 0);
-    if (n_threads <= 1 || total < 500000) {
+    if (n_threads <= 1 || total < detail::FORMAT_LABELS_SERIAL_THRESHOLD) {
         for (int64_t i = 0; i < total; ++i) {
             const int32_t v = lbl[i];
             if (v > 0) present[static_cast<size_t>(v)] = 1;
@@ -233,7 +189,7 @@ inline int32_t format_labels_inplace(int32_t* lbl, int64_t total,
     if (next_lbl == max_lbl) return next_lbl;
 
     // 5. Apply remap.
-    if (n_threads <= 1 || total < 500000) {
+    if (n_threads <= 1 || total < detail::FORMAT_LABELS_SERIAL_THRESHOLD) {
         for (int64_t i = 0; i < total; ++i) {
             lbl[i] = remap[static_cast<size_t>(lbl[i])];
         }
