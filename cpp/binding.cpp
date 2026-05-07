@@ -558,24 +558,35 @@ private:
             static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap);
     }
 
-    // Coloring loop: BFS attempt → conflict-check → repair fallback,
-    // wrapped in attempts_per_n random-offset attempts at each cur_n,
-    // bumping cur_n if all attempts fail. Mirrors the numba ``_solver``
-    // retry chain (sans Kempe-chain swaps; rare for the planar graphs
-    // ncolor sees in practice).
+    // Coloring loop: try the user-preferred algorithm first, switch to
+    // the alternate algorithm before bumping cur_n. Welsh-Powell and
+    // BFS-with-random-restarts have nearly disjoint failure modes on
+    // planar adjacency graphs — running both at each cur_n nearly
+    // eliminates the cur_n→cur_n+1 bump that was costing ~10% of L2
+    // colorings on hard inputs.
     //
-    // The attempts at each cur_n only differ in the LCG seed used for
-    // BFS restart, so for N+M ≥ 500 we race them in parallel on the pool.
-    // Wall-clock becomes max(attempt_time) per cur_n iteration instead of
-    // sum. Smaller graphs fall back to the serial path (dispatch overhead
-    // dominates the BFS).
+    // Slot assignment within attempts_per_n at each cur_n:
+    //   balance=True   slots: [WP,  BFS, BFS, BFS]
+    //                  WP first (uniform colour distribution); on failure
+    //                  three BFS variants with offsets {1, 2, 3} as
+    //                  fallback before bumping cur_n.
+    //   balance=False  slots: [BFS, BFS, BFS, WP]
+    //                  BFS first (user-preferred ordering, deterministic
+    //                  ID-order visit); on failure WP with offset 3 as
+    //                  last-ditch alternative before bumping cur_n.
     //
-    // Welsh-Powell ordering covers attempts [0, attempts_per_n - 1) when
-    // ``balance`` is on; the last attempt is reserved as a label-ID
-    // fallback that recovers from edge cases (e.g. L2 + wrap occasionally
-    // pushes some cells to a 5th colour with WP). WP attempts must be
-    // CLEAN to count — repair tends to merge colours unevenly, so a
-    // repaired WP coloring is usually less balanced than the safety net.
+    // Lowest-index successful attempt wins, so the user-preferred algo
+    // is preserved whenever it succeeds. Big graphs (N+M ≥ 500) race
+    // the 4 attempts in parallel on the pool; small graphs run them
+    // serially (dispatch overhead would exceed BFS work).
+    //
+    // ``WP must be CLEAN to count`` rule is retained: a repaired WP
+    // coloring loses its uniform-distribution advantage, so we'd rather
+    // fall through to a clean BFS than accept a repaired WP. Under
+    // balance=False this means a conflicted-WP fallback doesn't save us
+    // from bumping cur_n — but in practice WP needing repair on the
+    // graphs that already failed three BFS attempts is vanishingly
+    // rare.
     //
     // Side effects: writes the winning coloring into ``colors_`` and the
     // adjacency-conflict count into ``last_n_conflicts_``. Returns
@@ -615,7 +626,11 @@ private:
                     while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < attempts_per_n) {
                         auto& cv = per_attempt_colors_[idx];
                         const int attempt_offset = local_depth + idx;
-                        const bool wp = balance && (idx < attempts_per_n - 1);
+                        // Slot 0 = user-preferred algorithm; remaining
+                        // slots = alternate algorithm with different
+                        // random offsets (algorithm-switching fallback).
+                        const bool wp = balance ? (idx == 0)
+                                                : (idx == attempts_per_n - 1);
                         const bool finished = ncolor_cpp::color_graph_csr_legacy(
                             ip, ix, N, local_cur_n, rand_period,
                             attempt_offset, max_iter, cv, wp);
@@ -639,7 +654,8 @@ private:
                 }
             } else {
                 for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
-                    const bool wp = balance && (attempt < attempts_per_n - 1);
+                    const bool wp = balance ? (attempt == 0)
+                                            : (attempt == attempts_per_n - 1);
                     const bool finished = ncolor_cpp::color_graph_csr_legacy(
                         indptr_.data(), indices_.data(), N,
                         cur_n, rand_period, depth + attempt, max_iter,
