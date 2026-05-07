@@ -222,6 +222,12 @@ static inline int64_t ipow2_ge(int64_t v) {
     return p;
 }
 
+// Minimum hashtable capacity for the find_pairs scan. Below this the
+// power-of-two rounding gives degenerate sizes that hurt insert
+// throughput on tiny graphs; the cost of overshooting is just a few
+// hundred bytes per worker.
+static constexpr int64_t MIN_HT_SIZE = 16;
+
 // Solver: end-to-end ncolor.label equivalent in C++. Owns a thread pool +
 // the scratch buffers for cast / format_labels / expand / connect / CSR
 // build / coloring / apply_lut.
@@ -294,22 +300,8 @@ public:
                         *pool_, n_threads_);
                 });
 
-            // Find max for hashtable sizing.
-            int32_t max_label = 0;
-            for (int64_t i = 0; i < total; ++i) {
-                if (labels[i] > max_label) max_label = labels[i];
-            }
-            if (max_label == 0) {
-                // Empty input — no pairs.
-            } else {
-                // Unified ND unpadded: ht size from forward-neighbour count.
-                const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbours(ndim, conn);
-                const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
-                const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
-                pairs = ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
-                    labels, shape, conn,
-                    static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap);
-            }
+            const int32_t max_label = parallel_max_label_(labels, total);
+            pairs = find_pairs_(labels, shape, conn, wrap, max_label);
         }
 
         return pairs_to_array(pairs);
@@ -443,17 +435,8 @@ public:
             // (was a single-threaded 1.2 ms loop at 2048²).
             const int32_t max_label = parallel_max_label_(expanded, total);
             stage("max_scan");
-            std::vector<std::pair<int32_t, int32_t>> pairs;
-            {
-                // Unified ND unpadded find_pairs: one path for any
-                // (ndim ≥ 2, conn ∈ [1, ndim]) combination.
-                const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbours(ndim, conn);
-                const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
-                const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
-                pairs = ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
-                    expanded, shape, conn,
-                    static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap);
-            }
+            std::vector<std::pair<int32_t, int32_t>> pairs =
+                find_pairs_(expanded, shape, conn, wrap, max_label);
             stage("find_pairs");
 
             // 3. Build CSR (labels are 1..max_label after expand → node = label-1).
@@ -570,6 +553,23 @@ private:
             if (partials_[i] > max_label) max_label = partials_[i];
         }
         return max_label;
+    }
+
+    // Find adjacency pairs in an int32 label image. Sizes the hashtable
+    // from the (ndim, conn) connectivity's forward-neighbour count and
+    // the maximum label value, then dispatches to the ND scan kernel.
+    // Returns {} for an empty input (max_label == 0).
+    std::vector<std::pair<int32_t, int32_t>> find_pairs_(
+            const int32_t* labels, const std::vector<int64_t>& shape,
+            int conn, bool wrap, int32_t max_label) {
+        if (max_label == 0) return {};
+        const int ndim = static_cast<int>(shape.size());
+        const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbours(ndim, conn);
+        const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
+        const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE));
+        return ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
+            labels, shape, conn,
+            static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap);
     }
 
     // Coloring loop: BFS attempt → conflict-check → repair fallback,
