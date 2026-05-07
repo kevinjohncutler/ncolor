@@ -1,7 +1,22 @@
 import numpy as np
+import pytest
 
 from ncolor.format import format_labels
-from ncolor.label_experimental_wip import _format_labels_experimental
+
+# label_experimental_wip is local dev scratch (untracked, not shipped). When
+# the user has it on disk the parity-vs-reference tests below run; on a clean
+# checkout (e.g. CI building from actions/checkout) they skip.
+try:
+    from ncolor.label_experimental_wip import _format_labels_experimental
+    HAS_EXPERIMENTAL = True
+except ImportError:
+    _format_labels_experimental = None
+    HAS_EXPERIMENTAL = False
+
+needs_experimental = pytest.mark.skipif(
+    not HAS_EXPERIMENTAL,
+    reason="ncolor.label_experimental_wip is dev scratch, not shipped in the package",
+)
 
 
 def test_format_labels_handles_negative_background():
@@ -37,6 +52,7 @@ def test_format_labels_clean_removes_single_pixel_regions():
     assert np.count_nonzero(out == 1) == 4
 
 
+@needs_experimental
 def test_experimental_formatter_matches_reference_random_inputs():
     """Both formatters compact labels to 1..N with bg=0 and the same
     bg-mask. They differ only in the permutation of new labels (the
@@ -65,6 +81,7 @@ def test_experimental_formatter_matches_reference_random_inputs():
             assert ref_vals.size == 1 and fast_vals.size == 1
 
 
+@needs_experimental
 def test_format_labels_first_seen_matches_fastremap_bit_for_bit():
     """When opted-in, first_seen=True should produce bit-identical output
     to fastremap.renumber (which is what _format_labels_experimental
@@ -78,6 +95,7 @@ def test_format_labels_first_seen_matches_fastremap_bit_for_bit():
         assert np.array_equal(prod, legacy)
 
 
+@needs_experimental
 def test_experimental_formatter_falls_back_when_clean_requested():
     arr = np.array([[0, 1], [0, 0]], dtype=np.int32)
     ref = format_labels(arr.copy(), clean=True, min_area=2, background=0)
