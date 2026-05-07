@@ -1,9 +1,9 @@
 /*
- * Pybind11 binding for ncolor C++. Exposes three classes — each wraps a
+ * Pybind11 binding for ncolor C++. Exposes two classes — each wraps a
  * persistent ForkJoinPool, so callers construct once and reuse:
- *   - ``ConnectEngine``  : adjacency-pair search (``find_pairs``)
- *   - ``ExpandEngine``   : Voronoi label expansion (``expand_labels``)
- *   - ``Solver``         : end-to-end ncolor.label pipeline
+ *   - ``ExpandEngine``  : Voronoi label expansion (``expand_labels``)
+ *   - ``Solver``        : end-to-end ncolor.label pipeline (``label`` /
+ *                        ``connect``)
  */
 
 #include <pybind11/pybind11.h>
@@ -107,53 +107,6 @@ static inline py::array_t<int32_t> pairs_to_array(
     }
     return out;
 }
-
-class ConnectEngine {
-public:
-    explicit ConnectEngine(double n_threads)
-        : n_threads_(resolve_threads(n_threads)),
-          pool_(std::make_unique<ncolor_cpp::ForkJoinPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
-
-    int n_threads() const { return n_threads_; }
-
-    // Match ncolor.color.connect's signature: takes the padded label line as
-    // a 1D int32 array, neighbor offsets as int64, and a power-of-two hash
-    // table size. Returns an (M, 2) int32 numpy array of unique (lo, hi) pairs.
-    py::array_t<int32_t> find_pairs(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> line,
-            py::array_t<int64_t, py::array::c_style | py::array::forcecast> nbs,
-            uint64_t ht_size,
-            int parallel_threshold = 100000) {
-        const auto line_buf = line.request();
-        const auto nbs_buf = nbs.request();
-        if (line_buf.ndim != 1) throw std::invalid_argument("line must be 1D");
-        if (nbs_buf.ndim != 1) throw std::invalid_argument("nbs must be 1D");
-        if ((ht_size & (ht_size - 1)) != 0)
-            throw std::invalid_argument("ht_size must be a power of two");
-
-        const int32_t* line_ptr = static_cast<const int32_t*>(line_buf.ptr);
-        const int64_t* nbs_ptr = static_cast<const int64_t*>(nbs_buf.ptr);
-        const int64_t total = line_buf.shape[0];
-        const int n_nbs = static_cast<int>(nbs_buf.shape[0]);
-
-        std::vector<std::pair<int32_t, int32_t>> pairs;
-        if (total > parallel_threshold && n_threads_ > 1) {
-            py::gil_scoped_release release;
-            pairs = ncolor_cpp::search_hashset_parallel<int32_t>(
-                line_ptr, total, nbs_ptr, n_nbs, ht_size, n_threads_, *pool_);
-        } else {
-            py::gil_scoped_release release;
-            pairs = ncolor_cpp::search_hashset_serial<int32_t>(
-                line_ptr, total, nbs_ptr, n_nbs, ht_size);
-        }
-
-        return pairs_to_array(pairs);
-    }
-
-private:
-    int n_threads_;
-    std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
-};
 
 // Persistent-pool wrapper for expand_labels + parallel LUT apply.
 // One ExpandEngine per ncolor.label "pipeline" — the pool + buffers persist
@@ -336,8 +289,9 @@ static inline int64_t ipow2_ge(int64_t v) {
     return p;
 }
 
-// Solver: end-to-end ncolor.label equivalent in C++. Wraps a ConnectEngine
-// and ExpandEngine plus its own scratch for CSR build + coloring.
+// Solver: end-to-end ncolor.label equivalent in C++. Owns a thread pool +
+// the scratch buffers for cast / format_labels / expand / connect / CSR
+// build / coloring / apply_lut.
 class Solver {
 public:
     explicit Solver(double n_threads)
@@ -840,18 +794,6 @@ PYBIND11_MODULE(_impl, m) {
     m.doc() = "ncolor C++ engine: connect / expand / color pipeline + "
               "ForkJoinPool. Public Python API in ncolor.color, ncolor.expand "
               "wraps the engines exposed here.";
-    py::class_<ConnectEngine>(m, "ConnectEngine",
-        "Persistent threadpool wrapper for the search-hashset kernel.\n"
-        "Construct once with the desired worker count; the underlying\n"
-        "std::thread workers live for the engine's lifetime, so call cost\n"
-        "is just task enqueue + dispatch (sub-millisecond on a warm pool).")
-        .def(py::init<double>(), py::arg("n_threads") = -1.0)
-        .def_property_readonly("n_threads", &ConnectEngine::n_threads)
-        .def("find_pairs", &ConnectEngine::find_pairs,
-             py::arg("line"), py::arg("nbs"), py::arg("ht_size"),
-             py::arg("parallel_threshold") = 100000,
-             "Find unique label-adjacency pairs on a 1D padded label line.");
-
     py::class_<ExpandEngine>(m, "ExpandEngine",
         "Persistent threadpool wrapper for expand_labels + apply_lut.\n"
         "One engine per pipeline; the pool and intermediate buffers are\n"

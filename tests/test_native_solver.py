@@ -65,11 +65,11 @@ def test_string_raises():
 
 
 def test_engines_share_convention():
-    """``ConnectEngine`` and ``ExpandEngine`` use the same resolver."""
+    """``ExpandEngine`` and ``Solver`` use the same resolver."""
     expected = _smt.auto_threads()
-    assert nc.ConnectEngine().n_threads == expected
     assert nc.ExpandEngine().n_threads == expected
-    assert nc.ConnectEngine(0.5).n_threads == nc.Solver(0.5).n_threads
+    assert nc.Solver().n_threads == expected
+    assert nc.ExpandEngine(0.5).n_threads == nc.Solver(0.5).n_threads
 
 
 # --- _smt helper -------------------------------------------------------------

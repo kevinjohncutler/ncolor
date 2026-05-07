@@ -135,7 +135,6 @@ _impl = _load_impl()
 # Re-export the public engine classes so ``from ncolor._backend import Solver``
 # works for internal callers (the high-level wrappers in ncolor.color /
 # ncolor.expand).
-ConnectEngine = _impl.ConnectEngine
 ExpandEngine = _impl.ExpandEngine
 Solver = _impl.Solver
 
@@ -175,4 +174,4 @@ def _maybe_calibrate_on_first_import() -> None:
 
 _maybe_calibrate_on_first_import()
 
-__all__ = ["ConnectEngine", "ExpandEngine", "Solver", "_smt"]
+__all__ = ["ExpandEngine", "Solver", "_smt"]

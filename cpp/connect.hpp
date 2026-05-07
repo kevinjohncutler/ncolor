@@ -6,12 +6,7 @@
  * (lo<<32 | hi). The per-thread tables are merged via log2(n_threads)
  * pairwise rounds, and the survivor is walked once to extract unique pairs.
  *
- * Two public entry points:
- *   - search_hashset_parallel<T>(...)  : padded-input legacy API used by
- *                                        ConnectEngine (one extra np.pad
- *                                        on the Python side).
- *   - find_pairs_nd_unpadded<T>(...)   : ND unpadded fast path used by
- *                                        Solver — no pad buffer needed.
+ * Public entry: ``find_pairs_nd_unpadded<T>(...)``.
  */
 
 #ifndef NCOLOR_CONNECT_HPP
@@ -45,29 +40,6 @@ inline void ht_insert(uint64_t* ht, uint64_t ht_mask, uint64_t key) {
     ht[h] = key;
 }
 
-// Per-thread scan: walk a strip of the padded label line and emit every
-// distinct (lo, hi) adjacency into ``ht``.  ``nbs`` are the flat-index
-// neighbor offsets for the connectivity (always positive on a padded image).
-template <typename T>
-void scan_strip(const T* line, int64_t start, int64_t end, int64_t total,
-                const int64_t* nbs, int n_nbs,
-                uint64_t* ht, uint64_t ht_mask) {
-    for (int64_t i = start; i < end; ++i) {
-        const T vi = line[i];
-        if (vi == 0) continue;
-        for (int n = 0; n < n_nbs; ++n) {
-            const int64_t j = i + nbs[n];
-            if (j < 0 || j >= total) continue;
-            const T vj = line[j];
-            if (vj == 0 || vj == vi) continue;
-            const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
-            const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
-            const uint64_t key = (lo << 32) | hi;
-            ht_insert(ht, ht_mask, key);
-        }
-    }
-}
-
 // Merge all entries from ``src`` into ``dst``.  Both tables are size ht_size.
 inline void ht_merge(const uint64_t* src, uint64_t* dst, uint64_t ht_size) {
     const uint64_t ht_mask = ht_size - 1;
@@ -78,79 +50,14 @@ inline void ht_merge(const uint64_t* src, uint64_t* dst, uint64_t ht_size) {
     }
 }
 
-// Public entry point: scan + parallel tree-merge, returns the unique pairs.
-// ``pool`` is reused across calls; constructing it once and passing it in
-// amortizes the std::thread creation cost across many ncolor.label calls.
-template <typename T>
-std::vector<std::pair<int32_t, int32_t>>
-search_hashset_parallel(const T* line, int64_t total,
-                        const int64_t* nbs, int n_nbs,
-                        uint64_t ht_size, int n_threads,
-                        ForkJoinPool& pool) {
-    const uint64_t ht_mask = ht_size - 1;
-
-    // NUCA-correct allocation: workers first-touch their own hashtable slice
-    // with HT_EMPTY so pages map to the worker's L2 cluster rather than the
-    // main thread's.
-    std::unique_ptr<uint64_t[]> hts(new uint64_t[static_cast<size_t>(n_threads) * ht_size]);
-
-    // Phase 1: each worker first-touches its own hashtable + scans its strip.
-    {
-        std::atomic<int> next{0};
-        const int64_t strip = (total + n_threads - 1) / n_threads;
-        pool.parallel([&]() {
-            int t;
-            while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_threads) {
-                uint64_t* ht = hts.get() + static_cast<size_t>(t) * ht_size;
-                std::fill_n(ht, ht_size, HT_EMPTY);
-                const int64_t s = static_cast<int64_t>(t) * strip;
-                const int64_t e = std::min(s + strip, total);
-                scan_strip<T>(line, s, e, total, nbs, n_nbs, ht, ht_mask);
-            }
-        });
-    }
-
-    // Phase 2: pairwise tree merge — log2(n_threads) parallel rounds, each
-    // round folds the second half of every active group into the first half.
-    int stride = 1;
-    while (stride < n_threads) {
-        const int n_pairs = (n_threads + 2 * stride - 1) / (2 * stride);
-        std::atomic<int> next{0};
-        pool.parallel([&]() {
-            int p;
-            while ((p = next.fetch_add(1, std::memory_order_relaxed)) < n_pairs) {
-                const int dst = p * 2 * stride;
-                const int src = dst + stride;
-                if (src >= n_threads) continue;
-                uint64_t* dst_ht = hts.get() + static_cast<size_t>(dst) * ht_size;
-                const uint64_t* src_ht = hts.get() + static_cast<size_t>(src) * ht_size;
-                ht_merge(src_ht, dst_ht, ht_size);
-            }
-        });
-        stride *= 2;
-    }
-
-    // Phase 3: extract unique pairs from workers[0]'s table.
-    std::vector<std::pair<int32_t, int32_t>> out;
-    out.reserve(64);
-    const uint64_t* root = hts.get();
-    for (uint64_t h = 0; h < ht_size; ++h) {
-        const uint64_t key = root[h];
-        if (key == HT_EMPTY) continue;
-        out.emplace_back(static_cast<int32_t>(key >> 32),
-                         static_cast<int32_t>(key & 0xFFFFFFFFull));
-    }
-    return out;
-}
-
 // =============================================================================
-// Unified ND unpadded find_pairs.
+// ND unpadded find_pairs.
 //
-// Replaces the previous 2D and 3D specialised variants. One source-level
-// entry point (`find_pairs_nd_unpadded`) handles any (ndim ≥ 2,
-// conn ∈ [1, ndim]) combination via a single ND odometer kernel. Interior
-// pixels (bnd_mask == 0) take the fast path that just adds pre-computed
-// nb_flat[k] offsets; only edge pixels pay the per-axis bounds check.
+// One source-level entry point (`find_pairs_nd_unpadded`) handles any
+// (ndim ≥ 2, conn ∈ [1, ndim]) combination via a single ND odometer
+// kernel. Interior pixels (bnd_mask == 0) take the fast path that just
+// adds pre-computed nb_flat[k] offsets; only edge pixels pay the per-axis
+// bounds check.
 //
 // Forward-neighbour set: enumerate dc ∈ {-1,0,1}^ndim with
 //   - 1 ≤ #(nonzero coords) ≤ conn  (Chebyshev radius / connectivity strength)
@@ -430,27 +337,6 @@ find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
     return wrap
         ? find_pairs_unpadded_impl<T, true >(lbl, shape, conn, ht_size, n_threads, pool)
         : find_pairs_unpadded_impl<T, false>(lbl, shape, conn, ht_size, n_threads, pool);
-}
-
-// Single-threaded variant (no pool, no merge) for the small-image case.
-template <typename T>
-std::vector<std::pair<int32_t, int32_t>>
-search_hashset_serial(const T* line, int64_t total,
-                      const int64_t* nbs, int n_nbs,
-                      uint64_t ht_size) {
-    const uint64_t ht_mask = ht_size - 1;
-    std::vector<uint64_t> ht(ht_size, HT_EMPTY);
-    scan_strip<T>(line, 0, total, total, nbs, n_nbs, ht.data(), ht_mask);
-
-    std::vector<std::pair<int32_t, int32_t>> out;
-    out.reserve(64);
-    for (uint64_t h = 0; h < ht_size; ++h) {
-        const uint64_t key = ht[h];
-        if (key == HT_EMPTY) continue;
-        out.emplace_back(static_cast<int32_t>(key >> 32),
-                         static_cast<int32_t>(key & 0xFFFFFFFFull));
-    }
-    return out;
 }
 
 } // namespace ncolor_cpp
