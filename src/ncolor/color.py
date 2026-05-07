@@ -50,7 +50,7 @@ def _get_solver():
 def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           return_n=False, return_lut=False, verbose=False,
           check_conflicts=False, return_conflicts=False, format_input=True,
-          out=None, p=2, wrap=False, balance=False):
+          out=None, p=1, wrap=False, balance=True):
     """4-color graph coloring of a label image.
 
     Default path uses the C++ Solver. ``verbose`` still falls back to the
@@ -60,11 +60,10 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     across calls — useful for batch pipelines.
 
     ``p`` selects the Voronoi expand metric:
-        p=2 — Felzenszwalb parabolic envelope (Euclidean², default)
-        p=1 — Saito-Toriwaki separable sweep (Manhattan)
-    L1 is ~2× faster than L2 and produces a different (but equally
-    valid) coloring at boundary tie-break regions; both satisfy the
-    4-coloring constraint.
+        p=1 — Saito-Toriwaki separable sweep (Manhattan, default)
+        p=2 — Felzenszwalb parabolic envelope (Euclidean²)
+    L1 is faster and produces a different (but equally valid) coloring
+    at boundary tie-break regions; both satisfy the 4-coloring constraint.
 
     ``wrap=True`` treats the image as a torus: left/right and top/bottom
     edges are neighbours, so cells on opposite image edges become
