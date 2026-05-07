@@ -1,25 +1,17 @@
 /*
- * connect.hpp — header-only C++ port of ncolor's `_search_hashset_parallel`.
+ * connect.hpp — adjacency-pair search for label images.
  *
- * Drop-in replacement for the @njit kernel.  The Python/numba version pays
- * 14–43 ms per @njit(parallel=True) region launch on multi-CCX hosts (e.g.
- * Threadripper PRO 3995WX); ncolor.label issues 7+ such regions, swamping the
- * actual work for typical interactive image sizes.  This C++ implementation
- * avoids that by using a single persistent ThreadPool (one std::thread per
- * worker, lives across calls) plus a parallel pairwise tree-reduce of the
- * per-thread hashtables.
+ * Each worker scans a contiguous strip of the label image and records every
+ * (lo, hi) label adjacency in a private linear-probing hashtable keyed by
+ * (lo<<32 | hi). The per-thread tables are merged via log2(n_threads)
+ * pairwise rounds, and the survivor is walked once to extract unique pairs.
  *
- * Algorithm matches ncolor.color._search_hashset_parallel exactly:
- *   1. Each worker scans a contiguous strip of the padded label image and
- *      records every (lo, hi) label adjacency in a private linear-probing
- *      hashtable keyed by (lo<<32 | hi).
- *   2. The per-thread tables are merged via log2(n_threads) pairwise rounds.
- *   3. The surviving table (workers[0]) is walked once to extract the unique
- *      pairs as a (M, 2) int32 array.
- *
- * Public entry point: search_hashset_parallel<T>(line, total, nbs, ht_size,
- * pool) -> std::vector<std::pair<int32_t,int32_t>>.  T is the label dtype
- * (int32 typical).
+ * Two public entry points:
+ *   - search_hashset_parallel<T>(...)  : padded-input legacy API used by
+ *                                        ConnectEngine (one extra np.pad
+ *                                        on the Python side).
+ *   - find_pairs_nd_unpadded<T>(...)   : ND unpadded fast path used by
+ *                                        Solver — no pad buffer needed.
  */
 
 #ifndef NCOLOR_CONNECT_HPP
@@ -97,9 +89,9 @@ search_hashset_parallel(const T* line, int64_t total,
                         ForkJoinPool& pool) {
     const uint64_t ht_mask = ht_size - 1;
 
-    // NUCA-correct allocation (see find_pairs_2d_unpadded for rationale):
-    // workers first-touch their own hashtable slice with HT_EMPTY so pages
-    // map to the worker's L2 cluster rather than the main thread's.
+    // NUCA-correct allocation: workers first-touch their own hashtable slice
+    // with HT_EMPTY so pages map to the worker's L2 cluster rather than the
+    // main thread's.
     std::unique_ptr<uint64_t[]> hts(new uint64_t[static_cast<size_t>(n_threads) * ht_size]);
 
     // Phase 1: each worker first-touches its own hashtable + scans its strip.
@@ -474,18 +466,6 @@ find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
         default: return {};  // ndim ≥ 5: caller should fall back to padded path
     }
 }
-
-// Convenience wrapper: 2D specialisation. Kept for callers that have raw
-// (H, W) without building a shape vector.
-template <typename T>
-std::vector<std::pair<int32_t, int32_t>>
-find_pairs_2d_unpadded(const T* lbl, int64_t H, int64_t W,
-                       uint64_t ht_size, int n_threads,
-                       ForkJoinPool& pool) {
-    return find_pairs_nd_unpadded<T>(lbl, std::vector<int64_t>{H, W},
-                                     /*conn=*/2, ht_size, n_threads, pool);
-}
-
 
 // Single-threaded variant (no pool, no merge) for the small-image case.
 template <typename T>

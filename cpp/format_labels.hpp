@@ -22,7 +22,8 @@
 //   6. Parallel scatter → lbl[i] = remap[lbl[i]].
 // Returns the number of distinct nonzero labels after compaction.
 
-#pragma once
+#ifndef NCOLOR_FORMAT_LABELS_HPP
+#define NCOLOR_FORMAT_LABELS_HPP
 
 #include <atomic>
 #include <cstdint>
@@ -338,3 +339,5 @@ inline void apply_bg_mask(const int32_t* input_mask, OutT* out_ptr,
 }
 
 }  // namespace ncolor_cpp
+
+#endif  // NCOLOR_FORMAT_LABELS_HPP

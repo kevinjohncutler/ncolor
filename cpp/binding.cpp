@@ -1,10 +1,9 @@
 /*
- * Pybind11 binding for the ncolor C++ prototype.
- *
- * Exposes a single class ``ConnectEngine`` that wraps a persistent ThreadPool.
- * Construct once, call ``find_pairs`` many times — that's the whole win
- * over the numba version, which pays per-call thread-pool startup on every
- * @njit(parallel=True) region launch.
+ * Pybind11 binding for ncolor C++. Exposes three classes — each wraps a
+ * persistent ForkJoinPool, so callers construct once and reuse:
+ *   - ``ConnectEngine``  : adjacency-pair search (``find_pairs``)
+ *   - ``ExpandEngine``   : Voronoi label expansion (``expand_labels``)
+ *   - ``Solver``         : end-to-end ncolor.label pipeline
  */
 
 #include <pybind11/pybind11.h>
@@ -337,96 +336,6 @@ static inline int64_t ipow2_ge(int64_t v) {
     int64_t p = 1;
     while (p < v) p <<= 1;
     return p;
-}
-
-// Compute the connectivity neighbour flat-index offsets for a padded image.
-// Matches ncolor.color.neighbors(buf.shape, conn, unique=True) where buf is
-// the input padded by 1 zero in each dim. ``conn`` is the max number of
-// nonzero components in the offset (scipy.ndimage.generate_binary_structure
-// semantics): 2D conn=1 → 4-conn (face only), 2D conn=2 → 8-conn (face +
-// diagonals); 3D conn=1 → 6-conn, conn=2 → 18-conn, conn=3 → 26-conn.
-//
-// "unique forward half" means we keep only directions whose first nonzero
-// component is positive — each undirected pair is then emitted exactly
-// once across both directions during the scan.
-static inline std::vector<int64_t> neighbors_nd_padded(
-        const std::vector<int64_t>& shape, int conn) {
-    const int ndim = static_cast<int>(shape.size());
-    std::vector<int64_t> ps(ndim);  // padded strides (row-major)
-    {
-        int64_t s = 1;
-        for (int d = ndim - 1; d >= 0; --d) {
-            ps[d] = s;
-            s *= (shape[d] + 2);
-        }
-    }
-    int total = 1;
-    for (int d = 0; d < ndim; ++d) total *= 3;
-    std::vector<int64_t> nbs;
-    nbs.reserve(static_cast<size_t>((total - 1) / 2));
-    for (int idx = 0; idx < total; ++idx) {
-        int v = idx;
-        int n_nonzero = 0, first_nz = -1;
-        std::vector<int> off(ndim);
-        for (int d = 0; d < ndim; ++d) {
-            off[d] = (v % 3) - 1;
-            v /= 3;
-            if (off[d] != 0) {
-                ++n_nonzero;
-                if (first_nz < 0) first_nz = d;
-            }
-        }
-        if (n_nonzero == 0 || n_nonzero > conn) continue;
-        if (off[first_nz] < 0) continue;  // forward half only
-        int64_t flat = 0;
-        for (int d = 0; d < ndim; ++d) flat += off[d] * ps[d];
-        nbs.push_back(flat);
-    }
-    return nbs;
-}
-
-// Pad an N-D row-major buffer by 1 zero in each dimension. ``dst`` must
-// have shape (s[0]+2, s[1]+2, ..., s[ndim-1]+2) and total ``total_padded``
-// elements; this fills it with ``pad_value`` then copies ``src`` into the
-// interior. Iterates over "innermost rows" so the inner copy is one
-// memcpy per (shape[ndim-1])-length row.
-template <typename T>
-inline void pad_nd_into(const T* src, T* dst,
-                        const std::vector<int64_t>& shape, T pad_value) {
-    const int ndim = static_cast<int>(shape.size());
-    int64_t total_padded = 1;
-    for (int d = 0; d < ndim; ++d) total_padded *= (shape[d] + 2);
-    std::fill_n(dst, total_padded, pad_value);
-
-    std::vector<int64_t> ps(ndim), ss(ndim);  // padded / source strides
-    {
-        int64_t p = 1, s = 1;
-        for (int d = ndim - 1; d >= 0; --d) {
-            ps[d] = p; p *= (shape[d] + 2);
-            ss[d] = s; s *= shape[d];
-        }
-    }
-    int64_t base_off = 0;
-    for (int d = 0; d < ndim; ++d) base_off += ps[d];
-
-    const int64_t row_len = shape[ndim - 1];
-    int64_t n_rows = 1;
-    for (int d = 0; d < ndim - 1; ++d) n_rows *= shape[d];
-
-    std::vector<int64_t> coord(std::max(0, ndim - 1), 0);
-    for (int64_t r = 0; r < n_rows; ++r) {
-        int64_t src_start = 0, dst_start = base_off;
-        for (int d = 0; d < ndim - 1; ++d) {
-            src_start += coord[d] * ss[d];
-            dst_start += coord[d] * ps[d];
-        }
-        std::memcpy(dst + dst_start, src + src_start, row_len * sizeof(T));
-        for (int d = ndim - 2; d >= 0; --d) {
-            ++coord[d];
-            if (coord[d] < shape[d]) break;
-            coord[d] = 0;
-        }
-    }
 }
 
 // Solver: end-to-end ncolor.label equivalent in C++. Wraps a ConnectEngine
@@ -824,9 +733,7 @@ public:
             std::vector<std::pair<int32_t, int32_t>> pairs;
             {
                 // Unified ND unpadded find_pairs: one path for any
-                // (ndim ≥ 2, conn ∈ [1, ndim]) combination. Same algorithm
-                // as the legacy padded search_hashset_parallel but skips
-                // the pad buffer + pad_nd_into pass. Forward-neighbour
+                // (ndim ≥ 2, conn ∈ [1, ndim]) combination. Forward-neighbour
                 // count for sizing ht: enumerate dc ∈ {-1,0,1}^ndim with
                 // 1 ≤ #nz ≤ conn and lex-first nonzero = +1.
                 int64_t n_fwd = 0;
@@ -914,7 +821,7 @@ public:
                     const int local_depth = depth;
                     const int32_t* ip = indptr_.data();
                     const int32_t* ix = indices_.data();
-                    pool_->parallel([&, A, local_cur_n, local_depth, ip, ix]() {
+                    pool_->parallel([&, local_cur_n, local_depth, ip, ix]() {
                         int idx;
                         while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < A) {
                             auto& cv = per_attempt_colors_[idx];
@@ -1056,7 +963,6 @@ private:
     std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
     ncolor_cpp::ExpandBuffers expand_bufs_;
     std::vector<uint8_t> bg_mask_;     // captured from cast, used by apply_lut
-    std::vector<int32_t> padded_;       // ND non-fast-2D connect path
     std::vector<int32_t> partials_;     // max-reduce partials, reused across calls
     std::vector<int32_t> src_idx_, dst_idx_;
     std::vector<int32_t> indptr_, indices_;

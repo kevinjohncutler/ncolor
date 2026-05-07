@@ -10,8 +10,8 @@ Original ThreadPool: Copyright (c) 2012 Jakob Progsch, Václav Zeman (zlib licen
 Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 */
 
-#ifndef THREAD_POOL_H
-#define THREAD_POOL_H
+#ifndef NCOLOR_THREADPOOL_H
+#define NCOLOR_THREADPOOL_H
 
 #include <atomic>
 #include <cstddef>
@@ -125,4 +125,4 @@ private:
     std::vector<std::thread> workers_;
 };
 
-#endif // THREAD_POOL_H
+#endif // NCOLOR_THREADPOOL_H

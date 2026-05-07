@@ -23,7 +23,8 @@
 // L_4, L_∞ later means a new ``LpExpand<P>::expand`` specialization
 // with its own pipeline.
 
-#pragma once
+#ifndef NCOLOR_EXPAND_LP_HPP
+#define NCOLOR_EXPAND_LP_HPP
 
 #include "expand.hpp"
 #include "chamfer.hpp"
@@ -104,3 +105,5 @@ inline void expand_labels_lp(const int32_t* input, int32_t* output,
 }
 
 }  // namespace ncolor_cpp
+
+#endif  // NCOLOR_EXPAND_LP_HPP

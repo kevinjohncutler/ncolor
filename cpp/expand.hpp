@@ -1,5 +1,5 @@
 /*
- * expand.hpp — header-only C++ port of ncolor.expand.expand_labels.
+ * expand.hpp — Voronoi label expansion under L2 (squared Euclidean).
  *
  * Felzenszwalb–Huttenlocher (2012) parabolic-envelope distance transform,
  * separable over axes. For an N-dim label image:
@@ -8,10 +8,8 @@
  *     2. parabolic envelope pass over the innermost axis
  *     3. transpose back (skip if first iteration)
  *
- * Like connect.hpp, this version uses a persistent ThreadPool — work is
- * distributed across rows (envelope) and tile pairs (transpose), so for a
- * (H, W) image we get H + W + tile-count tasks per call vs the numba
- * version's 5+ @njit(parallel=True) regions × per-region launch cost.
+ * Work is distributed across the persistent ForkJoinPool — rows for the
+ * envelope passes, tile pairs for the transposes.
  */
 
 #ifndef NCOLOR_EXPAND_HPP
@@ -40,20 +38,6 @@
 namespace ncolor_cpp {
 
 using ::ForkJoinPool;
-
-// Strided indexer: lbl[i * stride], dist[i * stride]. With stride=1 this
-// is the contiguous row case; with stride=W it operates on a column of an
-// (H, W) image without transposing first. Per-iteration cache lines are
-// touched once each but for a 2048-tall column the working set fits in L2.
-struct StridedView {
-    int32_t* base_lbl;
-    int32_t* base_dist;
-    int64_t stride;
-    inline int32_t& lbl(int64_t i) { return base_lbl[i * stride]; }
-    inline int32_t& dist(int64_t i) { return base_dist[i * stride]; }
-    inline int32_t lbl_r(int64_t i) const { return base_lbl[i * stride]; }
-    inline int32_t dist_r(int64_t i) const { return base_dist[i * stride]; }
-};
 
 // Parabolic-envelope pass on one line of length N.
 //
@@ -519,56 +503,6 @@ inline void envelope_pass(
             const int64_t s1 = std::min(s0 + chunk_sz, n_slices);
             for (int64_t s = s0; s < s1; ++s) {
                 run_row(h_lbl + s * N, h_dist + s * N, vp, lp, gp, zp, vdp, vdsqp);
-            }
-        }
-    });
-}
-
-// Strided variant: process one logical "line" per call where pixels are
-// stride-spaced in memory. Use case: a column of an (H, W) row-major image
-// with stride=W, base=col_index. Avoids the transpose round-trip entirely.
-inline void envelope_pass_strided(
-        int32_t* h_lbl, int32_t* h_dist,
-        int64_t n_lines, int64_t N, int64_t stride,
-        ForkJoinPool& pool, int n_threads,
-        std::vector<EnvelopeScratch>& scratch) {
-    if (n_threads < 1) n_threads = 1;
-    if (static_cast<int>(scratch.size()) < n_threads) scratch.resize(n_threads);
-    const size_t cap = static_cast<size_t>(N) + 1;
-    for (int t = 0; t < n_threads; ++t) scratch[t].resize(cap);
-
-    if (n_threads == 1 || n_lines < 2) {
-        auto& sc = scratch[0];
-        for (int64_t s = 0; s < n_lines; ++s) {
-            envelope_pass_row(h_lbl + s, h_dist + s, N, stride,
-                              sc.v.data(), sc.lblstk.data(), sc.g.data(),
-                              sc.z.data(), sc.vd.data(), sc.vd_sq.data());
-        }
-        return;
-    }
-
-    const int n_chunks = static_cast<int>(std::min<int64_t>(
-        n_lines, static_cast<int64_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD));
-    const int64_t chunk_sz = (n_lines + n_chunks - 1) / n_chunks;
-    std::atomic<int> tid_next{0};
-    std::atomic<int> chunk_next{0};
-    pool.parallel([&]() {
-        const int my_tid = tid_next.fetch_add(1, std::memory_order_relaxed);
-        if (my_tid >= n_threads) return;
-        auto& sc = scratch[my_tid];
-        int32_t* vp = sc.v.data();
-        int32_t* lp = sc.lblstk.data();
-        int32_t* gp = sc.g.data();
-        double* zp = sc.z.data();
-        double* vdp = sc.vd.data();
-        double* vdsqp = sc.vd_sq.data();
-        int idx;
-        while ((idx = chunk_next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
-            const int64_t s0 = static_cast<int64_t>(idx) * chunk_sz;
-            const int64_t s1 = std::min(s0 + chunk_sz, n_lines);
-            for (int64_t s = s0; s < s1; ++s) {
-                envelope_pass_row(h_lbl + s, h_dist + s, N, stride,
-                                  vp, lp, gp, zp, vdp, vdsqp);
             }
         }
     });

@@ -1,13 +1,11 @@
 /*
- * color.hpp — C++ port of ncolor's graph-coloring + CSR-build kernels.
+ * color.hpp — graph-coloring + CSR-build kernels.
  *
- * Pure scalar code (the numba originals are @njit, no parallel=True), so the
- * point is parity + lower call overhead, not parallelism. Together with
- * connect.hpp + expand.hpp, this lets ncolor.label run end-to-end without
- * touching the numba pipeline. The repair fallback (`_repair_coloring` /
- * `_kempe_repair_csr`) is intentionally omitted — for the 4-coloring of
- * planar adjacency graphs we hit in practice, the BFS converges on the first
- * attempt; if you need the full repair chain, fall back to the numba path.
+ * Pure scalar code; together with connect.hpp + expand.hpp this lets
+ * Solver run end-to-end. The BFS coloring converges on the first attempt
+ * for the planar adjacency graphs we hit in practice; ``repair_coloring``
+ * provides the Kempe-chain fallback for the rare cases where it doesn't
+ * (typically L2 + wrap on tightly-cropped images).
  */
 
 #ifndef NCOLOR_COLOR_HPP
