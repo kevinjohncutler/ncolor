@@ -17,10 +17,27 @@
 #include <utility>
 #include <atomic>
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <intrin.h>
+#endif
+
 #include "dispatch.hpp"
 #include "threadpool.h"
 
 namespace ncolor_cpp {
+
+// Portable count-trailing-zeros for non-zero uint32_t. clang/gcc use the
+// builtin; MSVC has _BitScanForward (since VS2005). Caller must ensure
+// ``m != 0`` — the result for 0 is undefined.
+static inline int ctz32(uint32_t m) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    unsigned long idx;
+    _BitScanForward(&idx, m);
+    return static_cast<int>(idx);
+#else
+    return __builtin_ctz(m);
+#endif
+}
 
 // ``ForkJoinPool`` is declared at file scope in threadpool.h (vendored from
 // edt). Bring it into our namespace so callers don't have to mix qualifiers.
@@ -153,8 +170,12 @@ static inline void scan_inner_axis_fast(
         const T vi = row[x];
         if (vi == 0) continue;
         const T* p = row + x;
-        // Compile-time-bounded; clang fully unrolls.
-        #pragma GCC unroll 16
+        // Compile-time-bounded; clang/gcc fully unroll the loop. MSVC
+        // doesn't have a portable unroll pragma — its loop unroller
+        // handles N_NBS ≤ 16 fine without a hint.
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC unroll 16
+#endif
         for (int k = 0; k < N_NBS; ++k) {
             const T vj = p[nb[k]];
             if (vj == 0 || vj == vi) continue;
@@ -249,7 +270,7 @@ inline void scan_band_unpadded(
                 bool valid = true;
                 uint32_t m = bnd_mask;
                 while (m) {
-                    const int d = __builtin_ctz(m);
+                    const int d = ctz32(m);
                     m &= m - 1;
                     const int64_t nc = coords[d] + dc[d];
                     if (nc < 0 || nc >= shape[d]) { valid = false; break; }
