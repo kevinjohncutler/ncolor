@@ -167,6 +167,33 @@ search_hashset_parallel(const T* line, int64_t total,
 
 namespace detail {
 
+// Count the forward neighbours produced by the (ndim, conn) connectivity.
+// Caller uses this to size the per-thread hashtables in Solver. The full
+// (dc, flat_offset) tuples come from build_forward_neighbours below; this
+// is a cheap wrapper that just iterates the same odometer.
+inline int64_t count_forward_neighbours(int ndim, int conn) {
+    if (ndim < 1) return 0;
+    int64_t n_fwd = 0;
+    std::vector<int8_t> dc(ndim, -1);
+    while (true) {
+        int n_nz = 0, first_nz = -1;
+        for (int d = 0; d < ndim; ++d) if (dc[d] != 0) {
+            if (first_nz < 0) first_nz = d;
+            ++n_nz;
+        }
+        if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] == 1) ++n_fwd;
+        int d = ndim - 1;
+        while (d >= 0) {
+            ++dc[d];
+            if (dc[d] <= 1) break;
+            dc[d] = -1;
+            --d;
+        }
+        if (d < 0) break;
+    }
+    return n_fwd;
+}
+
 // Generate the forward-neighbour set's (dc[0..ndim-1], flat_offset) tuples.
 // Used by all NDIM specialisations of find_pairs_unpadded_impl.
 inline void build_forward_neighbours(

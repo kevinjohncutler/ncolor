@@ -411,25 +411,8 @@ public:
             if (max_label == 0) {
                 // Empty input — no pairs.
             } else {
-                // Unified ND unpadded: count forward neighbours for sizing.
-                int64_t n_fwd = 0;
-                std::vector<int8_t> dc(ndim, -1);
-                while (true) {
-                    int n_nz = 0, first_nz = -1;
-                    for (int d = 0; d < ndim; ++d) if (dc[d] != 0) {
-                        if (first_nz < 0) first_nz = d;
-                        ++n_nz;
-                    }
-                    if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] == 1) ++n_fwd;
-                    int d = ndim - 1;
-                    while (d >= 0) {
-                        ++dc[d];
-                        if (dc[d] <= 1) break;
-                        dc[d] = -1;
-                        --d;
-                    }
-                    if (d < 0) break;
-                }
+                // Unified ND unpadded: ht size from forward-neighbour count.
+                const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbours(ndim, conn);
                 const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
                 const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
                 pairs = ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
@@ -645,32 +628,8 @@ public:
             std::vector<std::pair<int32_t, int32_t>> pairs;
             {
                 // Unified ND unpadded find_pairs: one path for any
-                // (ndim ≥ 2, conn ∈ [1, ndim]) combination. Forward-neighbour
-                // count for sizing ht: enumerate dc ∈ {-1,0,1}^ndim with
-                // 1 ≤ #nz ≤ conn and lex-first nonzero = +1.
-                int64_t n_fwd = 0;
-                {
-                    const int n = ndim;
-                    // Cheap closed-form: sum over k=1..conn of  C(n, k) * 2^{k-1} / 2 …
-                    // simpler to just enumerate the same way the kernel does.
-                    std::vector<int8_t> dc(n, -1);
-                    while (true) {
-                        int n_nz = 0, first_nz = -1;
-                        for (int d = 0; d < n; ++d) if (dc[d] != 0) {
-                            if (first_nz < 0) first_nz = d;
-                            ++n_nz;
-                        }
-                        if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] == 1) ++n_fwd;
-                        int d = n - 1;
-                        while (d >= 0) {
-                            ++dc[d];
-                            if (dc[d] <= 1) break;
-                            dc[d] = -1;
-                            --d;
-                        }
-                        if (d < 0) break;
-                    }
-                }
+                // (ndim ≥ 2, conn ∈ [1, ndim]) combination.
+                const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbours(ndim, conn);
                 const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
                 const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, 16));
                 pairs = ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
