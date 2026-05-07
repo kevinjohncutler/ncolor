@@ -79,33 +79,21 @@ inline void chamfer_st_l1(int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
                 prev_d = out_d;
                 prev_l = out_l;
             }
-            // Backward sweep — same as before.
-            for (int64_t x = W - 2; x >= 0; --x) {
-                const int32_t cd = dr[x + 1] + 1;
-                if (cd < dr[x]) { dr[x] = cd; lr[x] = lr[x + 1]; }
-            }
-            // Toroidal extension: extra forward + backward sweep where the
-            // first cell inherits from the last (wrap-around). Shortest paths
-            // crossing the row boundary are picked up here.
+            // Per-cell relax inside this row: dr[x_dst] vs (dr[x_src] + 1).
+            auto relax_x = [&](int64_t x_dst, int64_t x_src) {
+                const int32_t cd = dr[x_src] + 1;
+                if (cd < dr[x_dst]) { dr[x_dst] = cd; lr[x_dst] = lr[x_src]; }
+            };
+            // Backward sweep — same as before, but expressed via relax_x.
+            for (int64_t x = W - 2; x >= 0; --x) relax_x(x, x + 1);
+            // Toroidal extension: extra forward + backward sweep with the
+            // first cell inheriting from the last (wrap-around). Captures
+            // shortest paths that cross the row boundary.
             if (wrap && W > 1) {
-                // Wrap-forward: dr[0] candidate = dr[W-1] + 1.
-                {
-                    const int32_t cd = dr[W - 1] + 1;
-                    if (cd < dr[0]) { dr[0] = cd; lr[0] = lr[W - 1]; }
-                }
-                for (int64_t x = 1; x < W; ++x) {
-                    const int32_t cd = dr[x - 1] + 1;
-                    if (cd < dr[x]) { dr[x] = cd; lr[x] = lr[x - 1]; }
-                }
-                // Wrap-backward: dr[W-1] candidate = dr[0] + 1.
-                {
-                    const int32_t cd = dr[0] + 1;
-                    if (cd < dr[W - 1]) { dr[W - 1] = cd; lr[W - 1] = lr[0]; }
-                }
-                for (int64_t x = W - 2; x >= 0; --x) {
-                    const int32_t cd = dr[x + 1] + 1;
-                    if (cd < dr[x]) { dr[x] = cd; lr[x] = lr[x + 1]; }
-                }
+                relax_x(0, W - 1);                                       // wrap-forward seed
+                for (int64_t x = 1;     x < W; ++x)  relax_x(x, x - 1);  // forward sweep
+                relax_x(W - 1, 0);                                       // wrap-backward seed
+                for (int64_t x = W - 2; x >= 0; --x) relax_x(x, x + 1);  // backward sweep
             }
         }
     };
@@ -121,66 +109,30 @@ inline void chamfer_st_l1(int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
     do { if ((NEWD) < (D)) { (D) = (NEWD); (L) = (NEWL); } } while (0)
 
     auto col_pass = [&](int64_t x0, int64_t x1) {
-        for (int64_t y = 1; y < H; ++y) {
-            int32_t* lr = lbl + y * W;
-            int32_t* dr = dist + y * W;
-            const int32_t* lt = lbl + (y - 1) * W;
-            const int32_t* dt = dist + (y - 1) * W;
+        // Per-row relax: dist[y_dst][x] vs (dist[y_src][x] + 1), keep min,
+        // for x ∈ [x0, x1). Inner SIMD-friendly contiguous loop.
+        auto relax_axis = [&](int64_t y_dst, int64_t y_src) {
+            int32_t* lr = lbl  + y_dst * W;
+            int32_t* dr = dist + y_dst * W;
+            const int32_t* lo = lbl  + y_src * W;
+            const int32_t* dn = dist + y_src * W;
             for (int64_t x = x0; x < x1; ++x) {
-                NCOLOR_L1_UPDATE(dr[x], lr[x], dt[x] + 1, lt[x]);
+                NCOLOR_L1_UPDATE(dr[x], lr[x], dn[x] + 1, lo[x]);
             }
-        }
-        for (int64_t y = H - 2; y >= 0; --y) {
-            int32_t* lr = lbl + y * W;
-            int32_t* dr = dist + y * W;
-            const int32_t* lb = lbl + (y + 1) * W;
-            const int32_t* db = dist + (y + 1) * W;
-            for (int64_t x = x0; x < x1; ++x) {
-                NCOLOR_L1_UPDATE(dr[x], lr[x], db[x] + 1, lb[x]);
-            }
-        }
-        // Toroidal extension: same idea as row_pass — one extra pair of
-        // forward+backward sweeps where the leading row inherits from the
-        // wrap-around opposite end.
+        };
+        auto forward_sweep  = [&]() { for (int64_t y = 1;     y < H; ++y)  relax_axis(y, y - 1); };
+        auto backward_sweep = [&]() { for (int64_t y = H - 2; y >= 0; --y) relax_axis(y, y + 1); };
+
+        forward_sweep();
+        backward_sweep();
+        // Toroidal extension: extra forward+backward sweep pair seeded
+        // from the wrap-around opposite end. See chamfer_l1_slab_pass for
+        // the analogous comment + ~2× cost.
         if (wrap && H > 1) {
-            // Wrap-forward: dist[0][x] candidate = dist[H-1][x] + 1.
-            {
-                int32_t* lr0       = lbl;
-                int32_t* dr0       = dist;
-                const int32_t* llast = lbl  + (H - 1) * W;
-                const int32_t* dlast = dist + (H - 1) * W;
-                for (int64_t x = x0; x < x1; ++x) {
-                    NCOLOR_L1_UPDATE(dr0[x], lr0[x], dlast[x] + 1, llast[x]);
-                }
-            }
-            for (int64_t y = 1; y < H; ++y) {
-                int32_t* lr = lbl + y * W;
-                int32_t* dr = dist + y * W;
-                const int32_t* lt = lbl + (y - 1) * W;
-                const int32_t* dt = dist + (y - 1) * W;
-                for (int64_t x = x0; x < x1; ++x) {
-                    NCOLOR_L1_UPDATE(dr[x], lr[x], dt[x] + 1, lt[x]);
-                }
-            }
-            // Wrap-backward: dist[H-1][x] candidate = dist[0][x] + 1.
-            {
-                int32_t* lr_last       = lbl  + (H - 1) * W;
-                int32_t* dr_last       = dist + (H - 1) * W;
-                const int32_t* lfirst  = lbl;
-                const int32_t* dfirst  = dist;
-                for (int64_t x = x0; x < x1; ++x) {
-                    NCOLOR_L1_UPDATE(dr_last[x], lr_last[x], dfirst[x] + 1, lfirst[x]);
-                }
-            }
-            for (int64_t y = H - 2; y >= 0; --y) {
-                int32_t* lr = lbl + y * W;
-                int32_t* dr = dist + y * W;
-                const int32_t* lb = lbl + (y + 1) * W;
-                const int32_t* db = dist + (y + 1) * W;
-                for (int64_t x = x0; x < x1; ++x) {
-                    NCOLOR_L1_UPDATE(dr[x], lr[x], db[x] + 1, lb[x]);
-                }
-            }
+            relax_axis(0,     H - 1);
+            forward_sweep();
+            relax_axis(H - 1, 0);
+            backward_sweep();
         }
     };
 
@@ -223,6 +175,20 @@ inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
     constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
     // Update macro is defined above (chamfer_st_l1's col_pass): branchful for
     // gcc/clang, branchless for MSVC. See note there for why.
+
+    // Per-cell relax: dist[b_dst][c] vs (dist[b_src][c] + 1), keep min.
+    auto relax_axis = [&](int64_t b_dst, int64_t b_src) {
+        int32_t* lr = lbl  + b_dst * C;
+        int32_t* dr = dist + b_dst * C;
+        const int32_t* lo = lbl  + b_src * C;
+        const int32_t* dn = dist + b_src * C;
+        for (int64_t c = c0; c < c1; ++c) {
+            NCOLOR_L1_UPDATE(dr[c], lr[c], dn[c] + 1, lo[c]);
+        }
+    };
+    auto forward_sweep  = [&]() { for (int64_t b = 1;     b < B; ++b)   relax_axis(b, b - 1); };
+    auto backward_sweep = [&]() { for (int64_t b = B - 2; b >= 0; --b)  relax_axis(b, b + 1); };
+
     if (init) {
         // Row 0: pure init from labels (no prev row exists).
         for (int64_t c = c0; c < c1; ++c) {
@@ -245,27 +211,9 @@ inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
             }
         }
     } else {
-        // Forward propagate, no init (dist already filled by prior axis).
-        for (int64_t b = 1; b < B; ++b) {
-            const int32_t* lprev = lbl  + (b - 1) * C;
-            const int32_t* dprev = dist + (b - 1) * C;
-            int32_t* lr = lbl  + b * C;
-            int32_t* dr = dist + b * C;
-            for (int64_t c = c0; c < c1; ++c) {
-                NCOLOR_L1_UPDATE(dr[c], lr[c], dprev[c] + 1, lprev[c]);
-            }
-        }
+        forward_sweep();
     }
-    // Backward (always).
-    for (int64_t b = B - 2; b >= 0; --b) {
-        const int32_t* lnext = lbl  + (b + 1) * C;
-        const int32_t* dnext = dist + (b + 1) * C;
-        int32_t* lr = lbl  + b * C;
-        int32_t* dr = dist + b * C;
-        for (int64_t c = c0; c < c1; ++c) {
-            NCOLOR_L1_UPDATE(dr[c], lr[c], dnext[c] + 1, lnext[c]);
-        }
-    }
+    backward_sweep();
 
     // Toroidal extension: one extra pair of forward+backward sweeps where
     // the leading edge inherits from the wrapped opposite end. Captures
@@ -273,46 +221,10 @@ inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
     // forward+backward suffice because each pair propagates O(B) along the
     // axis, and the wrap distance is at most B/2. ~2× the standard cost.
     if (wrap && B > 1) {
-        // Wrap-forward: dist[0][c] candidate = dist[B-1][c] + 1.
-        {
-            int32_t* lr0       = lbl;
-            int32_t* dr0       = dist;
-            const int32_t* llast = lbl  + (B - 1) * C;
-            const int32_t* dlast = dist + (B - 1) * C;
-            for (int64_t c = c0; c < c1; ++c) {
-                NCOLOR_L1_UPDATE(dr0[c], lr0[c], dlast[c] + 1, llast[c]);
-            }
-        }
-        // Forward propagate the updated dist[0] through to dist[B-1].
-        for (int64_t b = 1; b < B; ++b) {
-            const int32_t* lprev = lbl  + (b - 1) * C;
-            const int32_t* dprev = dist + (b - 1) * C;
-            int32_t* lr = lbl  + b * C;
-            int32_t* dr = dist + b * C;
-            for (int64_t c = c0; c < c1; ++c) {
-                NCOLOR_L1_UPDATE(dr[c], lr[c], dprev[c] + 1, lprev[c]);
-            }
-        }
-        // Wrap-backward: dist[B-1][c] candidate = dist[0][c] + 1.
-        {
-            int32_t* lr_last       = lbl  + (B - 1) * C;
-            int32_t* dr_last       = dist + (B - 1) * C;
-            const int32_t* lfirst  = lbl;
-            const int32_t* dfirst  = dist;
-            for (int64_t c = c0; c < c1; ++c) {
-                NCOLOR_L1_UPDATE(dr_last[c], lr_last[c], dfirst[c] + 1, lfirst[c]);
-            }
-        }
-        // Backward propagate the updated dist[B-1] through to dist[0].
-        for (int64_t b = B - 2; b >= 0; --b) {
-            const int32_t* lnext = lbl  + (b + 1) * C;
-            const int32_t* dnext = dist + (b + 1) * C;
-            int32_t* lr = lbl  + b * C;
-            int32_t* dr = dist + b * C;
-            for (int64_t c = c0; c < c1; ++c) {
-                NCOLOR_L1_UPDATE(dr[c], lr[c], dnext[c] + 1, lnext[c]);
-            }
-        }
+        relax_axis(0,     B - 1);  // wrap-forward seed
+        forward_sweep();
+        relax_axis(B - 1, 0);       // wrap-backward seed
+        backward_sweep();
     }
 }
 
