@@ -1,17 +1,14 @@
 /*
- * chamfer.hpp — header-only L1 (Manhattan) Voronoi label expansion via the
- * Rosenfeld–Pfaltz two-pass scan. Two raster sweeps over the (H, W) row-major
- * image: forward (top→bottom, left→right) propagates from N + W neighbors,
- * backward (bottom→top, right→left) propagates from S + E. Per pixel: 4
- * loads + 2 mins + 1 store per pass. Inherently sequential within a sweep
- * but parallelisable in a wavefront / row-chunk fashion.
+ * chamfer.hpp — N-D L1 (Manhattan) Voronoi label expansion via the
+ * Saito-Toriwaki separable transform. For each axis we do one
+ * forward + backward 1D sweep with label propagation; the innermost
+ * axis fuses init with the forward sweep into a single register-carry
+ * pass over each row, the rest use a slab pass with C-band split for
+ * SIMD-friendly auto-vectorisation.
  *
- * Output is L1 nearest-seed assignment, not L2 (parabolic envelope). For
- * ncolor's coloring use case this produces a slightly different boundary
- * placement at corners (the standard L1 vs L2 difference) — the resulting
- * adjacency graph is nearly always the same and the 4-coloring works
- * identically. Use only if `expand=True` and you accept non-bit-identical
- * output to numba's L2 expand.
+ * Output is L1 nearest-seed assignment (slightly different boundary
+ * placement at corner ties vs L2; the 4-colouring graph is the same in
+ * practice).
  */
 
 #ifndef NCOLOR_CHAMFER_HPP
@@ -29,129 +26,46 @@
 
 namespace ncolor_cpp {
 
-// Saito-Toriwaki separable L1 transform — exact L1 Voronoi via two
-// orthogonal 1D passes (forward+backward sweep each), with label
-// propagation. Strictly faster scaling than the row-band Rosenfeld-Pfaltz
-// chamfer at high thread counts because there's no cross-band boundary
-// fixup: phase 1 parallelizes trivially over rows (each row's 1D L1
-// transform is independent); phase 2 parallelizes trivially over column
-// bands (each column-band's vertical sweep is independent).
-//
-// Algorithm:
-//   Phase 1 (per row, parallel-over-rows):
-//     init dist[i,j] = 0 if seed else INF, lbl[i,j] from input
-//     forward x: if dr[x-1]+1 < dr[x]: dr[x] = dr[x-1]+1, lr[x] = lr[x-1]
-//     backward x: if dr[x+1]+1 < dr[x]: dr[x] = dr[x+1]+1, lr[x] = lr[x+1]
-//     → after phase 1, dist[i,j] = min over j' of |j-j'| with j' seed in row i
-//   Phase 2 (per column band, parallel-over-columns):
-//     forward y: if dt[x]+1 < dr[x]: dr[x] = dt[x]+1, lr[x] = lt[x]
-//     backward y: if db[x]+1 < dr[x]: dr[x] = db[x]+1, lr[x] = lb[x]
-//     → after phase 2, dist[i,j] = exact L1 distance to nearest seed
-//        (and lbl[i,j] = that seed's label)
-//
-// Output is bit-identical to the serial chamfer (both compute exact L1)
-// but the parallel scaling is clean — no boundary fixup, predictable
-// O((H+W) × n_threads) throughput.
-inline void chamfer_st_l1(int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
-                          ForkJoinPool& pool, int n_threads, bool wrap = false) {
-    constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
-
-    // Phase 1: per-row init + L1 1D transform. Init fused with forward sweep
-    // — saves one full pass over the row's data (~16MB at 2048² → ~0.3 ms).
-    auto row_pass = [&](int64_t y0, int64_t y1) {
-        for (int64_t y = y0; y < y1; ++y) {
-            int32_t* lr = lbl + y * W;
-            int32_t* dr = dist + y * W;
-            // Fused init + forward. `prev_d` carries the previous-cell's
-            // post-forward distance; for x=0 there's no left neighbour so
-            // prev_d starts at INF (saturating with +1 stays >> any seed).
-            int32_t prev_d = INF;
-            int32_t prev_l = 0;
-            for (int64_t x = 0; x < W; ++x) {
-                const int32_t init_l = lr[x];
-                const int32_t init_d = (init_l != 0) ? 0 : INF;
-                const int32_t cd = prev_d + 1;
-                int32_t out_d, out_l;
-                if (cd < init_d) { out_d = cd; out_l = prev_l; }
-                else             { out_d = init_d; out_l = init_l; }
-                dr[x] = out_d;
-                lr[x] = out_l;
-                prev_d = out_d;
-                prev_l = out_l;
-            }
-            // Per-cell relax inside this row: dr[x_dst] vs (dr[x_src] + 1).
-            auto relax_x = [&](int64_t x_dst, int64_t x_src) {
-                const int32_t cd = dr[x_src] + 1;
-                if (cd < dr[x_dst]) { dr[x_dst] = cd; lr[x_dst] = lr[x_src]; }
-            };
-            // Backward sweep — same as before, but expressed via relax_x.
-            for (int64_t x = W - 2; x >= 0; --x) relax_x(x, x + 1);
-            // Toroidal extension: extra forward + backward sweep with the
-            // first cell inheriting from the last (wrap-around). Captures
-            // shortest paths that cross the row boundary.
-            if (wrap && W > 1) {
-                relax_x(0, W - 1);                                       // wrap-forward seed
-                for (int64_t x = 1;     x < W; ++x)  relax_x(x, x - 1);  // forward sweep
-                relax_x(W - 1, 0);                                       // wrap-backward seed
-                for (int64_t x = W - 2; x >= 0; --x) relax_x(x, x + 1);  // backward sweep
-            }
-        }
-    };
-
-    // Phase 2: per-column-band vertical L1 transform. Each band independent.
-    // Inner x loop is contiguous reads from y, y-1 (or y+1) — prefetcher-friendly.
-    // The branchful form is fastest with gcc/clang (it vectorises with
-    // masked stores and skips work on no-update rows). MSVC's auto-vectoriser
-    // doesn't kick in for either branchful or branchless int32 conditional
-    // updates — switch the Windows toolchain to clang-cl for vectorised
-    // builds; the macro is then a single source of truth across compilers.
+// Update macro used by both the 1D row sweep and the (B, C) slab pass:
+// branchful on gcc/clang (auto-vectorises with masked stores; skips work
+// on no-update lanes), branchless wins on MSVC. Switch the Windows
+// toolchain to clang-cl for vectorised builds; the macro is then a
+// single source of truth across compilers.
 #define NCOLOR_L1_UPDATE(D, L, NEWD, NEWL)              \
     do { if ((NEWD) < (D)) { (D) = (NEWD); (L) = (NEWL); } } while (0)
 
-    auto col_pass = [&](int64_t x0, int64_t x1) {
-        // Per-row relax: dist[y_dst][x] vs (dist[y_src][x] + 1), keep min,
-        // for x ∈ [x0, x1). Inner SIMD-friendly contiguous loop.
-        auto relax_axis = [&](int64_t y_dst, int64_t y_src) {
-            int32_t* lr = lbl  + y_dst * W;
-            int32_t* dr = dist + y_dst * W;
-            const int32_t* lo = lbl  + y_src * W;
-            const int32_t* dn = dist + y_src * W;
-            for (int64_t x = x0; x < x1; ++x) {
-                NCOLOR_L1_UPDATE(dr[x], lr[x], dn[x] + 1, lo[x]);
-            }
-        };
-        auto forward_sweep  = [&]() { for (int64_t y = 1;     y < H; ++y)  relax_axis(y, y - 1); };
-        auto backward_sweep = [&]() { for (int64_t y = H - 2; y >= 0; --y) relax_axis(y, y + 1); };
-
-        forward_sweep();
-        backward_sweep();
-        // Toroidal extension: extra forward+backward sweep pair seeded
-        // from the wrap-around opposite end. See chamfer_l1_slab_pass for
-        // the analogous comment + ~2× cost.
-        if (wrap && H > 1) {
-            relax_axis(0,     H - 1);
-            forward_sweep();
-            relax_axis(H - 1, 0);
-            backward_sweep();
-        }
+// Per-row 1D L1 sweep with init: fuses dist init (INF / 0) with the
+// forward sweep so we touch each cell once carrying ``prev_d``/``prev_l``
+// in registers. Then a backward sweep, then the optional toroidal
+// forward+backward pair. Used for the innermost axis of any ND input.
+inline void chamfer_l1_row_init(int32_t* __restrict lr, int32_t* __restrict dr,
+                                int64_t W, bool wrap) {
+    constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
+    int32_t prev_d = INF, prev_l = 0;
+    for (int64_t x = 0; x < W; ++x) {
+        const int32_t init_l = lr[x];
+        const int32_t init_d = (init_l != 0) ? 0 : INF;
+        const int32_t cd = prev_d + 1;
+        int32_t out_d, out_l;
+        if (cd < init_d) { out_d = cd; out_l = prev_l; }
+        else             { out_d = init_d; out_l = init_l; }
+        dr[x] = out_d;
+        lr[x] = out_l;
+        prev_d = out_d;
+        prev_l = out_l;
+    }
+    auto relax_x = [&](int64_t x_dst, int64_t x_src) {
+        const int32_t cd = dr[x_src] + 1;
+        if (cd < dr[x_dst]) { dr[x_dst] = cd; lr[x_dst] = lr[x_src]; }
     };
-
-    // Phase 1: parallel over rows. Use atomic work-stealing — much better
-    // load balancing than static partitioning when bands have unequal seeds.
-    const size_t row_threads = compute_threads(n_threads, H, W);
-    dispatch_parallel(pool, static_cast<size_t>(H),
-                      row_threads * DISPATCH_CHUNKS_PER_THREAD,
-                      [&](size_t y0, size_t y1) { row_pass(static_cast<int64_t>(y0), static_cast<int64_t>(y1)); });
-
-    // Phase 2: parallel over column bands. Each band's vertical sweep is
-    // independent; atomic work-stealing balances cache-warm threads across
-    // chunks of bands automatically.
-    const size_t col_threads = compute_threads(n_threads, W, H);
-    dispatch_parallel(pool, static_cast<size_t>(W),
-                      col_threads * DISPATCH_CHUNKS_PER_THREAD,
-                      [&](size_t x0, size_t x1) { col_pass(static_cast<int64_t>(x0), static_cast<int64_t>(x1)); });
+    for (int64_t x = W - 2; x >= 0; --x) relax_x(x, x + 1);
+    if (wrap && W > 1) {
+        relax_x(0, W - 1);                                       // wrap-forward seed
+        for (int64_t x = 1;     x < W; ++x)  relax_x(x, x - 1);  // forward sweep
+        relax_x(W - 1, 0);                                       // wrap-backward seed
+        for (int64_t x = W - 2; x >= 0; --x) relax_x(x, x + 1);  // backward sweep
+    }
 }
-
 
 // L1 chamfer pass over a contiguous (B, C) slab. Sweep axis is B (rows),
 // inner loop is contiguous over the C-band [c0, c1) so the compiler can
@@ -159,23 +73,14 @@ inline void chamfer_st_l1(int32_t* lbl, int32_t* dist, int64_t H, int64_t W,
 // (carries through `dprev[c]`), but we now process a full column-band
 // per-row, so each row's work is data-parallel across C.
 //
-//   `init=true`  → row 0 initialises dist from labels, rows 1..B-1 fuse
-//                  init with forward propagate. Used for the first axis.
-//   `init=false` → rows 1..B-1 propagate forward only (subsequent axes).
-//
-// Mirrors numba's `_expand_l1_axis_propagate`. For non-innermost axes
-// this replaces the strided per-line approach (which had no inner SIMD
-// and walked memory with stride = next-axis-product). Cache-friendly
-// because consecutive c's land in the same cache lines.
+// dist is already filled by the prior axis's pass; we just propagate
+// the running min along axis B with both sweeps. Cache-friendly because
+// consecutive c's land in the same cache lines.
 inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
                                  int32_t* __restrict dist,
                                  int64_t B, int64_t C,
                                  int64_t c0, int64_t c1,
-                                 bool init, bool wrap = false) {
-    constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
-    // Update macro is defined above (chamfer_st_l1's col_pass): branchful for
-    // gcc/clang, branchless for MSVC. See note there for why.
-
+                                 bool wrap = false) {
     // Per-cell relax: dist[b_dst][c] vs (dist[b_src][c] + 1), keep min.
     auto relax_axis = [&](int64_t b_dst, int64_t b_src) {
         int32_t* lr = lbl  + b_dst * C;
@@ -189,41 +94,15 @@ inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
     auto forward_sweep  = [&]() { for (int64_t b = 1;     b < B; ++b)   relax_axis(b, b - 1); };
     auto backward_sweep = [&]() { for (int64_t b = B - 2; b >= 0; --b)  relax_axis(b, b + 1); };
 
-    if (init) {
-        // Row 0: pure init from labels (no prev row exists).
-        for (int64_t c = c0; c < c1; ++c) {
-            dist[c] = (lbl[c] != 0) ? 0 : INF;
-        }
-        // Rows 1..B-1: fused init + forward propagate. dr[c] is uninitialised
-        // here so it must always be written; only the lr[c] write is
-        // conditional on the candidate beating init.
-        for (int64_t b = 1; b < B; ++b) {
-            const int32_t* lprev = lbl  + (b - 1) * C;
-            const int32_t* dprev = dist + (b - 1) * C;
-            int32_t* lr = lbl  + b * C;
-            int32_t* dr = dist + b * C;
-            for (int64_t c = c0; c < c1; ++c) {
-                const int32_t init_l = lr[c];
-                const int32_t init_d = (init_l != 0) ? 0 : INF;
-                const int32_t cd     = dprev[c] + 1;
-                if (cd < init_d) { dr[c] = cd;     lr[c] = lprev[c]; }
-                else             { dr[c] = init_d; /* lr[c] kept */  }
-            }
-        }
-    } else {
-        forward_sweep();
-    }
+    forward_sweep();
     backward_sweep();
 
     // Toroidal extension: one extra pair of forward+backward sweeps where
-    // the leading edge inherits from the wrapped opposite end. Captures
-    // shortest paths that traverse the b=0/b=B-1 boundary. Two cycles of
-    // forward+backward suffice because each pair propagates O(B) along the
-    // axis, and the wrap distance is at most B/2. ~2× the standard cost.
+    // the leading edge inherits from the wrapped opposite end. ~2× cost.
     if (wrap && B > 1) {
-        relax_axis(0,     B - 1);  // wrap-forward seed
+        relax_axis(0,     B - 1);
         forward_sweep();
-        relax_axis(B - 1, 0);       // wrap-backward seed
+        relax_axis(B - 1, 0);
         backward_sweep();
     }
 }
@@ -234,18 +113,16 @@ inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
 //   B = shape[ax]                    (serial sweep axis)
 //   C = product of axes AFTER ax     (inner contiguous, auto-vectorised)
 //
-// This is the same reshape trick used by the dedicated 2D ``chamfer_st_l1``
-// kernel and by numba's ``_expand_l1_axis_propagate``. The previous
-// implementation processed one strided line at a time, which for axis 0
-// of a large 3D volume meant every memory access stepped by the full
-// next-axis product (e.g. 256K ints = 1 MB on 512³). That was a cache
-// disaster and serial within each line. The (A, B, C) slab pattern keeps
-// the inner loop contiguous on every axis, which is roughly 4-5× faster
-// for 3D ≥ 256³ on the hosts we benched.
+// Innermost axis (ax = ndim-1, C = 1): each "row" is a contiguous run of
+// length B, parallel-over-rows; per-row uses the fused
+// init+forward+backward sweep with prev_d/prev_l carried in registers
+// (chamfer_l1_row_init). This is the perf-critical pass on dense inputs
+// because every cell is touched.
 //
-// When A is small (axis 0 in 3D has A=1), C is band-split so the
-// thread pool still fills out. ``MIN_BAND_W`` keeps each band wide enough
-// that the SIMD loop has real work to do.
+// Other axes (C > 1): slab pass with C-band split so the inner loop is
+// contiguous and vectorises. Each band must be ≥ MIN_BAND_W ints; the
+// remaining parallelism comes from A. Mirrors numba's
+// _expand_l1_axis_propagate.
 inline void chamfer_st_l1_nd(int32_t* lbl, int32_t* dist,
                              const std::vector<int64_t>& shape,
                              ForkJoinPool& pool, int n_threads,
@@ -259,11 +136,29 @@ inline void chamfer_st_l1_nd(int32_t* lbl, int32_t* dist,
     constexpr int64_t MIN_BAND_W = 256;
 
     for (int ax = ndim - 1; ax >= 0; --ax) {
-        const bool first = (ax == ndim - 1);
         int64_t A = 1, C = 1;
         for (int d = 0; d < ax; ++d)        A *= shape[d];
         for (int d = ax + 1; d < ndim; ++d) C *= shape[d];
         const int64_t B = shape[ax];
+
+        if (ax == ndim - 1) {
+            // Innermost axis (C == 1): per-row 1D sweep, fully fused
+            // init + forward + backward (+ optional wrap). The slab path's
+            // C-band split would degenerate to a serial scalar loop here.
+            const size_t row_threads = compute_threads(
+                static_cast<size_t>(n_threads),
+                static_cast<size_t>(A),
+                static_cast<size_t>(B));
+            dispatch_parallel(pool, static_cast<size_t>(A),
+                              row_threads * DISPATCH_CHUNKS_PER_THREAD,
+                              [&](size_t a0, size_t a1) {
+                for (size_t a = a0; a < a1; ++a) {
+                    const int64_t off = static_cast<int64_t>(a) * B;
+                    chamfer_l1_row_init(lbl + off, dist + off, B, wrap);
+                }
+            });
+            continue;
+        }
 
         // Pick band count so A * n_bands ≈ threads * DISPATCH_CHUNKS_PER_THREAD.
         // Each band must be ≥ MIN_BAND_W ints (when C allows it).
@@ -294,7 +189,8 @@ inline void chamfer_st_l1_nd(int32_t* lbl, int32_t* dist,
                 const int64_t c1  = std::min(C, c0 + band_w);
                 if (c0 >= c1) continue;
                 const int64_t off = a * B * C;
-                chamfer_l1_slab_pass(lbl + off, dist + off, B, C, c0, c1, first, wrap);
+                chamfer_l1_slab_pass(lbl + off, dist + off, B, C, c0, c1,
+                                     wrap);
             }
         });
     }

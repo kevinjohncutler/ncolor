@@ -65,32 +65,23 @@ struct LpExpand<2> {
 };
 
 // L1 (Manhattan): Saito-Toriwaki separable sweep. Operates in-place on
-// a single buffer for the labels (with ``dist`` as scratch) — single
-// input→output memcpy, then the sweep runs on ``output`` directly. The
-// 2D fast path uses the dedicated kernel that fuses init + forward +
-// backward sweep with register-carried state across cells (faster than
-// the generic ND slab dispatch); ndim ≥ 3 falls through to the generic
-// (A, B, C)-banded slab driver.
+// the output buffer for the labels (with ``dist`` as scratch) — one
+// input→output memcpy, then the ND driver runs the per-row fused
+// init+forward+backward sweep on the innermost axis and (B, C)-banded
+// slab passes on the rest.
 template <>
 struct LpExpand<1> {
     static void expand(const int32_t* input, int32_t* output,
                        ExpandBuffers& bufs,
                        const std::vector<int64_t>& shape,
                        ForkJoinPool& pool, int n_threads, bool wrap = false) {
-        const int ndim = static_cast<int>(shape.size());
         int64_t total = 1;
         for (int64_t d : shape) total *= d;
         bufs.resize(total);  // for the dist scratch
         if (input != output) {
             std::memcpy(output, input, total * sizeof(int32_t));
         }
-        if (ndim == 2) {
-            chamfer_st_l1(output, bufs.dist(),
-                          shape[0], shape[1], pool, n_threads, wrap);
-        } else {
-            chamfer_st_l1_nd(output, bufs.dist(),
-                             shape, pool, n_threads, wrap);
-        }
+        chamfer_st_l1_nd(output, bufs.dist(), shape, pool, n_threads, wrap);
     }
 };
 
