@@ -148,17 +148,11 @@ search_hashset_parallel(const T* line, int64_t total,
 //
 // Replaces the previous 2D and 3D specialised variants. One source-level
 // entry point (`find_pairs_nd_unpadded`) handles any (ndim ≥ 2,
-// conn ∈ [1, ndim]) combination — same algorithm as the legacy padded
-// `search_hashset_parallel` but skips the (s_0+2)*…  pad buffer +
-// pad_nd_into pass.
+// conn ∈ [1, ndim]) combination via a single ND odometer kernel. Interior
+// pixels (bnd_mask == 0) take the fast path that just adds pre-computed
+// nb_flat[k] offsets; only edge pixels pay the per-axis bounds check.
 //
-// Implementation is template-specialised on NDIM at compile time so the
-// nested boundary/interior loop structure unrolls cleanly. NDIM=2 and
-// NDIM=3 cover the production cases (2D imaging + 3D volumetric) at full
-// hand-coded performance; NDIM≥4 falls through to the runtime-odometer
-// path inside the same template, keeping the source unified.
-//
-// Forward-neighbour set: enumerate dc ∈ {-1,0,1}^NDIM with
+// Forward-neighbour set: enumerate dc ∈ {-1,0,1}^ndim with
 //   - 1 ≤ #(nonzero coords) ≤ conn  (Chebyshev radius / connectivity strength)
 //   - lex-first nonzero coord is +1  (ensures neighbour has strictly greater
 //     flat index in row-major layout, so each undirected adjacency is emitted
@@ -195,7 +189,7 @@ inline int64_t count_forward_neighbours(int ndim, int conn) {
 }
 
 // Generate the forward-neighbour set's (dc[0..ndim-1], flat_offset) tuples.
-// Used by all NDIM specialisations of find_pairs_unpadded_impl.
+// Used by find_pairs_unpadded_impl.
 inline void build_forward_neighbours(
         const std::vector<int64_t>& shape, int conn,
         std::vector<int64_t>& strides_out,
@@ -233,16 +227,18 @@ inline void build_forward_neighbours(
 }  // namespace detail
 
 // Internal scan kernel: walks one strip of axis-0, emits forward-neighbour
-// pairs into a single hashtable. Templated on NDIM so 2D and 3D get hand-
-// coded nested loops with explicit boundary/interior splits; NDIM>=4 falls
-// through to the generic odometer path.
-template <typename T, int NDIM, bool Wrap = false>
+// pairs into a single hashtable. Generic ND odometer — interior pixels use
+// the pre-computed flat offsets in nb_flat; boundary pixels rebuild offsets
+// per-axis (with optional wrap). `Wrap` is templated so the boundary path
+// has no runtime cost when it's off.
+template <typename T, bool Wrap = false>
 inline void scan_band_unpadded(
         const T* lbl, const std::vector<int64_t>& shape,
         const int64_t* strides, const int64_t* nb_flat,
         const int8_t* nb_dc, int n_nbs,
         int64_t outer_start, int64_t outer_end,
         uint64_t* ht, uint64_t ht_mask) {
+    const int ndim = static_cast<int>(shape.size());
     auto emit_pair = [ht_mask](uint64_t* h, T vi, T vj) {
         if (vj == 0 || vj == vi) return;
         const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
@@ -255,17 +251,15 @@ inline void scan_band_unpadded(
     //   Wrap=true: out-of-bounds neighbours wrap to the opposite edge of the
     //     same axis (toroidal topology). For each OOB axis we recompute the
     //     wrapped coord and rebuild the flat offset directly, since the
-    //     pre-computed nb_flat[k] assumed no wrap. Interior pixels never
-    //     hit this path so the fast loop's pre-computed offsets stay valid
-    //     under both modes.
+    //     pre-computed nb_flat[k] assumed no wrap.
     auto scan_pixel_checked = [&](const int64_t* coords, uint32_t bnd_mask, int64_t flat) {
         const T vi = lbl[flat];
         if (vi == 0) return;
         for (int k = 0; k < n_nbs; ++k) {
-            const int8_t* dc = nb_dc + k * NDIM;
+            const int8_t* dc = nb_dc + k * ndim;
             if constexpr (Wrap) {
                 int64_t neigh_flat = 0;
-                for (int d = 0; d < NDIM; ++d) {
+                for (int d = 0; d < ndim; ++d) {
                     int64_t nc = coords[d] + dc[d];
                     if (nc < 0) nc += shape[d];
                     else if (nc >= shape[d]) nc -= shape[d];
@@ -286,122 +280,77 @@ inline void scan_band_unpadded(
         }
     };
 
-    if constexpr (NDIM == 2) {
-        const int64_t H = shape[0], W = shape[1];
-        for (int64_t y = outer_start; y < outer_end; ++y) {
-            const bool y_bnd = (y == 0) || (y == H - 1);
-            const T* row = lbl + y * W;
-            if (y_bnd || W < 3) {
-                for (int64_t x = 0; x < W; ++x) {
-                    const bool x_bnd = (x == 0) || (x == W - 1);
-                    const uint32_t mask = (y_bnd ? 1u : 0u) | (x_bnd ? 2u : 0u);
-                    int64_t coords[2] = {y, x};
-                    scan_pixel_checked(coords, mask, y * W + x);
-                }
-                continue;
+    // Iterate over (outer coords) × (inner axis). The outer loop is an
+    // odometer over axes [0 .. ndim-2]; for each outer state, the inner
+    // axis (ndim-1) is walked as a tight contiguous run. When the outer
+    // coords are all interior (outer_bnd == 0) and the inner axis is wide
+    // enough (W ≥ 3) we get the same fast path the 2D/3D specialisations
+    // had: split inner axis into [0], [1, W-1), [W-1] and the middle slice
+    // touches only the pre-computed nb_flat[k] offsets — no per-pixel
+    // coord arithmetic, no boundary mask updates.
+    constexpr int MAX_NDIM = 16;  // realistic upper bound; trips fast in practice
+    const int inner = ndim - 1;
+    const int64_t W = shape[inner];           // inner-axis length
+    const uint32_t inner_bit = 1u << inner;
+    int64_t coords[MAX_NDIM] = {0};
+    coords[0] = outer_start;
+    uint32_t outer_bnd = 0;                   // bnd mask for coords[0..ndim-2]
+    for (int d = 0; d < inner; ++d) {
+        if (coords[d] == 0 || coords[d] >= shape[d] - 1) outer_bnd |= (1u << d);
+    }
+    // Compute base flat offset for (coords[0..ndim-2], inner=0).
+    int64_t row_base = 0;
+    for (int d = 0; d < inner; ++d) row_base += coords[d] * strides[d];
+    const int64_t end_outer = outer_end;
+    while (coords[0] < end_outer) {
+        if (outer_bnd != 0 || W < 3) {
+            // Full per-pixel boundary checks across the entire inner axis.
+            for (int64_t x = 0; x < W; ++x) {
+                const uint32_t bnd = outer_bnd |
+                    ((x == 0 || x == W - 1) ? inner_bit : 0u);
+                coords[inner] = x;
+                scan_pixel_checked(coords, bnd, row_base + x);
             }
-            // y interior: x=0 edge, x in [1, W-2] interior, x=W-1 edge.
-            int64_t coords[2] = {y, 0};
-            scan_pixel_checked(coords, /*bnd=*/2u, y * W + 0);
+        } else {
+            // Outer coords all interior, W ≥ 3: fast path on the
+            // open interval (0, W-1).
+            coords[inner] = 0;
+            scan_pixel_checked(coords, inner_bit, row_base);
             for (int64_t x = 1; x < W - 1; ++x) {
-                const T vi = row[x];
+                const T vi = lbl[row_base + x];
                 if (vi == 0) continue;
-                const int64_t base = y * W + x;
-                for (int k = 0; k < n_nbs; ++k) emit_pair(ht, vi, lbl[base + nb_flat[k]]);
+                for (int k = 0; k < n_nbs; ++k) {
+                    emit_pair(ht, vi, lbl[row_base + x + nb_flat[k]]);
+                }
             }
-            coords[1] = W - 1;
-            scan_pixel_checked(coords, /*bnd=*/2u, y * W + (W - 1));
+            coords[inner] = W - 1;
+            scan_pixel_checked(coords, inner_bit, row_base + (W - 1));
         }
-    } else if constexpr (NDIM == 3) {
-        const int64_t D = shape[0], H = shape[1], W = shape[2];
-        for (int64_t z = outer_start; z < outer_end; ++z) {
-            const bool z_bnd = (z == 0) || (z == D - 1);
-            if (z_bnd || H < 3 || W < 3) {
-                for (int64_t y = 0; y < H; ++y)
-                    for (int64_t x = 0; x < W; ++x) {
-                        const uint32_t mask =
-                            (z_bnd ? 1u : 0u) |
-                            ((y == 0 || y == H - 1) ? 2u : 0u) |
-                            ((x == 0 || x == W - 1) ? 4u : 0u);
-                        int64_t coords[3] = {z, y, x};
-                        scan_pixel_checked(coords, mask, (z * H + y) * W + x);
-                    }
-                continue;
-            }
-            // z interior: handle y=0, y interior, y=H-1
-            for (int64_t y = 0; y < H; ++y) {
-                const bool y_bnd = (y == 0) || (y == H - 1);
-                if (y_bnd) {
-                    for (int64_t x = 0; x < W; ++x) {
-                        const uint32_t mask = 2u | ((x == 0 || x == W - 1) ? 4u : 0u);
-                        int64_t coords[3] = {z, y, x};
-                        scan_pixel_checked(coords, mask, (z * H + y) * W + x);
-                    }
-                    continue;
-                }
-                // z, y both interior: x=0 edge, x in [1, W-2] interior, x=W-1 edge.
-                {
-                    int64_t coords[3] = {z, y, 0};
-                    scan_pixel_checked(coords, /*bnd=*/4u, (z * H + y) * W + 0);
-                }
-                {
-                    const T* row = lbl + (z * H + y) * W;
-                    const int64_t row_base = (z * H + y) * W;
-                    for (int64_t x = 1; x < W - 1; ++x) {
-                        const T vi = row[x];
-                        if (vi == 0) continue;
-                        for (int k = 0; k < n_nbs; ++k)
-                            emit_pair(ht, vi, lbl[row_base + x + nb_flat[k]]);
-                    }
-                }
-                {
-                    int64_t coords[3] = {z, y, W - 1};
-                    scan_pixel_checked(coords, /*bnd=*/4u, (z * H + y) * W + (W - 1));
-                }
-            }
-        }
-    } else {
-        // NDIM >= 4: generic odometer fallback. Same correctness, ~10-20%
-        // slower than the hand-coded NDIM=2/3 paths from the per-iteration
-        // boundary-mask maintenance.
-        const int ndim = NDIM;
-        std::vector<int64_t> coords(ndim, 0);
-        coords[0] = outer_start;
-        uint32_t bnd_mask = 0;
-        for (int d = 0; d < ndim; ++d) {
-            if (coords[d] == 0 || coords[d] >= shape[d] - 1) bnd_mask |= (1u << d);
-        }
-        int64_t flat = outer_start * strides[0];
-        const int64_t end_flat = outer_end * strides[0];
-        while (flat < end_flat) {
-            const T vi = lbl[flat];
-            if (vi != 0) {
-                if (bnd_mask == 0) {
-                    for (int k = 0; k < n_nbs; ++k) emit_pair(ht, vi, lbl[flat + nb_flat[k]]);
-                } else {
-                    scan_pixel_checked(coords.data(), bnd_mask, flat);
-                }
-            }
-            ++flat;
-            int d = ndim - 1;
+        // Advance the outer odometer (axes [0 .. ndim-2]).
+        if (ndim == 1) break;
+        int d = inner - 1;
+        ++coords[d];
+        row_base += strides[d];
+        while (coords[d] >= shape[d] && d > 0) {
+            row_base -= coords[d] * strides[d];
+            coords[d] = 0;
+            outer_bnd |= (1u << d);
+            --d;
             ++coords[d];
-            while (coords[d] >= shape[d] && d > 0) {
-                coords[d] = 0;
-                bnd_mask |= (1u << d);
-                --d;
-                ++coords[d];
-            }
-            if (coords[d] >= shape[d]) break;
-            const bool is_bnd = (coords[d] == 0 || coords[d] >= shape[d] - 1);
-            if (is_bnd) bnd_mask |= (1u << d);
-            else bnd_mask &= ~(1u << d);
+            row_base += strides[d];
         }
+        if (coords[d] >= shape[d]) break;
+        const bool is_bnd = (coords[d] == 0 || coords[d] >= shape[d] - 1);
+        if (is_bnd) outer_bnd |= (1u << d);
+        else outer_bnd &= ~(1u << d);
     }
 }
 
-// Internal: per-NDIM driver — generates neighbours, allocates HTs, parallel-
-// scans dim-0 strips, merges. The public dispatcher below routes here.
-template <typename T, int NDIM, bool Wrap = false>
+// Internal driver — generates neighbours, allocates per-thread HTs,
+// parallel-scans dim-0 strips, merges. The public dispatcher below
+// routes here. ``Wrap`` is templated so the wrap branch in
+// scan_band_unpadded is compile-time-elided when not needed.
+template <typename T, bool Wrap = false>
 inline std::vector<std::pair<int32_t, int32_t>>
 find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
                          int conn, uint64_t ht_size, int n_threads,
@@ -417,9 +366,9 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
     std::unique_ptr<uint64_t[]> hts(new uint64_t[static_cast<size_t>(n_threads) * ht_size]);
     if (n_threads == 1 || shape[0] < 2) {
         std::fill_n(hts.get(), ht_size, HT_EMPTY);
-        scan_band_unpadded<T, NDIM, Wrap>(lbl, shape, strides.data(), nb_flat.data(),
-                                          nb_dc.data(), n_nbs, 0, shape[0],
-                                          hts.get(), ht_mask);
+        scan_band_unpadded<T, Wrap>(lbl, shape, strides.data(), nb_flat.data(),
+                                    nb_dc.data(), n_nbs, 0, shape[0],
+                                    hts.get(), ht_mask);
     } else {
         // Phase 1: per-worker scan + first-touch HT (NUCA-local).
         std::atomic<int> next{0};
@@ -432,9 +381,9 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
                 const int64_t z0 = static_cast<int64_t>(t) * per;
                 const int64_t z1 = std::min(z0 + per, shape[0]);
                 if (z0 < z1) {
-                    scan_band_unpadded<T, NDIM, Wrap>(lbl, shape, strides.data(), nb_flat.data(),
-                                                      nb_dc.data(), n_nbs, z0, z1,
-                                                      ht, ht_mask);
+                    scan_band_unpadded<T, Wrap>(lbl, shape, strides.data(), nb_flat.data(),
+                                                nb_dc.data(), n_nbs, z0, z1,
+                                                ht, ht_mask);
                 }
             }
         });
@@ -469,29 +418,18 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
     return out;
 }
 
-// Public entry point: dispatches on shape.size() to the compile-time-
-// specialised NDIM=2/3 implementations or (rare) NDIM=4 generic path.
+// Public entry point — dispatches on ``wrap`` only (the kernel itself is
+// fully ND). Returns ``{}`` for ndim ∉ [2, 16] or invalid conn.
 template <typename T>
 std::vector<std::pair<int32_t, int32_t>>
 find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
                        int conn, uint64_t ht_size, int n_threads,
                        ForkJoinPool& pool, bool wrap = false) {
     const int ndim = static_cast<int>(shape.size());
-    if (ndim < 2 || conn < 1 || conn > ndim) return {};
-    if (wrap) {
-        switch (ndim) {
-            case 2: return find_pairs_unpadded_impl<T, 2, true>(lbl, shape, conn, ht_size, n_threads, pool);
-            case 3: return find_pairs_unpadded_impl<T, 3, true>(lbl, shape, conn, ht_size, n_threads, pool);
-            case 4: return find_pairs_unpadded_impl<T, 4, true>(lbl, shape, conn, ht_size, n_threads, pool);
-            default: return {};
-        }
-    }
-    switch (ndim) {
-        case 2: return find_pairs_unpadded_impl<T, 2, false>(lbl, shape, conn, ht_size, n_threads, pool);
-        case 3: return find_pairs_unpadded_impl<T, 3, false>(lbl, shape, conn, ht_size, n_threads, pool);
-        case 4: return find_pairs_unpadded_impl<T, 4, false>(lbl, shape, conn, ht_size, n_threads, pool);
-        default: return {};  // ndim ≥ 5: caller should fall back to padded path
-    }
+    if (ndim < 2 || ndim > 16 || conn < 1 || conn > ndim) return {};
+    return wrap
+        ? find_pairs_unpadded_impl<T, true >(lbl, shape, conn, ht_size, n_threads, pool)
+        : find_pairs_unpadded_impl<T, false>(lbl, shape, conn, ht_size, n_threads, pool);
 }
 
 // Single-threaded variant (no pool, no merge) for the small-image case.
