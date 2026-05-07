@@ -464,43 +464,8 @@ public:
             shape[d] = static_cast<int64_t>(buf.shape[d]);
             total *= shape[d];
         }
-        // 2D fast path uses the unpadded ConnectEngine optimisation; ND or
-        // non-default conn falls back to the generic padded path.
-        // Unified ND unpadded find_pairs handles all (ndim, conn) cases.
-
-        // Validate + classify dtype by (itemsize, signedness). Doing it
-        // by buf.format string runs into a platform quirk: numpy's int64
-        // is 'l' (long) on macOS / Linux LP64 while pybind11's
         const void* src_ptr = buf.ptr;
-
-        std::vector<py::ssize_t> out_shape(ndim);
-        for (int d = 0; d < ndim; ++d) out_shape[d] = static_cast<py::ssize_t>(shape[d]);
-        py::array_t<uint8_t> out;
-        if (out_arg.is_none()) {
-            out = py::array_t<uint8_t>(out_shape);
-        } else {
-            // Caller-supplied buffer: must be uint8, C-contiguous, exact-shape.
-            // Reusing an output buffer across calls saves the per-call alloc
-            // (16 MiB at 4096²); useful for batch pipelines. We need strict
-            // dtype check (not pybind11's auto-cast) so that the caller's
-            // buffer is actually the one written — a silent copy would defeat
-            // the purpose of passing out=.
-            const py::array out_view = py::cast<py::array>(out_arg);
-            if (out_view.dtype().kind() != 'u' || out_view.dtype().itemsize() != 1) {
-                throw std::invalid_argument(
-                    "Solver.label: out buffer must be uint8");
-            }
-            out = py::cast<py::array_t<uint8_t>>(out_arg);
-            const auto out_buf = out.request();
-            if (out_buf.ndim != ndim) throw std::invalid_argument(
-                "Solver.label: out buffer ndim does not match input");
-            for (int d = 0; d < ndim; ++d) {
-                if (out_buf.shape[d] != buf.shape[d]) throw std::invalid_argument(
-                    "Solver.label: out buffer shape does not match input");
-            }
-            if (!(out.flags() & py::array::c_style)) throw std::invalid_argument(
-                "Solver.label: out buffer must be C-contiguous");
-        }
+        py::array_t<uint8_t> out = prepare_out_buffer_(out_arg, buf, ndim);
         uint8_t* out_ptr = static_cast<uint8_t*>(out.request().ptr);
 
         int n_used = 0;
@@ -591,39 +556,9 @@ public:
             (void)expand_input;
             stage("expand");
 
-            // 2. Find adjacency pairs.
-            // Parallel max-reduce — was a single-threaded 1.2 ms loop at 2048².
-            int32_t max_label = 0;
-            const int64_t hw = total;
-            if (n_threads_ <= 1 || hw < 8192) {
-                for (int64_t i = 0; i < hw; ++i) {
-                    if (expanded[i] > max_label) max_label = expanded[i];
-                }
-            } else {
-                // Per-chunk partial maxes; final reduce on the main thread.
-                const size_t n_chunks = static_cast<size_t>(n_threads_) *
-                                        ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD;
-                partials_.assign(n_chunks, 0);
-                std::atomic<size_t> next{0};
-                const size_t total_sz = static_cast<size_t>(hw);
-                const size_t actual_chunks = std::min(n_chunks, total_sz);
-                const size_t chunk_sz = (total_sz + actual_chunks - 1) / actual_chunks;
-                const int32_t* ep = expanded;
-                int32_t* partials_ptr = partials_.data();
-                pool_->parallel([&, partials_ptr]() {
-                    size_t idx;
-                    while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < actual_chunks) {
-                        const size_t i0 = idx * chunk_sz;
-                        const size_t i1 = std::min(i0 + chunk_sz, total_sz);
-                        int32_t m = 0;
-                        for (size_t i = i0; i < i1; ++i) if (ep[i] > m) m = ep[i];
-                        partials_ptr[idx] = m;
-                    }
-                });
-                for (size_t i = 0; i < actual_chunks; ++i) {
-                    if (partials_[i] > max_label) max_label = partials_[i];
-                }
-            }
+            // 2. Find adjacency pairs. Parallel max-reduce first
+            // (was a single-threaded 1.2 ms loop at 2048²).
+            const int32_t max_label = parallel_max_label_(expanded, total);
             stage("max_scan");
             std::vector<std::pair<int32_t, int32_t>> pairs;
             {
@@ -651,167 +586,19 @@ public:
                                              indptr_, indices_);
             stage("build_csr");
 
-            // 4. Color: BFS attempt → if conflicts/unfinished, run local
-            // repair pass; only bump n_colors if both fail. Mirrors the
-            // numba `_solver` retry chain (sans Kempe-chain swaps, which
-            // are rarely triggered for the planar adjacency graphs ncolor
-            // sees in practice).
-            //
-            // The ``attempts_per_n`` random-offset attempts at each cur_n
-            // are independent (they only differ in the LCG seed used for
-            // restarts), so we race them in parallel on the pool. Wall-clock
-            // is now max(attempt_time) per cur_n iteration instead of sum.
-            // For small graphs the dispatch overhead dominates the BFS, so
-            // we fall back to the serial path below a threshold.
-            const int64_t max_iter = std::max<int64_t>(static_cast<int64_t>(indices_.size()) +
-                                                      static_cast<int64_t>(indptr_.size()), 512);
-            int cur_n = n_colors;
-            const int attempts_per_n = 4;
-            bool ok = false;
-            // Threshold tuned on M2 / 20-thread ForkJoinPool: below ~500
-            // edges the BFS finishes in <100 µs and dispatch eats the win.
-            // color_mode override: 0 = forced serial, 1 = forced parallel.
-            bool color_parallel;
-            if (color_mode == 0) color_parallel = false;
-            else if (color_mode == 1) color_parallel = (n_threads_ > 1);
-            else color_parallel = (n_threads_ > 1) &&
-                (static_cast<int64_t>(N) + M >= 500);
-            if (color_parallel) {
-                per_attempt_colors_.resize(attempts_per_n);
-                per_attempt_ok_.assign(attempts_per_n, 0);
-            }
-            for (int depth = 0; depth < max_depth && !ok; ++depth) {
-                if (color_parallel) {
-                    // Run the attempts_per_n random-offset attempts in parallel.
-                    // Each attempt has its own colors buffer (the BFS internally
-                    // also allocates its own counter / queue, so attempts are
-                    // fully independent — no cross-thread state).
-                    std::atomic<int> next{0};
-                    const int A = attempts_per_n;
-                    const int local_cur_n = cur_n;
-                    const int local_depth = depth;
-                    const int32_t* ip = indptr_.data();
-                    const int32_t* ix = indices_.data();
-                    pool_->parallel([&, local_cur_n, local_depth, ip, ix]() {
-                        int idx;
-                        while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < A) {
-                            auto& cv = per_attempt_colors_[idx];
-                            const int attempt_offset = local_depth + idx;
-                            // Welsh-Powell ordering on the first
-                            // attempts_per_n - 1 attempts (each with its
-                            // own random offset for the BFS restart
-                            // logic), with the last attempt reserved as
-                            // a label-ID fallback. WP can occasionally
-                            // paint itself into a corner (e.g. L2 + wrap
-                            // pushes some cells to a 5th colour); the
-                            // fallback recovers the 4-colouring without
-                            // bumping cur_n. Lowest-index successful
-                            // attempt wins, so a working WP is always
-                            // preferred over the label-ID fallback.
-                            const bool wp = balance && (idx < A - 1);
-                            const bool finished = ncolor_cpp::color_graph_csr_legacy(
-                                ip, ix, N,
-                                local_cur_n, rand_period, attempt_offset, max_iter, cv, wp);
-                            const bool conflict = !finished ||
-                                ncolor_cpp::has_conflict_csr(ip, ix, N, cv.data());
-                            bool a_ok;
-                            if (conflict) {
-                                a_ok = ncolor_cpp::repair_coloring(
-                                    ip, ix, N,
-                                    local_cur_n, std::max(4, max_depth), cv);
-                            } else {
-                                a_ok = true;
-                            }
-                            // For Welsh-Powell attempts (all but the last
-                            // when balance=true), require a CLEAN result
-                            // — repair tends to merge colours unevenly,
-                            // so a repaired WP coloring is usually less
-                            // balanced than the label-ID fallback. The
-                            // last attempt (label-ID safety net) accepts
-                            // any successful result.
-                            const bool require_clean = wp;
-                            per_attempt_ok_[idx] = (a_ok && (!require_clean || !conflict)) ? 1 : 0;
-                        }
-                    });
-                    // Take the lowest-index successful attempt
-                    // (preserves deterministic preference for the first
-                    // random offset when multiple attempts succeed).
-                    for (int a = 0; a < attempts_per_n; ++a) {
-                        if (per_attempt_ok_[a]) {
-                            colors_.swap(per_attempt_colors_[a]);
-                            ok = true;
-                            break;
-                        }
-                    }
-                } else {
-                    for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
-                        // See parallel branch — Welsh-Powell on the
-                        // first attempts_per_n - 1 attempts; last is
-                        // label-ID fallback. WP attempts must be clean
-                        // (no repair) to count, so a repaired WP doesn't
-                        // pre-empt the label-ID safety net.
-                        const bool wp = balance && (attempt < attempts_per_n - 1);
-                        const bool finished = ncolor_cpp::color_graph_csr_legacy(
-                            indptr_.data(), indices_.data(), N,
-                            cur_n, rand_period, depth + attempt, max_iter, colors_, wp);
-                        bool conflict = !finished || ncolor_cpp::has_conflict_csr(
-                            indptr_.data(), indices_.data(), N, colors_.data());
-                        bool a_ok;
-                        if (conflict) {
-                            a_ok = ncolor_cpp::repair_coloring(
-                                indptr_.data(), indices_.data(), N,
-                                cur_n, std::max(4, max_depth), colors_);
-                        } else {
-                            a_ok = true;
-                        }
-                        // Same gate as parallel: WP only counts when clean.
-                        if (a_ok && (!wp || !conflict)) ok = true;
-                    }
-                }
-                if (!ok) ++cur_n;  // bump n only when all attempts at cur_n failed
-            }
-            n_used = 0;
-            for (uint8_t c : colors_) if (c > n_used) n_used = c;
-
-            // Cheap O(M) tally of adjacent same-color pairs. Matches the
-            // legacy ``conflicts = sum(lut[pairs[:,0]] == lut[pairs[:,1]])``
-            // since src_idx_/dst_idx_ are exactly the pairs from connect()
-            // (shifted to 0-based) and colors_[k] == lut_[k+1].
-            last_n_conflicts_ = 0;
-            for (int32_t i = 0; i < M; ++i) {
-                if (colors_[src_idx_[i]] == colors_[dst_idx_[i]]) ++last_n_conflicts_;
-            }
-
+            // 4. Coloring: BFS + repair fallback × attempts_per_n random
+            // offsets, retrying with cur_n+1 if all attempts fail. See
+            // ``solve_coloring_`` for full algorithm + parallel-attempt
+            // dispatch.
+            n_used = solve_coloring_(N, M, n_colors, max_depth, rand_period,
+                                     balance, color_mode);
             stage("color");
-            // 5. Build LUT and apply (expanded[i] is in 1..N, so lut size = N+1).
+
+            // 5. Build LUT (expanded[i] is in 1..N, so lut size = N+1) and
+            // apply it to the expanded-label buffer.
             lut_.assign(static_cast<size_t>(N) + 1, 0);
             for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
-
-            // Apply LUT in parallel — bg pixels get color 0, foreground
-            // pixels get lut[expanded[i]]. The bg pattern was captured
-            // by ``cast_with_bg`` at the start (bg_mask_[i]==1 wherever
-            // the original input was 0); using a uint8 mask here keeps
-            // the inner loop typeless wrt the original dtype.
-            {
-                const int nt = std::max(1, n_threads_);
-                const uint8_t* bg_p = bg_mask_.data();
-                const int32_t* ep = expanded;
-                const uint8_t* lp = lut_.data();
-                uint8_t* op = out_ptr;
-                if (nt == 1 || total < 8192) {
-                    for (int64_t i = 0; i < total; ++i) {
-                        op[i] = bg_p[i] ? 0 : lp[ep[i]];
-                    }
-                } else {
-                    ncolor_cpp::dispatch_parallel(*pool_, static_cast<size_t>(total),
-                        static_cast<size_t>(nt) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
-                        [bg_p, ep, lp, op](size_t begin, size_t end) {
-                            for (size_t i = begin; i < end; ++i) {
-                                op[i] = bg_p[i] ? 0 : lp[ep[i]];
-                            }
-                        });
-                }
-            }
+            apply_color_lut_(expanded, out_ptr, total);
             stage("apply_lut");
         }  // close: if (!early_exit_empty)
         }  // close: gil_scoped_release scope
@@ -830,6 +617,213 @@ public:
     int get_last_n_conflicts() const { return last_n_conflicts_; }
 
 private:
+    // Validate or allocate the uint8 output buffer. Returns the (possibly
+    // caller-supplied) py::array_t to write into. Throws if a supplied
+    // buffer is the wrong dtype / shape / not C-contiguous.
+    py::array_t<uint8_t> prepare_out_buffer_(
+            py::object out_arg, const py::buffer_info& src_buf, int ndim) {
+        if (out_arg.is_none()) {
+            std::vector<py::ssize_t> out_shape(ndim);
+            for (int d = 0; d < ndim; ++d) out_shape[d] = src_buf.shape[d];
+            return py::array_t<uint8_t>(out_shape);
+        }
+        // Caller-supplied buffer: must be uint8, C-contiguous, exact shape.
+        // Reusing an output buffer across calls saves the per-call alloc
+        // (16 MiB at 4096²); useful for batch pipelines. Strict dtype check
+        // (not pybind11's auto-cast) so the caller's buffer is actually the
+        // one written — a silent copy would defeat the purpose of out=.
+        const py::array out_view = py::cast<py::array>(out_arg);
+        if (out_view.dtype().kind() != 'u' || out_view.dtype().itemsize() != 1) {
+            throw std::invalid_argument("Solver.label: out buffer must be uint8");
+        }
+        py::array_t<uint8_t> out = py::cast<py::array_t<uint8_t>>(out_arg);
+        const auto out_buf = out.request();
+        if (out_buf.ndim != ndim) {
+            throw std::invalid_argument(
+                "Solver.label: out buffer ndim does not match input");
+        }
+        for (int d = 0; d < ndim; ++d) {
+            if (out_buf.shape[d] != src_buf.shape[d]) {
+                throw std::invalid_argument(
+                    "Solver.label: out buffer shape does not match input");
+            }
+        }
+        if (!(out.flags() & py::array::c_style)) {
+            throw std::invalid_argument(
+                "Solver.label: out buffer must be C-contiguous");
+        }
+        return out;
+    }
+
+    // Parallel max-reduce over the (already-expanded) int32 label buffer.
+    // Below the threshold runs serially (dispatch overhead exceeds work).
+    int32_t parallel_max_label_(const int32_t* lbl, int64_t total) {
+        int32_t max_label = 0;
+        if (n_threads_ <= 1 || total < 8192) {
+            for (int64_t i = 0; i < total; ++i) {
+                if (lbl[i] > max_label) max_label = lbl[i];
+            }
+            return max_label;
+        }
+        const size_t total_sz = static_cast<size_t>(total);
+        const size_t n_chunks = static_cast<size_t>(n_threads_) *
+                                ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD;
+        const size_t actual_chunks = std::min(n_chunks, total_sz);
+        const size_t chunk_sz = (total_sz + actual_chunks - 1) / actual_chunks;
+        partials_.assign(actual_chunks, 0);
+        std::atomic<size_t> next{0};
+        int32_t* partials_ptr = partials_.data();
+        pool_->parallel([&, partials_ptr]() {
+            size_t idx;
+            while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < actual_chunks) {
+                const size_t i0 = idx * chunk_sz;
+                const size_t i1 = std::min(i0 + chunk_sz, total_sz);
+                int32_t m = 0;
+                for (size_t i = i0; i < i1; ++i) if (lbl[i] > m) m = lbl[i];
+                partials_ptr[idx] = m;
+            }
+        });
+        for (size_t i = 0; i < actual_chunks; ++i) {
+            if (partials_[i] > max_label) max_label = partials_[i];
+        }
+        return max_label;
+    }
+
+    // Coloring loop: BFS attempt → conflict-check → repair fallback,
+    // wrapped in attempts_per_n random-offset attempts at each cur_n,
+    // bumping cur_n if all attempts fail. Mirrors the numba ``_solver``
+    // retry chain (sans Kempe-chain swaps; rare for the planar graphs
+    // ncolor sees in practice).
+    //
+    // The attempts at each cur_n only differ in the LCG seed used for
+    // BFS restart, so for N+M ≥ 500 we race them in parallel on the pool.
+    // Wall-clock becomes max(attempt_time) per cur_n iteration instead of
+    // sum. Smaller graphs fall back to the serial path (dispatch overhead
+    // dominates the BFS).
+    //
+    // Welsh-Powell ordering covers attempts [0, attempts_per_n - 1) when
+    // ``balance`` is on; the last attempt is reserved as a label-ID
+    // fallback that recovers from edge cases (e.g. L2 + wrap occasionally
+    // pushes some cells to a 5th colour with WP). WP attempts must be
+    // CLEAN to count — repair tends to merge colours unevenly, so a
+    // repaired WP coloring is usually less balanced than the safety net.
+    //
+    // Side effects: writes the winning coloring into ``colors_`` and the
+    // adjacency-conflict count into ``last_n_conflicts_``. Returns
+    // ``n_used`` = max colour value in the winning coloring.
+    int solve_coloring_(int32_t N, int32_t M, int n_colors,
+                        int max_depth, int rand_period, bool balance,
+                        int color_mode) {
+        constexpr int attempts_per_n = 4;
+        const int64_t max_iter = std::max<int64_t>(
+            static_cast<int64_t>(indices_.size()) +
+            static_cast<int64_t>(indptr_.size()), 512);
+        // color_mode: -1 = auto (threshold-based), 0 = forced serial,
+        // 1 = forced parallel. Auto threshold tuned on M2 / 20-thread
+        // ForkJoinPool: below ~500 edges the BFS finishes in <100 µs and
+        // dispatch overhead eats the win.
+        bool color_parallel;
+        if (color_mode == 0) color_parallel = false;
+        else if (color_mode == 1) color_parallel = (n_threads_ > 1);
+        else color_parallel = (n_threads_ > 1) &&
+            (static_cast<int64_t>(N) + M >= 500);
+        if (color_parallel) {
+            per_attempt_colors_.resize(attempts_per_n);
+            per_attempt_ok_.assign(attempts_per_n, 0);
+        }
+
+        int cur_n = n_colors;
+        bool ok = false;
+        for (int depth = 0; depth < max_depth && !ok; ++depth) {
+            if (color_parallel) {
+                std::atomic<int> next{0};
+                const int local_cur_n = cur_n;
+                const int local_depth = depth;
+                const int32_t* ip = indptr_.data();
+                const int32_t* ix = indices_.data();
+                pool_->parallel([&, local_cur_n, local_depth, ip, ix]() {
+                    int idx;
+                    while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < attempts_per_n) {
+                        auto& cv = per_attempt_colors_[idx];
+                        const int attempt_offset = local_depth + idx;
+                        const bool wp = balance && (idx < attempts_per_n - 1);
+                        const bool finished = ncolor_cpp::color_graph_csr_legacy(
+                            ip, ix, N, local_cur_n, rand_period,
+                            attempt_offset, max_iter, cv, wp);
+                        const bool conflict = !finished ||
+                            ncolor_cpp::has_conflict_csr(ip, ix, N, cv.data());
+                        bool a_ok = !conflict || ncolor_cpp::repair_coloring(
+                            ip, ix, N, local_cur_n, std::max(4, max_depth), cv);
+                        // WP must be clean — repair pre-empting a WP attempt
+                        // would shadow the cleaner label-ID safety net.
+                        per_attempt_ok_[idx] = (a_ok && (!wp || !conflict)) ? 1 : 0;
+                    }
+                });
+                // Lowest-index successful attempt wins (deterministic
+                // preference for the first random offset).
+                for (int a = 0; a < attempts_per_n; ++a) {
+                    if (per_attempt_ok_[a]) {
+                        colors_.swap(per_attempt_colors_[a]);
+                        ok = true;
+                        break;
+                    }
+                }
+            } else {
+                for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
+                    const bool wp = balance && (attempt < attempts_per_n - 1);
+                    const bool finished = ncolor_cpp::color_graph_csr_legacy(
+                        indptr_.data(), indices_.data(), N,
+                        cur_n, rand_period, depth + attempt, max_iter,
+                        colors_, wp);
+                    const bool conflict = !finished || ncolor_cpp::has_conflict_csr(
+                        indptr_.data(), indices_.data(), N, colors_.data());
+                    bool a_ok = !conflict || ncolor_cpp::repair_coloring(
+                        indptr_.data(), indices_.data(), N,
+                        cur_n, std::max(4, max_depth), colors_);
+                    if (a_ok && (!wp || !conflict)) ok = true;
+                }
+            }
+            if (!ok) ++cur_n;
+        }
+
+        int n_used = 0;
+        for (uint8_t c : colors_) if (c > n_used) n_used = c;
+        // Cheap O(M) tally of adjacent same-colour pairs. Matches the
+        // legacy ``conflicts = sum(lut[pairs[:,0]] == lut[pairs[:,1]])``
+        // since src_idx_/dst_idx_ are exactly the pairs from connect()
+        // (shifted to 0-based) and colors_[k] == lut_[k+1].
+        last_n_conflicts_ = 0;
+        for (int32_t i = 0; i < M; ++i) {
+            if (colors_[src_idx_[i]] == colors_[dst_idx_[i]]) ++last_n_conflicts_;
+        }
+        return n_used;
+    }
+
+    // Apply the colour LUT to ``expanded[i]``: bg pixels (bg_mask_[i]==1)
+    // get colour 0; foreground pixels get ``lut_[expanded[i]]``. Parallel
+    // when total ≥ 8192. The bg pattern was captured by ``cast_with_bg``
+    // at the start of label(); using a uint8 mask here keeps the inner
+    // loop typeless wrt the original input dtype.
+    void apply_color_lut_(const int32_t* expanded, uint8_t* out_ptr,
+                          int64_t total) {
+        const int nt = std::max(1, n_threads_);
+        const uint8_t* bg_p = bg_mask_.data();
+        const uint8_t* lp = lut_.data();
+        if (nt == 1 || total < 8192) {
+            for (int64_t i = 0; i < total; ++i) {
+                out_ptr[i] = bg_p[i] ? 0 : lp[expanded[i]];
+            }
+            return;
+        }
+        ncolor_cpp::dispatch_parallel(*pool_, static_cast<size_t>(total),
+            static_cast<size_t>(nt) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
+            [bg_p, expanded, lp, out_ptr](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i) {
+                    out_ptr[i] = bg_p[i] ? 0 : lp[expanded[i]];
+                }
+            });
+    }
+
     int n_threads_;
     std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
     ncolor_cpp::ExpandBuffers expand_bufs_;
