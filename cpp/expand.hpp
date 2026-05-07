@@ -117,25 +117,26 @@ static inline void envelope_fill_simd(
     }
 }
 
-// Contiguous (stride=1) variant. Templated on ``Wrap`` so the compiler
-// emits two specialised codepaths and the wrap branches cost nothing
-// at runtime when Wrap=false.
-//
-// Wrap=true: the envelope considers ghost seeds at v - N and v + N
-// (toroidal Voronoi). Phase 1 iterates i ∈ [-N, 2N), reading lbl/dist
-// from (i mod N). Phase 2 still fills only [0, N); segments entirely
-// in [-N, 0) are skipped naturally by the existing i_end <= i_start
-// guard, and the last segment is clamped to N. ~2-3× the standard
-// Phase 1 cost (one extra full-axis pass per ghost side); Phase 2
-// unchanged.
-template <bool Wrap>
-inline void envelope_pass_row_contig_impl(
-        int32_t* __restrict lbl, int32_t* __restrict dist, int64_t N,
+// Templated on (Wrap, Contig) so each (wrap × stride==1) pair gets its own
+// inlined specialization with all branches resolved at compile time:
+//   - Wrap=false : Phase 1 = real seeds only (one [0,N) sweep).
+//   - Wrap=true  : ghost seeds at v±N → Phase 1 sweeps [-N, 2N), reading
+//                  lbl/dist from (i mod N). Phase 2 still fills only
+//                  [0, N); segments entirely in [-N, 0) are skipped by
+//                  the i_end ≤ i_start guard, and the last segment is
+//                  clamped to N. ~2-3× the standard Phase 1 cost.
+//   - Contig=true  : direct lbl[i] / dist[i] access; Phase 2 uses the
+//                    SIMD fill helper.
+//   - Contig=false : strided lbl[i*stride] / dist[i*stride]; scalar fill.
+template <bool Wrap, bool Contig>
+inline void envelope_pass_row_impl(
+        int32_t* __restrict lbl, int32_t* __restrict dist,
+        int64_t N, int64_t stride,
         int32_t* __restrict v, int32_t* __restrict lblstk,
         int32_t* __restrict g, double* __restrict z,
         double* __restrict vd, double* __restrict vd_sq) {
     int32_t k = 0;
-    // Inline push-onto-envelope helper (lambda captures all the stack arrays).
+    // Inline push-onto-envelope helper.
     auto push_seed = [&](int64_t i, int32_t lbl_val, int32_t gi) {
         const double fi = static_cast<double>(i);
         const double gf = static_cast<double>(gi);
@@ -161,27 +162,35 @@ inline void envelope_pass_row_contig_impl(
         lblstk[k] = lbl_val;
         g[k] = gi;
         k += 1;
+    };
+
+    auto load_lbl  = [&](int64_t idx) -> int32_t {
+        if constexpr (Contig) return lbl[idx]; else return lbl[idx * stride];
+    };
+    auto load_dist = [&](int64_t idx) -> int32_t {
+        if constexpr (Contig) return dist[idx]; else return dist[idx * stride];
     };
 
     if constexpr (Wrap) {
         // Pass 1a: ghost seeds at v - N (i ∈ [-N, 0), source from i + N).
         for (int64_t i = -N; i < 0; ++i) {
-            const int64_t src = i + N;
-            if (lbl[src] == 0) continue;
-            push_seed(i, lbl[src], dist[src]);
+            const int32_t lv = load_lbl(i + N);
+            if (lv == 0) continue;
+            push_seed(i, lv, load_dist(i + N));
         }
     }
     // Pass 1b: real seeds (i ∈ [0, N)).
     for (int64_t i = 0; i < N; ++i) {
-        if (lbl[i] == 0) continue;
-        push_seed(i, lbl[i], dist[i]);
+        const int32_t lv = load_lbl(i);
+        if (lv == 0) continue;
+        push_seed(i, lv, load_dist(i));
     }
     if constexpr (Wrap) {
         // Pass 1c: ghost seeds at v + N (i ∈ [N, 2N), source from i - N).
         for (int64_t i = N; i < 2 * N; ++i) {
-            const int64_t src = i - N;
-            if (lbl[src] == 0) continue;
-            push_seed(i, lbl[src], dist[src]);
+            const int32_t lv = load_lbl(i - N);
+            if (lv == 0) continue;
+            push_seed(i, lv, load_dist(i - N));
         }
     }
     if (k == 0) return;
@@ -200,102 +209,14 @@ inline void envelope_pass_row_contig_impl(
         const int32_t lbl_j = lblstk[j];
         const int32_t g_j = g[j];
         const int32_t v_j = v[j];
-        envelope_fill_simd(lbl, dist, i_start, i_end, lbl_j, g_j, v_j);
-        i_start = i_end;
-    }
-}
-
-inline void envelope_pass_row_contig(
-        int32_t* __restrict lbl, int32_t* __restrict dist, int64_t N,
-        int32_t* __restrict v, int32_t* __restrict lblstk,
-        int32_t* __restrict g, double* __restrict z,
-        double* __restrict vd, double* __restrict vd_sq) {
-    envelope_pass_row_contig_impl<false>(lbl, dist, N, v, lblstk, g, z, vd, vd_sq);
-}
-
-inline void envelope_pass_row_contig_wrap(
-        int32_t* __restrict lbl, int32_t* __restrict dist, int64_t N,
-        int32_t* __restrict v, int32_t* __restrict lblstk,
-        int32_t* __restrict g, double* __restrict z,
-        double* __restrict vd, double* __restrict vd_sq) {
-    envelope_pass_row_contig_impl<true>(lbl, dist, N, v, lblstk, g, z, vd, vd_sq);
-}
-
-// Strided variant. Same algorithm as envelope_pass_row_contig but indexes
-// lbl/dist with i*stride. Templated on Wrap so the wrap branches cost
-// nothing at runtime when Wrap=false. See contig version for the wrap-
-// algorithm rationale.
-template <bool Wrap>
-inline void envelope_pass_row_strided_impl(
-        int32_t* lbl, int32_t* dist, int64_t N, int64_t stride,
-        int32_t* v, int32_t* lblstk, int32_t* g, double* z,
-        double* vd, double* vd_sq) {
-    int32_t k = 0;
-    auto push_seed = [&](int64_t i, int32_t lbl_val, int32_t gi) {
-        const double fi = static_cast<double>(i);
-        const double gf = static_cast<double>(gi);
-        const double fi_sq_plus_gf = fi * fi + gf;
-        double new_z = -1e18;
-        while (k > 0) {
-            const int32_t top = k - 1;
-            const double ft = vd[top];
-            const double ft_sq = vd_sq[top];
-            const double g_top = static_cast<double>(g[top]);
-            const double numer = fi_sq_plus_gf - g_top - ft_sq;
-            const double denom = 2.0 * (fi - ft);
-            if (numer > z[top] * denom) {
-                new_z = numer / denom;
-                break;
+        if constexpr (Contig) {
+            envelope_fill_simd(lbl, dist, i_start, i_end, lbl_j, g_j, v_j);
+        } else {
+            for (int64_t i = i_start; i < i_end; ++i) {
+                const int32_t di = static_cast<int32_t>(i) - v_j;
+                lbl[i * stride] = lbl_j;
+                dist[i * stride] = g_j + di * di;
             }
-            k -= 1;
-        }
-        z[k] = new_z;
-        v[k] = static_cast<int32_t>(i);
-        vd[k] = fi;
-        vd_sq[k] = fi * fi;
-        lblstk[k] = lbl_val;
-        g[k] = gi;
-        k += 1;
-    };
-
-    if constexpr (Wrap) {
-        for (int64_t i = -N; i < 0; ++i) {
-            const int64_t src = (i + N) * stride;
-            if (lbl[src] == 0) continue;
-            push_seed(i, lbl[src], dist[src]);
-        }
-    }
-    for (int64_t i = 0; i < N; ++i) {
-        if (lbl[i * stride] == 0) continue;
-        push_seed(i, lbl[i * stride], dist[i * stride]);
-    }
-    if constexpr (Wrap) {
-        for (int64_t i = N; i < 2 * N; ++i) {
-            const int64_t src = (i - N) * stride;
-            if (lbl[src] == 0) continue;
-            push_seed(i, lbl[src], dist[src]);
-        }
-    }
-    if (k == 0) return;
-    int64_t i_start = 0;
-    for (int32_t j = 0; j < k; ++j) {
-        int64_t i_end;
-        if (j + 1 == k) {
-            i_end = N;
-        } else {
-            const double zj1 = z[j + 1];
-            if (zj1 <= static_cast<double>(i_start)) continue;
-            i_end = (zj1 >= static_cast<double>(N)) ? N : static_cast<int64_t>(std::ceil(zj1));
-            if (i_end > N) i_end = N;
-        }
-        if (i_end <= i_start) continue;
-        const int32_t lbl_j = lblstk[j];
-        const int32_t g_j = g[j];
-        const int32_t v_j = v[j];
-        for (int64_t i = i_start; i < i_end; ++i) {
-            const int32_t di = static_cast<int32_t>(i) - v_j;
-            lbl[i * stride] = lbl_j;
-            dist[i * stride] = g_j + di * di;
         }
         i_start = i_end;
     }
@@ -305,22 +226,16 @@ inline void envelope_pass_row(
         int32_t* lbl, int32_t* dist, int64_t N, int64_t stride,
         int32_t* v, int32_t* lblstk, int32_t* g, double* z,
         double* vd, double* vd_sq) {
-    if (stride == 1) {
-        envelope_pass_row_contig_impl<false>(lbl, dist, N, v, lblstk, g, z, vd, vd_sq);
-    } else {
-        envelope_pass_row_strided_impl<false>(lbl, dist, N, stride, v, lblstk, g, z, vd, vd_sq);
-    }
+    if (stride == 1) envelope_pass_row_impl<false, true >(lbl, dist, N, 1,      v, lblstk, g, z, vd, vd_sq);
+    else             envelope_pass_row_impl<false, false>(lbl, dist, N, stride, v, lblstk, g, z, vd, vd_sq);
 }
 
 inline void envelope_pass_row_wrap(
         int32_t* lbl, int32_t* dist, int64_t N, int64_t stride,
         int32_t* v, int32_t* lblstk, int32_t* g, double* z,
         double* vd, double* vd_sq) {
-    if (stride == 1) {
-        envelope_pass_row_contig_impl<true>(lbl, dist, N, v, lblstk, g, z, vd, vd_sq);
-    } else {
-        envelope_pass_row_strided_impl<true>(lbl, dist, N, stride, v, lblstk, g, z, vd, vd_sq);
-    }
+    if (stride == 1) envelope_pass_row_impl<true, true >(lbl, dist, N, 1,      v, lblstk, g, z, vd, vd_sq);
+    else             envelope_pass_row_impl<true, false>(lbl, dist, N, stride, v, lblstk, g, z, vd, vd_sq);
 }
 
 // =============================================================================
