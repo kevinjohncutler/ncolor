@@ -41,20 +41,17 @@ install_deps = [
 ]
 
 # Optional features:
-#   [legacy]: numba reference impl reachable via ncolor.label(..., verbose=True)
-#             and the ``_numba_legacy`` submodule. ~141 MB extra disk.
 #   [clean]:  ncolor.format_labels(clean=True) + ncolor.delete_spurs use
 #             scikit-image (CCL + remove_small_holes), scipy.ndimage
 #             (convolve), and fastremap.renumber/refit. ~140 MB extra disk.
 #             Cpp ncolor.connected_components / ncolor.regionprops are
 #             available without this extra.
+#
+# The numba reference implementation was retired in v1.6.0 — the cpp
+# engine is the only backend. The numba sources still live in the repo
+# at ``legacy_numba/`` (gitignored) for parity-testing if needed.
 extras_deps = {
-    # numba reference implementation pulls fastremap (renumber/refit) and
-    # scipy.ndimage (label-conflict checks) at module top-level — the
-    # [legacy] extra is only useful with all three present.
-    "legacy": ["numba>=0.60.0", "scipy", "fastremap"],
-    "clean":  ["scipy", "scikit-image", "fastremap"],
-    "full":   ["numba>=0.60.0", "scipy", "scikit-image", "fastremap"],
+    "clean": ["scipy", "scikit-image", "fastremap"],
 }
 
 extra_compile_args = []

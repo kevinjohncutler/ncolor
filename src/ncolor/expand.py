@@ -1,6 +1,5 @@
 """Public ``ncolor.expand_labels`` API — thin wrapper over the C++
-:class:`ncolor._backend.ExpandEngine`. Falls back to the numba reference
-when there's nothing to expand (empty array / no labels).
+:class:`ncolor._backend.ExpandEngine`.
 """
 from __future__ import annotations
 
@@ -55,9 +54,11 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
 
     arr = np.asarray(label_image)
     if arr.size == 0 or int(arr.max()) == 0:
-        # Nothing to expand — fall back to legacy (handles the empty case).
-        from ._numba_legacy.expand import expand_labels as _legacy
-        return _legacy(label_image, metric="l2" if p == 2 else "l1")
+        # Nothing to expand: empty array or no foreground seeds. The cpp
+        # ExpandEngine assumes at least one seed; short-circuit to an
+        # int32 copy so callers always get a fresh writable buffer of
+        # the canonical expand_labels dtype.
+        return arr.astype(np.int32, copy=True)
 
     arr32 = arr.astype(np.int32, copy=False)
     # Native cpp toroidal kernels for both L1 and L2:

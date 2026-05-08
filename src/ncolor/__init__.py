@@ -1,14 +1,11 @@
 """ncolor — 4-color label graph coloring and label expansion utilities.
 
 Public API resolves lazily (PEP 562 ``__getattr__``): bare ``import ncolor``
-does almost no work; submodules — and their numba/C++ extension
-dependencies — load only on first attribute access.
+does almost no work; submodules — and the C++ extension — load only on
+first attribute access.
 
-Default backend is the C++ engine in :mod:`ncolor._backend`. Set
-``NCOLOR_BACKEND=numba`` in the environment to fall back to the original
-numba reference implementation in :mod:`ncolor._numba_legacy` (kept as a
-sanity-check toggle; will be removed once the C++ path is fully battle-
-tested).
+The original numba reference implementation was retired in v1.6.0; the
+C++ engine in :mod:`ncolor._backend` is the only backend.
 
 Public names:
 
@@ -20,8 +17,6 @@ Public names:
 * ``connected_components`` — N-D connected-components labelling
 * ``regionprops``          — area / bbox / centroid for a labelled image
 """
-import os as _os
-
 from ._version import __version__  # cheap; no heavy deps
 
 __all__ = [
@@ -34,31 +29,16 @@ __all__ = [
     "regionprops",
 ]
 
-_BACKEND = _os.environ.get("NCOLOR_BACKEND", "cpp").lower()
-if _BACKEND not in ("cpp", "numba"):
-    raise ValueError(
-        f"NCOLOR_BACKEND must be 'cpp' or 'numba', got {_BACKEND!r}"
-    )
-
 # Map public attribute -> source module (relative path).
-if _BACKEND == "numba":
-    _LAZY_ATTRS = {
-        "label": "._numba_legacy.color",
-        "unique_nonzero": "._numba_legacy.color",
-        "get_lut": "._numba_legacy.color",
-        "format_labels": ".format",
-        "expand_labels": "._numba_legacy.expand",
-    }
-else:
-    _LAZY_ATTRS = {
-        "label": ".color",
-        "unique_nonzero": ".color",
-        "get_lut": ".color",
-        "connected_components": ".color",
-        "regionprops": ".color",
-        "format_labels": ".format",
-        "expand_labels": ".expand",
-    }
+_LAZY_ATTRS = {
+    "label": ".color",
+    "unique_nonzero": ".color",
+    "get_lut": ".color",
+    "connected_components": ".color",
+    "regionprops": ".color",
+    "format_labels": ".format",
+    "expand_labels": ".expand",
+}
 
 
 def __getattr__(name):

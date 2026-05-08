@@ -140,3 +140,8 @@ dmypy.json
 # macOS AppleDouble sidecar files (created on NAS / SMB mounts)
 ._*
 .DS_Store
+
+# Local-only numba reference implementation (kept out of the package and
+# off PyPI as of v1.6.0; resurrect from git history if you need it for
+# parity testing).
+/legacy_numba/

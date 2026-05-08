@@ -1,61 +1,11 @@
 """Public ``ncolor.label`` / ``ncolor.connect`` API — thin wrappers over
 the :mod:`ncolor._backend` C++ engine.
-
-Less-common branches of the legacy numba ``label()`` (``return_lut``,
-``check_conflicts``, ``return_conflicts``, ``expand=False``) fall through
-to :mod:`ncolor._numba_legacy.color` because the C++ Solver doesn't yet
-expose those codepaths. Day-to-day usage (``label(mask)`` with the
-defaults) stays on the C++ fast path.
 """
 from __future__ import annotations
 
 import numpy as np
 
 from .format import format_labels
-
-# Re-export numba-side helpers that callers (tests, label_experimental_*,
-# notebooks) reach for at this module path. The public wrappers below
-# intentionally shadow ``label``/``connect``/``unique_nonzero``/``get_lut``
-# with the C++-backed versions.
-#
-# The legacy module imports ``numba`` at top level. Since v1.6.0 numba is
-# an optional ``[legacy]`` extra (the cpp pipeline doesn't need it), so
-# this import may fail. We fall back to stub callables that raise an
-# informative error — keeps ``import ncolor`` working without numba.
-try:
-    from ._numba_legacy.color import (  # noqa: F401
-        is_sequential,
-        _normalize_labels,
-        neighbors,
-        search,
-        _PARALLEL_THRESHOLD,
-    )
-    _NUMBA_LEGACY_AVAILABLE = True
-except ImportError:
-    _NUMBA_LEGACY_AVAILABLE = False
-    _PARALLEL_THRESHOLD = None
-    def _missing_numba(name):
-        def _raise(*a, **kw):
-            raise ImportError(
-                f"ncolor.color.{name} requires the legacy numba backend. "
-                "Install with `pip install ncolor[legacy]`."
-            )
-        return _raise
-    is_sequential     = _missing_numba("is_sequential")
-    _normalize_labels = _missing_numba("_normalize_labels")
-    neighbors         = _missing_numba("neighbors")
-    search            = _missing_numba("search")
-
-
-def _legacy_label(*args, **kwargs):
-    if not _NUMBA_LEGACY_AVAILABLE:
-        raise ImportError(
-            "ncolor.label(..., verbose=True) routes to the legacy numba "
-            "implementation, which requires the [legacy] extra. "
-            "Install with `pip install ncolor[legacy]`."
-        )
-    from ._numba_legacy.color import label as _legacy
-    return _legacy(*args, **kwargs)
 
 
 # Module-level Solver singleton. The C++ Solver owns a persistent thread
@@ -80,9 +30,6 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           out=None, p=1, wrap=False, balance=True):
     """4-color graph coloring of a label image.
 
-    Default path uses the C++ Solver. ``verbose`` still falls back to the
-    numba reference (the cpp pipeline doesn't print stage info).
-
     Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
     across calls — useful for batch pipelines.
 
@@ -106,13 +53,9 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     especially with p=1 where the BFS would otherwise concentrate
     color 4 unevenly.
     """
-    if verbose:
-        return _legacy_label(lab, n=n, conn=conn, max_depth=max_depth,
-                             offset=offset, expand=expand, return_n=return_n,
-                             return_lut=return_lut, verbose=verbose,
-                             check_conflicts=check_conflicts,
-                             return_conflicts=return_conflicts,
-                             format_input=format_input)
+    # ``verbose`` was a stage-trace flag for the (now-retired) numba
+    # reference impl. Accepted for back-compat; ignored on the cpp path.
+    del verbose
 
     # Common path: cpp Solver handles format_labels (compact 1..N with
     # min-shift), expand (or skip when expand=False), connect, color,
@@ -177,6 +120,19 @@ def unique_nonzero(labels):
     arr = np.asarray(labels)
     u = np.unique(arr)
     return u[u != 0]
+
+
+def is_sequential(labels):
+    """Whether the unique label values form a contiguous integer run.
+
+    ``True`` for label arrays already in canonical 1..N (or 0..N) form;
+    ``False`` if any value is missing from the run. Empty arrays are
+    treated as sequential.
+    """
+    u = np.unique(np.asarray(labels))
+    if u.size <= 1:
+        return True
+    return bool(np.all(np.diff(u) == 1))
 
 
 def connected_components(mask, conn=2):
