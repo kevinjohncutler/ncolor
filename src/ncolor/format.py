@@ -1,13 +1,37 @@
 import numpy as np
-import fastremap
 
-# Lazy imports for heavy dependencies - only import when functions are called
+# Lazy imports for heavy dependencies. fastremap, scipy, and scikit-image
+# are all in the [clean] extra; the cpp fast-path below never imports
+# them. Only the legacy ``format_labels(clean=True/...)`` slow path and
+# ``delete_spurs`` reach for them.
+def _lazy_import_fastremap():
+    try:
+        import fastremap
+    except ImportError as exc:
+        raise ImportError(
+            "ncolor.format_labels(clean=True) and the legacy fallback "
+            "use fastremap. Install with `pip install ncolor[clean]`."
+        ) from exc
+    return fastremap
+
 def _lazy_import_skimage_measure():
-    from skimage import measure
+    try:
+        from skimage import measure
+    except ImportError as exc:
+        raise ImportError(
+            "ncolor.format_labels(clean=True) uses scikit-image. "
+            "Install with `pip install ncolor[clean]`."
+        ) from exc
     return measure
 
 def _lazy_import_skimage_morphology():
-    from skimage.morphology import remove_small_holes
+    try:
+        from skimage.morphology import remove_small_holes
+    except ImportError as exc:
+        raise ImportError(
+            "ncolor.delete_spurs uses scikit-image. "
+            "Install with `pip install ncolor[clean]`."
+        ) from exc
     return remove_small_holes
 
 
@@ -130,8 +154,9 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                     print('Warning - found mask area less than', min_area)
                     print('Removing it.')
     
-    fastremap.renumber(labels,in_place=True) # convenient to have unit increments from 1 to N cells
-    labels = fastremap.refit(labels) # put into smaller data type if possible 
+    fastremap = _lazy_import_fastremap()
+    fastremap.renumber(labels, in_place=True)  # unit increments from 1..N cells
+    labels = fastremap.refit(labels)           # downcast dtype if possible
     return labels
 
 def delete_spurs(mask):

@@ -32,13 +32,30 @@ except ImportError:
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
+# Hard runtime deps for the cpp pipeline. ncolor.label, ncolor.expand_labels,
+# ncolor.format_labels, ncolor.connected_components, ncolor.regionprops all
+# work with just numpy + platformdirs.
 install_deps = [
-    "numba>=0.60.0",
-    "scipy",
-    "fastremap",
-    "scikit-image",
-    "platformdirs",  # used by the SMT calibration cache + native loader
+    "numpy",
+    "platformdirs",  # SMT calibration cache + native loader
 ]
+
+# Optional features:
+#   [legacy]: numba reference impl reachable via ncolor.label(..., verbose=True)
+#             and the ``_numba_legacy`` submodule. ~141 MB extra disk.
+#   [clean]:  ncolor.format_labels(clean=True) + ncolor.delete_spurs use
+#             scikit-image (CCL + remove_small_holes), scipy.ndimage
+#             (convolve), and fastremap.renumber/refit. ~140 MB extra disk.
+#             Cpp ncolor.connected_components / ncolor.regionprops are
+#             available without this extra.
+extras_deps = {
+    # numba reference implementation pulls fastremap (renumber/refit) and
+    # scipy.ndimage (label-conflict checks) at module top-level — the
+    # [legacy] extra is only useful with all three present.
+    "legacy": ["numba>=0.60.0", "scipy", "fastremap"],
+    "clean":  ["scipy", "scikit-image", "fastremap"],
+    "full":   ["numba>=0.60.0", "scipy", "scikit-image", "fastremap"],
+}
 
 extra_compile_args = []
 extra_link_args = []
@@ -163,6 +180,7 @@ setup(
     cmdclass={"build_ext": build_ext},
     use_scm_version=True,
     install_requires=install_deps,
+    extras_require=extras_deps,
     include_package_data=True,
     classifiers=[
         "Programming Language :: Python :: 3",

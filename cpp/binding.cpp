@@ -16,6 +16,7 @@
 #include <memory>
 #include <vector>
 
+#include "cc_label.hpp"
 #include "chamfer.hpp"
 #include "color.hpp"
 #include "expand_lp.hpp"
@@ -833,4 +834,144 @@ PYBIND11_MODULE(_impl, m) {
              "Number of adjacent same-color pairs in the most recent\n"
              "label() output. 0 means the coloring is valid; nonzero\n"
              "means the solver bailed out without finding a clean coloring.");
+
+    // Standalone N-D connected-components labelling. Single-threaded
+    // two-pass union-find. Drop-in for skimage.measure.label on integer
+    // (or boolean) input.
+    m.def("cc_label",
+          [](py::array mask, int conn) -> std::pair<py::array_t<int32_t>, int32_t> {
+              if (!(mask.flags() & py::array::c_style)) {
+                  mask = py::array::ensure(mask, py::array::c_style);
+              }
+              const auto buf = mask.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              if (ndim < 1) throw std::invalid_argument("cc_label: input must be ≥ 1-D");
+              if (conn < 1 || conn > ndim) throw std::invalid_argument(
+                  "cc_label: conn must be in [1, ndim]");
+              std::vector<int64_t> shape(ndim);
+              std::vector<py::ssize_t> out_shape(ndim);
+              for (int d = 0; d < ndim; ++d) {
+                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
+                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+              }
+              py::array_t<int32_t> out(out_shape);
+              int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
+              const void* src_ptr = buf.ptr;
+              int32_t n_labels = 0;
+              {
+                  py::gil_scoped_release release;
+                  dispatch_int_dtype(buf.format, buf.itemsize, "cc_label",
+                      [&](auto* tag) {
+                          using T = std::remove_pointer_t<decltype(tag)>;
+                          n_labels = ncolor_cpp::cc_label_nd<T>(
+                              static_cast<const T*>(src_ptr), out_ptr, shape, conn);
+                      });
+              }
+              return {std::move(out), n_labels};
+          },
+          py::arg("mask"), py::arg("conn") = 2,
+          "N-D connected-components labelling. Returns (labels, n_components).\n"
+          "Foreground = (mask != 0). conn = 1 (face only) up to ndim\n"
+          "(full diagonal). Compatible with skimage.measure.label output\n"
+          "format (int32, dense 1..N labels, 0 = bg).");
+
+    // Timed variant: returns (labels, n, {fg_mask_ms, pass1_ms, pass2_ms})
+    // for diagnostic profiling.
+    m.def("cc_label_timed",
+          [](py::array mask, int conn) {
+              if (!(mask.flags() & py::array::c_style)) {
+                  mask = py::array::ensure(mask, py::array::c_style);
+              }
+              const auto buf = mask.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              std::vector<int64_t> shape(ndim);
+              std::vector<py::ssize_t> out_shape(ndim);
+              for (int d = 0; d < ndim; ++d) {
+                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
+                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+              }
+              py::array_t<int32_t> out(out_shape);
+              int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
+              const void* src_ptr = buf.ptr;
+              int32_t n_labels = 0;
+              ncolor_cpp::CCStageTimes times;
+              {
+                  py::gil_scoped_release release;
+                  dispatch_int_dtype(buf.format, buf.itemsize, "cc_label_timed",
+                      [&](auto* tag) {
+                          using T = std::remove_pointer_t<decltype(tag)>;
+                          n_labels = ncolor_cpp::cc_label_nd<T>(
+                              static_cast<const T*>(src_ptr), out_ptr,
+                              shape, conn, &times);
+                      });
+              }
+              py::dict t;
+              t["fg_mask_ms"] = times.fg_mask_ms;
+              t["pass1_ms"]   = times.pass1_ms;
+              t["pass2_ms"]   = times.pass2_ms;
+              return py::make_tuple(out, n_labels, t);
+          },
+          py::arg("mask"), py::arg("conn") = 2,
+          "Diagnostic: same as cc_label but returns (labels, n, stage_times).");
+
+    // Region properties for a dense 1..N labelled image. Returns a dict
+    // of int64/double arrays — minimal-overhead, vectorised consumption
+    // pattern (a list of namedtuples like skimage.measure.regionprops
+    // returns is much heavier).
+    m.def("regionprops",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
+             int n_labels_arg) -> py::dict {
+              const auto buf = labels.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              std::vector<int64_t> shape(ndim);
+              for (int d = 0; d < ndim; ++d) shape[d] = static_cast<int64_t>(buf.shape[d]);
+              const int32_t* lab_ptr = static_cast<const int32_t*>(buf.ptr);
+              int64_t total = 1;
+              for (int64_t d : shape) total *= d;
+              // Auto-detect n_labels if caller passed 0.
+              int32_t n_labels = n_labels_arg;
+              if (n_labels <= 0) {
+                  for (int64_t i = 0; i < total; ++i) {
+                      if (lab_ptr[i] > n_labels) n_labels = lab_ptr[i];
+                  }
+              }
+              py::array_t<int64_t> areas({static_cast<py::ssize_t>(n_labels)});
+              py::array_t<int64_t> bbox_min({static_cast<py::ssize_t>(n_labels),
+                                             static_cast<py::ssize_t>(ndim)});
+              py::array_t<int64_t> bbox_max({static_cast<py::ssize_t>(n_labels),
+                                             static_cast<py::ssize_t>(ndim)});
+              py::array_t<double>  centroid({static_cast<py::ssize_t>(n_labels),
+                                             static_cast<py::ssize_t>(ndim)});
+              // Grab raw pointers BEFORE releasing the GIL — buffer_info()
+              // calls into Python's buffer protocol.
+              int64_t* areas_ptr    = static_cast<int64_t*>(areas.request().ptr);
+              int64_t* bbox_min_ptr = static_cast<int64_t*>(bbox_min.request().ptr);
+              int64_t* bbox_max_ptr = static_cast<int64_t*>(bbox_max.request().ptr);
+              double*  cent_ptr     = static_cast<double*>(centroid.request().ptr);
+              {
+                  py::gil_scoped_release release;
+                  ncolor_cpp::regionprops_nd(
+                      lab_ptr, n_labels, shape,
+                      areas_ptr, bbox_min_ptr, bbox_max_ptr, cent_ptr);
+                  // centroid /= area
+                  for (int32_t i = 0; i < n_labels; ++i) {
+                      const double a = static_cast<double>(areas_ptr[i]);
+                      if (a > 0.0) {
+                          for (int d = 0; d < ndim; ++d) cent_ptr[i * ndim + d] /= a;
+                      }
+                  }
+              }
+              py::dict out;
+              out["area"]     = areas;
+              out["bbox_min"] = bbox_min;
+              out["bbox_max"] = bbox_max;
+              out["centroid"] = centroid;
+              return out;
+          },
+          py::arg("labels"), py::arg("n_labels") = 0,
+          "Region properties of a dense int32 1..N labelled image.\n"
+          "Returns dict with keys 'area' (n_labels,), 'bbox_min'/'bbox_max'\n"
+          "(n_labels, ndim), 'centroid' (n_labels, ndim). Pass n_labels=0\n"
+          "to auto-detect from labels.max(). One raster pass; no per-component\n"
+          "Python objects.");
 }

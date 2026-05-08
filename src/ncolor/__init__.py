@@ -12,11 +12,13 @@ tested).
 
 Public names:
 
-* ``label``          — 4-color graph coloring of a label image
-* ``unique_nonzero`` — unique nonzero labels (uses fastremap.unique)
-* ``format_labels``  — normalize labels to contiguous 1..N with bg=0
-* ``get_lut``        — return the color lookup table built by ``label``
-* ``expand_labels``  — multi-pass label expansion across background pixels
+* ``label``                — 4-color graph coloring of a label image
+* ``unique_nonzero``       — unique nonzero labels
+* ``format_labels``        — normalize labels to contiguous 1..N with bg=0
+* ``get_lut``              — return the color lookup table built by ``label``
+* ``expand_labels``        — Voronoi-style label expansion (L1 / L2)
+* ``connected_components`` — N-D connected-components labelling
+* ``regionprops``          — area / bbox / centroid for a labelled image
 """
 import os as _os
 
@@ -28,6 +30,8 @@ __all__ = [
     "format_labels",
     "get_lut",
     "expand_labels",
+    "connected_components",
+    "regionprops",
 ]
 
 _BACKEND = _os.environ.get("NCOLOR_BACKEND", "cpp").lower()
@@ -50,6 +54,8 @@ else:
         "label": ".color",
         "unique_nonzero": ".color",
         "get_lut": ".color",
+        "connected_components": ".color",
+        "regionprops": ".color",
         "format_labels": ".format",
         "expand_labels": ".expand",
     }

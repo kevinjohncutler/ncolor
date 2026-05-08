@@ -17,16 +17,43 @@ from .format import format_labels
 # notebooks) reach for at this module path. The public wrappers below
 # intentionally shadow ``label``/``connect``/``unique_nonzero``/``get_lut``
 # with the C++-backed versions.
-from ._numba_legacy.color import (  # noqa: F401
-    is_sequential,
-    _normalize_labels,
-    neighbors,
-    search,
-    _PARALLEL_THRESHOLD,
-)
+#
+# The legacy module imports ``numba`` at top level. Since v1.6.0 numba is
+# an optional ``[legacy]`` extra (the cpp pipeline doesn't need it), so
+# this import may fail. We fall back to stub callables that raise an
+# informative error — keeps ``import ncolor`` working without numba.
+try:
+    from ._numba_legacy.color import (  # noqa: F401
+        is_sequential,
+        _normalize_labels,
+        neighbors,
+        search,
+        _PARALLEL_THRESHOLD,
+    )
+    _NUMBA_LEGACY_AVAILABLE = True
+except ImportError:
+    _NUMBA_LEGACY_AVAILABLE = False
+    _PARALLEL_THRESHOLD = None
+    def _missing_numba(name):
+        def _raise(*a, **kw):
+            raise ImportError(
+                f"ncolor.color.{name} requires the legacy numba backend. "
+                "Install with `pip install ncolor[legacy]`."
+            )
+        return _raise
+    is_sequential     = _missing_numba("is_sequential")
+    _normalize_labels = _missing_numba("_normalize_labels")
+    neighbors         = _missing_numba("neighbors")
+    search            = _missing_numba("search")
 
 
 def _legacy_label(*args, **kwargs):
+    if not _NUMBA_LEGACY_AVAILABLE:
+        raise ImportError(
+            "ncolor.label(..., verbose=True) routes to the legacy numba "
+            "implementation, which requires the [legacy] extra. "
+            "Install with `pip install ncolor[legacy]`."
+        )
     from ._numba_legacy.color import label as _legacy
     return _legacy(*args, **kwargs)
 
@@ -146,10 +173,45 @@ def connect(img, conn=1):
 
 
 def unique_nonzero(labels):
-    """Unique nonzero labels — wraps fastremap.unique."""
-    # Pure-Python helper; identical behavior in legacy and new paths.
-    from ._numba_legacy.color import unique_nonzero as _legacy
-    return _legacy(labels)
+    """Unique nonzero labels."""
+    arr = np.asarray(labels)
+    u = np.unique(arr)
+    return u[u != 0]
+
+
+def connected_components(mask, conn=2):
+    """N-D connected-components labelling. Foreground = ``mask != 0``.
+
+    Returns a tuple ``(labels, n_components)``: ``labels`` is an int32
+    array of the same shape as ``mask`` with dense 1..N component IDs
+    (0 = bg); ``n_components`` is the number of components found.
+
+    ``conn`` selects the connectivity (1 = face-only, ndim = full
+    diagonal; equivalent to scipy/skimage's ``connectivity`` argument).
+
+    Drop-in replacement for ``skimage.measure.label`` for callers that
+    only need the labelled array, without the scikit-image dep.
+    """
+    from ._backend import _impl as _b
+    return _b.cc_label(mask, conn=int(conn))
+
+
+def regionprops(labels, n_labels=0):
+    """Region properties for a dense int32 1..N labelled image.
+
+    Returns ``dict`` with vectorised numpy arrays:
+        ``area`` (n_labels,)            — int64 pixel counts
+        ``bbox_min`` (n_labels, ndim)   — int64 inclusive lower bounds
+        ``bbox_max`` (n_labels, ndim)   — int64 exclusive upper bounds
+        ``centroid`` (n_labels, ndim)   — float64 centroids
+    Pass ``n_labels=0`` (default) to auto-detect from ``labels.max()``.
+
+    Drop-in for the common subset of ``skimage.measure.regionprops`` —
+    much faster (1.9–8× depending on shape) and returns vectorised
+    arrays instead of per-region Python objects.
+    """
+    from ._backend import _impl as _b
+    return _b.regionprops(labels, int(n_labels))
 
 
 def get_lut(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
