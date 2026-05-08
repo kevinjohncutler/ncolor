@@ -159,8 +159,15 @@ def _make_3d_mask(D=32, n_blobs=20, seed=0):
 
 
 def _coloring_is_valid(mask, colored, conn):
-    """Every pair of touching regions in mask must have different colors."""
-    import scipy.ndimage as snd
+    """Every pair of touching regions in mask must have different colors.
+
+    Uses scipy.ndimage as an *independent* validator (the cpp engine has
+    its own connected-components and adjacency code; we want a third
+    party to vouch for the colouring). Auto-skips the calling test when
+    scipy isn't installed — scipy is in the [clean] extra, not in the
+    default install.
+    """
+    snd = pytest.importorskip("scipy.ndimage")
     struct = snd.generate_binary_structure(mask.ndim, conn)
     labels = np.unique(mask)
     labels = labels[labels > 0]

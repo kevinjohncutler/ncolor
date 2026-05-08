@@ -1,3 +1,5 @@
+import importlib.util
+
 import numpy as np
 import pytest
 
@@ -18,6 +20,13 @@ needs_experimental = pytest.mark.skipif(
     reason="ncolor.label_experimental_wip is dev scratch, not shipped in the package",
 )
 
+# format_labels(clean=True) routes through scikit-image; auto-skip when
+# the [clean] extra isn't installed (default install is cpp-only).
+needs_clean_extra = pytest.mark.skipif(
+    importlib.util.find_spec("skimage") is None,
+    reason="format_labels(clean=True) needs ncolor[clean] (scikit-image)",
+)
+
 
 def test_format_labels_handles_negative_background():
     arr = np.array(
@@ -35,6 +44,7 @@ def test_format_labels_handles_negative_background():
     assert np.array_equal(nonzero, np.arange(1, nonzero.size + 1))
 
 
+@needs_clean_extra
 def test_format_labels_clean_removes_single_pixel_regions():
     arr = np.array(
         [
@@ -96,6 +106,7 @@ def test_format_labels_first_seen_matches_fastremap_bit_for_bit():
 
 
 @needs_experimental
+@needs_clean_extra
 def test_experimental_formatter_falls_back_when_clean_requested():
     arr = np.array([[0, 1], [0, 0]], dtype=np.int32)
     ref = format_labels(arr.copy(), clean=True, min_area=2, background=0)
