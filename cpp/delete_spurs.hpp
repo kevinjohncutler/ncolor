@@ -169,6 +169,25 @@ delete_spurs_nd(py::array mask, int hole_threshold) {
     }
 
     // Step 2: iterative endpoint pruning.
+    //
+    // The naive algorithm scans the full padded buffer twice per
+    // iteration (mark + subtract). For a 1024² image with stroke
+    // lengths ~256 the iteration count is on that order, so the cost
+    // is ~iterations × image_pixels. On dense skeletons this is fine,
+    // but for sparse foregrounds it bills work proportional to the
+    // empty background.
+    //
+    // Optimised version: maintain a *candidate set* of pixel offsets
+    // that need checking on each iteration. Initial set = every fg
+    // pixel (one full pass). On subsequent iterations the candidate
+    // set is the union of *neighbours of pixels removed last
+    // iteration* — only those can have had their neighbour count
+    // change. Equivalent to the parallel-removal semantics of the
+    // original algorithm because all endpoints in iteration k are
+    // identified before any are removed (we collect into ``ep``
+    // first, then subtract in bulk). Total work scales with
+    // (pixels removed × neighbours_per_pixel) instead of
+    // (iterations × image_pixels).
     {
         // Match endpoints_nd: 2D uses full (8-conn), ndim≥3 uses face-only.
         const int neigh_kind = (ndim == 2) ? ndim : 1;
@@ -176,27 +195,45 @@ delete_spurs_nd(py::array mask, int hole_threshold) {
             delete_spurs_detail::make_neighbour_offsets(pstrides, ndim, neigh_kind);
         const int n_nbs = static_cast<int>(offsets.size());
 
-        std::vector<uint8_t> ep(static_cast<size_t>(padded_total), 0u);
-        bool any;
-        do {
-            any = false;
-            // Pass 1: mark endpoints (fg pixels with exactly one fg neighbour).
-            for (int64_t i = 0; i < padded_total; ++i) {
-                if (!skel[i]) { ep[i] = 0u; continue; }
+        std::vector<int64_t> candidates;
+        std::vector<int64_t> ep;
+        std::vector<int64_t> next_candidates;
+        candidates.reserve(static_cast<size_t>(padded_total) / 16 + 16);
+
+        // Seed: one full sweep to collect every fg pixel.
+        for (int64_t i = 0; i < padded_total; ++i) {
+            if (skel[i]) candidates.push_back(i);
+        }
+
+        while (!candidates.empty()) {
+            ep.clear();
+            // Mark endpoints among the candidate set.
+            for (int64_t i : candidates) {
+                if (!skel[i]) continue;  // already removed this round
                 int count = 0;
                 for (int k = 0; k < n_nbs; ++k) {
                     if (skel[static_cast<size_t>(i + offsets[k])]) ++count;
                 }
-                ep[i] = (count == 1) ? 1u : 0u;
+                if (count == 1) ep.push_back(i);
             }
-            // Pass 2: subtract endpoints from skel; record whether anything changed.
-            for (int64_t i = 0; i < padded_total; ++i) {
-                if (ep[i]) {
-                    skel[i] = 0u;
-                    any = true;
+            if (ep.empty()) break;
+
+            // Subtract — done in bulk so all reads above saw the same skel state.
+            for (int64_t i : ep) skel[i] = 0u;
+
+            // Next candidates: fg neighbours of just-removed pixels. Duplicates
+            // are harmless (the skel check above filters re-entries on the next
+            // iteration), so we skip an explicit visited set.
+            next_candidates.clear();
+            next_candidates.reserve(ep.size() * static_cast<size_t>(n_nbs));
+            for (int64_t i : ep) {
+                for (int k = 0; k < n_nbs; ++k) {
+                    const int64_t nb = i + offsets[k];
+                    if (skel[static_cast<size_t>(nb)]) next_candidates.push_back(nb);
                 }
             }
-        } while (any);
+            candidates.swap(next_candidates);
+        }
     }
 
     // Unpad: copy interior of skel back to a fresh bool array of the
