@@ -16,6 +16,7 @@ Public names:
 * ``expand_labels``        — Voronoi-style label expansion (L1 / L2)
 * ``connected_components`` — N-D connected-components labelling
 * ``regionprops``          — area / bbox / centroid for a labelled image
+* ``delete_spurs``         — N-D skeleton hole-fill + endpoint pruning
 """
 from ._version import __version__  # cheap; no heavy deps
 
@@ -27,6 +28,7 @@ __all__ = [
     "expand_labels",
     "connected_components",
     "regionprops",
+    "delete_spurs",
 ]
 
 # Map public attribute -> source module (relative path).
@@ -38,6 +40,7 @@ _LAZY_ATTRS = {
     "regionprops": ".color",
     "format_labels": ".format",
     "expand_labels": ".expand",
+    "delete_spurs": ".format",
 }
 
 
