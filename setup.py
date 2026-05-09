@@ -167,7 +167,7 @@ setup(
     license="BSD",
     author="Kevin Cutler",
     author_email="kevinjohncutler@outlook.com",
-    description="Label matrix 4-color graph coloring + Voronoi expansion (C++/numba).",
+    description="Label matrix 4-color graph coloring + Voronoi expansion (C++).",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/kevinjohncutler/ncolor",

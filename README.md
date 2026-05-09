@@ -7,7 +7,25 @@
 
 Fast remapping of instance labels 1,2,3,...,M to a smaller set of repeating, disjoint labels, 1,2,...,N. The [four color theorem](https://en.wikipedia.org/wiki/Four_color_theorem) guarantees that at most four colors are required for any 2D segmentation/map, but the stochastic algorithms of `ncolor` will opt for 5 or 6 to give an acceptable result if it fails to find a 4-color mapping quickly. Also works for 3D labels (&lt;8 colors typically required) and perhaps higher dimensions as well.
 
-### Usage
+## Install
+
+```bash
+pip install ncolor
+```
+
+This pulls a precompiled wheel (Linux x86_64 / aarch64, macOS arm64,
+Windows AMD64) and only `numpy` + `platformdirs`. Everything in the
+public API below works on this default install.
+
+The `[clean]` extra adds `scipy`, `scikit-image`, and `fastremap` for
+`format_labels(clean=True)` and `delete_spurs`:
+
+```bash
+pip install "ncolor[clean]"
+```
+
+## Usage
+
 If you have an integer array called `masks`, you may transform it into an N-color representation as follows:
 
 ```python
@@ -17,34 +35,46 @@ ncolor_masks = ncolor.label(masks)
 
 If you need the number of unique labels returned:
 ```python
-ncolor_masks, num_labels = ncolor.label(masks,return_n=True)
-
+ncolor_masks, num_labels = ncolor.label(masks, return_n=True)
 ```
-If you need to convert back to `0,...,N` object labels:
+
+To compact a sparse label image into contiguous `1..N` (without any
+clean-up — works on the default install):
 ```python
-labels = ncolor.format_labels(ncolor_masks,clean=True)
-
+labels = ncolor.format_labels(masks)
 ```
 
-Note that `format_labels` with ```clean=True``` will also remove small labels (<9px) by default. This behavior can be changed with the `min_area` parameter. 
+Or with disjoint-component splitting and small-region removal (this
+path uses scikit-image; install the `[clean]` extra above):
+```python
+labels = ncolor.format_labels(masks, clean=True, min_area=9)
+```
 
-    
 The integer array `ncolor_masks` can be visualized using any color map you prefer. The example in this README uses the viridis colormap. See `example.ipynb` for more details.
 
-Thanks to Ryan Peters ([@ryanirl](https://github.com/ryanirl)) for suggesting the `expand_labels` function. This is applied by default to 2D images (optionally for 3D images with `expand=True`, but this can give bad results since objects in 3D have a lot more wiggle room to make contact when expanded). This preprocessing step eliminates cases where close (but not touching) or dispersed objects previously received the same label. I dug a layer back to use `ndimage.distance_transform_edt` for a speed boost. If undesired for 2D images, use `expand=False`. 
+Thanks to Ryan Peters ([@ryanirl](https://github.com/ryanirl)) for suggesting the `expand_labels` function. This is applied by default to 2D images (optionally for 3D images with `expand=True`, but this can give bad results since objects in 3D have a lot more wiggle room to make contact when expanded). This preprocessing step eliminates cases where close (but not touching) or dispersed objects previously received the same label. The C++ engine ships its own ND parallel L1 (Saito-Toriwaki separable sweep) and L2 (Felzenszwalb parabolic envelope) implementations — no `scipy.ndimage`/`edt` dependency. If undesired for 2D images, use `expand=False`.
 
-## Backends
+ncolor also ships drop-ins for the two scikit-image entry points the
+above pipeline used to call:
 
-Default backend is the C++ engine in `ncolor._backend` — built from
-`cpp/binding.cpp` into a single pybind11 extension `ncolor._backend._impl`.
-It implements `expand` → `find_pairs` → `color` → `apply_lut` end-to-end
-with a persistent thread pool and bit-identical output to the numba
-reference.
+```python
+labels, n = ncolor.connected_components(mask, conn=2)   # like skimage.measure.label
+props     = ncolor.regionprops(labels, n)               # area, bbox, centroid (vectorised)
+```
 
-Set `NCOLOR_BACKEND=numba` to fall back to the original numba
-implementation in `ncolor._numba_legacy/`. Useful as a sanity check when
-diagnosing a regression; the legacy path will be removed once the C++
-engine has been the default for a release cycle.
+These run 1.5–3× faster than `scikit-image` on typical instance-mask
+inputs and don't require the `[clean]` extra.
+
+## Backend
+
+The C++ engine in `ncolor._backend` is the only backend as of v2 —
+built from `cpp/binding.cpp` into a single pybind11 extension
+`ncolor._backend._impl`. It owns a persistent thread pool and runs
+`expand` → `find_pairs` → `color` → `apply_lut` end-to-end under one
+`gil_scoped_release`.
+
+The original numba reference implementation was retired; sources are
+preserved in git history for parity-testing if needed.
 
 The C++ engine auto-calibrates its thread count once per machine
 (~50–300 ms hidden under the user's first `import ncolor`) and caches
