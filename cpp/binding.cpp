@@ -976,6 +976,51 @@ PYBIND11_MODULE(_impl, m) {
           "to auto-detect from labels.max(). One raster pass; no per-component\n"
           "Python objects.");
 
+    // cc_label_per_label — like cc_label, but a pair of neighbouring
+    // pixels is unioned only if they share the same input value (and
+    // both are nonzero). Returns (labels, n_components, source_labels).
+    // ``source_labels[i]`` is the input value of the (i+1)-th component
+    // — lets format_labels(clean=True) group components by their
+    // original label without rescanning the image.
+    m.def("cc_label_per_label",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> input,
+             int conn) {
+              const auto buf = input.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              if (ndim < 1) throw std::invalid_argument("cc_label_per_label: input must be ≥ 1-D");
+              if (conn < 1 || conn > ndim) throw std::invalid_argument(
+                  "cc_label_per_label: conn must be in [1, ndim]");
+              std::vector<int64_t> shape(ndim);
+              for (int d = 0; d < ndim; ++d) shape[d] = static_cast<int64_t>(buf.shape[d]);
+
+              std::vector<py::ssize_t> py_shape(ndim);
+              for (int d = 0; d < ndim; ++d) py_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+              py::array_t<int32_t> output(py_shape);
+
+              const int32_t* in_ptr  = static_cast<const int32_t*>(buf.ptr);
+              int32_t*       out_ptr = static_cast<int32_t*>(output.request().ptr);
+
+              std::vector<int32_t> source_labels;
+              int32_t n;
+              {
+                  py::gil_scoped_release release;
+                  n = ncolor_cpp::cc_label_per_label_nd<int32_t>(
+                      in_ptr, out_ptr, shape, conn, source_labels);
+              }
+              py::array_t<int32_t> sl_arr({static_cast<py::ssize_t>(n)});
+              if (n > 0) {
+                  std::memcpy(sl_arr.mutable_data(),
+                              source_labels.data(),
+                              static_cast<size_t>(n) * sizeof(int32_t));
+              }
+              return py::make_tuple(output, n, sl_arr);
+          },
+          py::arg("input"), py::arg("conn") = 2,
+          "Per-label connected components: pixels merge into one component\n"
+          "only when they share the same nonzero input value. Returns\n"
+          "(labels, n_components, source_labels) where source_labels[i] is\n"
+          "the input value of the (i+1)-th component.");
+
     // delete_spurs — N-D skeleton hole-fill + iterative endpoint pruning.
     // Replaces the original Python implementation that used
     // skimage.morphology.remove_small_holes + scipy.ndimage.convolve.

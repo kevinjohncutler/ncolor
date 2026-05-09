@@ -81,90 +81,133 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
 
     # optional cleanup
     if clean:
-        # Lazy in-function import: ncolor.color top-imports format.py, so
-        # a top-level import here would deadlock module init.
+        # The despur=True branch still runs per-label (it mutates the
+        # mask between cc passes); the common despur=False path uses a
+        # single global cpp call into cc_label_per_label which returns
+        # (component_labels, n_components, source_label_per_component)
+        # in one round-trip. That avoids paying ~290 µs of Python⇄cpp
+        # boundary overhead per input label, which was the bottleneck
+        # after bbox-cropping was already in place.
         from .color import connected_components, regionprops as _regionprops
+        from ._backend import _impl as _b
 
-        # Single global pass to collect a bbox per input label. Slicing
-        # to that bbox before the per-label CCL turns the inner loop
-        # from O(n_labels × image_size) into O(sum of bbox volumes) —
-        # ~50× speedup on 1024² inputs vs. running CCL on the full
-        # image inside every iteration.
+        ndim = labels.ndim
         labels_i32 = labels.view(np.int32) if labels.dtype == np.uint32 \
                      else labels.astype(np.int32, copy=False)
         nmax = int(labels.max()) if labels.size else 0
-        bbox_min_all = bbox_max_all = areas_all = None
-        if nmax > 0:
-            global_props = _regionprops(np.ascontiguousarray(labels_i32), nmax)
-            bbox_min_all = global_props['bbox_min']
-            bbox_max_all = global_props['bbox_max']
-            areas_all    = global_props['area']
 
-        cur_max = nmax
-        ndim = labels.ndim
-        for j in range(1, nmax + 1):
-            if areas_all[j - 1] == 0:  # label value not present
-                continue
-            bb_lo = bbox_min_all[j - 1]
-            bb_hi = bbox_max_all[j - 1]
-            slc = tuple(slice(int(bb_lo[d]), int(bb_hi[d])) for d in range(ndim))
-            crop_view = labels[slc]
-            mask = (crop_view == j)
-            if despur:
+        if despur:
+            # Per-label loop required: delete_spurs needs the binary
+            # mask of just one label, and despur mutates the labels
+            # buffer in-place between iterations. Bbox-cropped path,
+            # same as before — only used when the user explicitly
+            # passes despur=True.
+            global_props = _regionprops(np.ascontiguousarray(labels_i32), nmax) if nmax > 0 else None
+            bbox_min_all = global_props['bbox_min'] if global_props else None
+            bbox_max_all = global_props['bbox_max'] if global_props else None
+            areas_all    = global_props['area']     if global_props else None
+            cur_max = nmax
+            for j in range(1, nmax + 1):
+                if areas_all[j - 1] == 0:
+                    continue
+                bb_lo = bbox_min_all[j - 1]; bb_hi = bbox_max_all[j - 1]
+                slc = tuple(slice(int(bb_lo[d]), int(bb_hi[d])) for d in range(ndim))
+                crop_view = labels[slc]
+                mask = (crop_view == j)
                 crop_view[mask] = 0
                 mask = delete_spurs(mask)
                 crop_view[mask] = j
 
-            lbl, n_comp = connected_components(mask.astype(np.uint8), conn=ndim)
-            if n_comp == 0:
-                continue
-            sub = _regionprops(lbl, n_comp)
-            sub_areas = sub['area']
-            sub_bb_lo = sub['bbox_min']
-            sub_bb_hi = sub['bbox_max']
-            # Stable descending-area order matches skimage's
-            # regionprops(...).sort(key=lambda r: r.area, reverse=True):
-            # ties keep ascending-component-id order. ncolor.cc_label
-            # numbers components in raster scan order, identical to
-            # skimage.measure.label, so the per-component decisions land
-            # on the same coords.
-            order = np.argsort(-sub_areas, kind='stable')
-
-            if n_comp > 1 and verbose:
-                print('Warning - found mask with disjoint label.')
-
-            for rank, comp_idx in enumerate(order):
-                comp_id = int(comp_idx) + 1  # cpp cc_label uses 1..N
-                area = int(sub_areas[comp_idx])
-                # Crop further to the sub-component's bbox before
-                # argwhere — saves the full crop-sized scan when the
-                # sub-component occupies a tiny corner.
-                cb_lo = sub_bb_lo[comp_idx]
-                cb_hi = sub_bb_hi[comp_idx]
-                sub_slc = tuple(slice(int(cb_lo[d]), int(cb_hi[d])) for d in range(ndim))
-                local = np.argwhere(lbl[sub_slc] == comp_id)
-                # Local coords are inside the doubly-cropped region;
-                # offset by (label bbox min) + (component bbox min) to
-                # get global indices.
-                offset = bb_lo + cb_lo
-                global_t = tuple((local + offset).T)
-                if rank == 0:
-                    if area <= min_area:
-                        labels[global_t] = background
-                        if verbose:
-                            print('Warning - found mask area less than', min_area)
-                            print('Removing it.')
-                else:
-                    if area < min_area:
-                        labels[global_t] = background
-                        if verbose:
-                            print('secondary disjoint part smaller than min_area. Removing it.')
+                lbl, n_comp = connected_components(mask.astype(np.uint8), conn=ndim)
+                if n_comp == 0:
+                    continue
+                sub = _regionprops(lbl, n_comp)
+                sub_areas = sub['area']; sub_bb_lo = sub['bbox_min']; sub_bb_hi = sub['bbox_max']
+                order = np.argsort(-sub_areas, kind='stable')
+                if n_comp > 1 and verbose:
+                    print('Warning - found mask with disjoint label.')
+                for rank, comp_idx in enumerate(order):
+                    comp_id = int(comp_idx) + 1
+                    area = int(sub_areas[comp_idx])
+                    cb_lo = sub_bb_lo[comp_idx]; cb_hi = sub_bb_hi[comp_idx]
+                    sub_slc = tuple(slice(int(cb_lo[d]), int(cb_hi[d])) for d in range(ndim))
+                    local = np.argwhere(lbl[sub_slc] == comp_id)
+                    offset = bb_lo + cb_lo
+                    global_t = tuple((local + offset).T)
+                    if rank == 0:
+                        if area <= min_area:
+                            labels[global_t] = background
+                            if verbose:
+                                print('Warning - found mask area less than', min_area)
+                                print('Removing it.')
                     else:
-                        if verbose:
-                            print('secondary disjoint part bigger than min_area, relabeling. Area:', area,
-                                  'Label value:', np.unique(labels[global_t]))
-                        cur_max += 1
-                        labels[global_t] = cur_max
+                        if area < min_area:
+                            labels[global_t] = background
+                        else:
+                            cur_max += 1
+                            labels[global_t] = cur_max
+        elif nmax > 0:
+            # Fast path: one global label-aware CCL gives every
+            # component of every input label in a single pass, plus
+            # a (n_components,) array of source labels.
+            comp_labels, n_total, source_per_comp = _b.cc_label_per_label(
+                np.ascontiguousarray(labels_i32), conn=ndim,
+            )
+            if n_total > 0:
+                # One regionprops call: areas for all components.
+                comp_props = _regionprops(comp_labels, n_total)
+                comp_areas = comp_props['area']
+
+                # Group components by source label via a stable sort on
+                # source_per_comp. After sorting, components sharing a
+                # source label are contiguous, located by searchsorted.
+                sort_idx = np.argsort(source_per_comp, kind='stable')
+                sorted_sources = source_per_comp[sort_idx]
+                unique_sources = np.unique(source_per_comp)
+                unique_sources = unique_sources[unique_sources > 0]
+
+                # remap[c+1] = the new label value for component c+1.
+                # Bg pixels (comp_label == 0) read remap[0] = 0.
+                remap = np.zeros(n_total + 1, dtype=np.int32)
+                cur_max = nmax
+                for j in unique_sources:
+                    lo = int(np.searchsorted(sorted_sources, j, side='left'))
+                    hi = int(np.searchsorted(sorted_sources, j, side='right'))
+                    comp_indices = sort_idx[lo:hi]
+                    if comp_indices.size == 0:
+                        continue
+                    areas_for_j = comp_areas[comp_indices]
+                    order = np.argsort(-areas_for_j, kind='stable')
+                    if comp_indices.size > 1 and verbose:
+                        print('Warning - found mask with disjoint label.')
+                    for rank, k in enumerate(order):
+                        ci = int(comp_indices[k])  # 0-based
+                        area = int(areas_for_j[k])
+                        if rank == 0:
+                            # Largest component: keep at j unless ≤ min_area.
+                            if area <= min_area:
+                                if verbose:
+                                    print('Warning - found mask area less than', min_area)
+                                    print('Removing it.')
+                                # remap[ci + 1] stays 0 → drops to bg
+                            else:
+                                remap[ci + 1] = int(j)
+                        else:
+                            if area < min_area:
+                                if verbose:
+                                    print('secondary disjoint part smaller than min_area. Removing it.')
+                                # remap[ci + 1] stays 0 → drops to bg
+                            else:
+                                if verbose:
+                                    print('secondary disjoint part bigger than min_area, relabeling. Area:', area,
+                                          'Label value:', int(j))
+                                cur_max += 1
+                                remap[ci + 1] = cur_max
+
+                # Single fancy-index pass writes the cleaned labels.
+                # Pixels where comp_labels == 0 (always-bg) read remap[0] = 0,
+                # so this also clears any bg that was non-zero originally.
+                labels = remap[comp_labels].astype(np.uint32, copy=False)
 
     # Final compaction — cpp ``format_labels`` with first_seen=True is
     # bit-identical to fastremap.renumber for raster-scan label

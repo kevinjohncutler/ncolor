@@ -309,6 +309,152 @@ inline int32_t cc_label_nd(const T* input, int32_t* output,
 }
 
 
+// Label-aware connected components: like cc_label_nd, but a pair of
+// neighbouring pixels is unioned into the same component only if they
+// share the same input value (and that value is nonzero). One pass over
+// the image partitions every nonzero pixel into a maximal same-value
+// connected region.
+//
+// On return:
+//   * ``output`` holds dense 1..N component IDs (0 = bg, same encoding
+//     as cc_label_nd).
+//   * ``source_labels_out`` is sized to N and holds the input value of
+//     each component (i.e. the original label that the component
+//     belongs to) so callers can group components by source label
+//     without rescanning the image.
+//
+// Used by ``ncolor.format_labels(clean=True)`` to do all per-label
+// connected-component analysis in a single cpp call instead of one
+// call per input label (which billed pure Python⇄cpp boundary cost).
+template <typename T>
+inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
+                                      const std::vector<int64_t>& shape,
+                                      int conn,
+                                      std::vector<T>& source_labels_out) {
+    const int ndim = static_cast<int>(shape.size());
+    if (ndim < 1) { source_labels_out.clear(); return 0; }
+    if (conn < 1) conn = 1;
+    if (conn > ndim) conn = ndim;
+    int64_t total = 1;
+    for (int64_t d : shape) total *= d;
+    if (total == 0) { source_labels_out.clear(); return 0; }
+
+    std::vector<int64_t> strides, nb_fwd;
+    std::vector<int8_t> nb_dc_fwd;
+    detail::build_forward_neighbours(shape, conn, strides, nb_fwd, nb_dc_fwd);
+    const int n_nbs = static_cast<int>(nb_fwd.size());
+
+    cc_detail::UnionFind uf;
+    uf.reserve(static_cast<size_t>(total) / 16 + 16);
+    (void)uf.make_set();
+
+    std::fill_n(output, total, int32_t{0});
+
+    const int inner = ndim - 1;
+    const int64_t W = shape[inner];
+
+    // Per-pixel checked path, used everywhere (no inner-row fast-path
+    // unrolling — the per-label union check needs to read input[] at
+    // each neighbour anyway, so the unrolled fg-only version doesn't
+    // apply). Single-image pass is plenty fast even without it.
+    auto step_pixel_checked = [&](const int64_t* coords, int64_t flat) {
+        const T cur = input[flat];
+        if (cur == T{0}) return;  // bg
+        int32_t best = 0;
+        for (int k = 0; k < n_nbs; ++k) {
+            const int8_t* dc = nb_dc_fwd.data() + k * ndim;
+            bool valid = true;
+            for (int d = 0; d < ndim; ++d) {
+                if (dc[d] == 0) continue;
+                const int64_t nc = coords[d] - dc[d];
+                if (nc < 0 || nc >= shape[d]) { valid = false; break; }
+            }
+            if (!valid) continue;
+            const int64_t nb_off = flat - nb_fwd[k];
+            if (input[nb_off] != cur) continue;  // different label → no union
+            const int32_t l = output[nb_off];
+            if (l == 0) continue;
+            if (best == 0) best = l;
+            else if (best != l) uf.unite(best, l);
+        }
+        output[flat] = (best == 0) ? uf.make_set() : best;
+    };
+
+    constexpr int MAX_NDIM = 16;
+    int64_t coords[MAX_NDIM] = {0};
+    int64_t row_base = 0;
+    const int64_t outer_total = (inner == 0) ? 1 : (total / W);
+
+    for (int64_t outer_idx = 0; outer_idx < outer_total; ++outer_idx) {
+        for (int64_t x = 0; x < W; ++x) {
+            coords[inner] = x;
+            step_pixel_checked(coords, row_base + x);
+        }
+        if (inner == 0) break;
+        int d = inner - 1;
+        ++coords[d];
+        row_base += strides[d];
+        while (coords[d] >= shape[d] && d > 0) {
+            row_base -= coords[d] * strides[d];
+            coords[d] = 0;
+            --d;
+            ++coords[d];
+            row_base += strides[d];
+        }
+        if (coords[d] >= shape[d]) break;
+    }
+
+    // Flatten UF (path-halve every entry to its root) so pass 2 can
+    // read directly from parent[].
+    for (size_t i = 1; i < uf.parent.size(); ++i) {
+        uf.parent[i] = uf.find(static_cast<int32_t>(i));
+    }
+
+    // Pass 2: provisional → final 1..N relabel, with run-length
+    // coalescing on consecutive same-prov pixels (matches cc_label_nd).
+    std::vector<int32_t> remap(uf.parent.size(), 0);
+    int32_t next_label = 0;
+    int32_t prev_prov = -1, prev_final = 0;
+    for (int64_t flat = 0; flat < total; ++flat) {
+        const int32_t prov = output[flat];
+        if (prov == 0) { prev_prov = -1; continue; }
+        if (prov == prev_prov) {
+            output[flat] = prev_final;
+            continue;
+        }
+        const int32_t root = uf.parent[prov];
+        int32_t final_lab = remap[root];
+        if (final_lab == 0) {
+            final_lab = ++next_label;
+            remap[root] = final_lab;
+        }
+        output[flat] = final_lab;
+        prev_prov = prov;
+        prev_final = final_lab;
+    }
+
+    // Source-label table: the input value of each final component. Walk
+    // the output once and record on first-seen. Could fold into pass 2,
+    // but keeping it separate keeps that loop's tight cache-friendly
+    // shape and only adds one more linear scan.
+    source_labels_out.assign(static_cast<size_t>(next_label), T{0});
+    if (next_label > 0) {
+        std::vector<uint8_t> seen(static_cast<size_t>(next_label) + 1, 0u);
+        int32_t left = next_label;
+        for (int64_t flat = 0; flat < total && left > 0; ++flat) {
+            const int32_t lab = output[flat];
+            if (lab > 0 && !seen[lab]) {
+                source_labels_out[lab - 1] = input[flat];
+                seen[lab] = 1u;
+                --left;
+            }
+        }
+    }
+
+    return next_label;
+}
+
+
 // Region properties for a labeled image (output of cc_label_nd or any
 // dense 1..N labeling). Fills the four output arrays:
 //   areas[i]      = pixel count of component (i + 1)
