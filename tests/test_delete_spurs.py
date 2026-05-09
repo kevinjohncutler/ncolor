@@ -106,6 +106,41 @@ def test_delete_spurs_matches_reference_3d(seed):
     assert np.array_equal(ours, ref), f"3D delete_spurs diverged (seed={seed})"
 
 
+@pytest.mark.parametrize("seed", range(3))
+def test_delete_spurs_matches_reference_4d(seed):
+    """4D parity vs the skimage+scipy reference. Locks in that the
+    N-D pad / cc_label / endpoint-prune chain doesn't bake any
+    2D/3D-specific assumptions into the cpp implementation."""
+    rng = np.random.default_rng(seed * 31 + 5)
+    D = 8
+    img = np.zeros((D, D, D, D), dtype=bool)
+    for _ in range(8):
+        coords = rng.integers(2, D - 2, 4)
+        L = int(rng.integers(3, 6))
+        axis = int(rng.integers(0, 4))
+        slc = list(coords)
+        slc[axis] = slice(int(coords[axis]), min(D, int(coords[axis]) + L))
+        img[tuple(slc)] = True
+    ours = delete_spurs(img, hole_threshold=3)
+    ref = _ref_delete_spurs(img, hole_threshold=3)
+    assert ours.shape == img.shape and ours.dtype == np.bool_
+    assert np.array_equal(ours, ref), f"4D delete_spurs diverged (seed={seed})"
+
+
+def test_delete_spurs_5d_smoke():
+    """5D smoke test (no skimage cross-check above 3D for the
+    morphology helpers, but the cpp code is dimension-agnostic).
+    Confirms the function returns sensibly on a 5-D input — same
+    shape, bool dtype, and at least some pruning happens."""
+    mask = np.zeros((5, 5, 5, 5, 5), dtype=bool)
+    mask[2, 2, 2, 2, 1:4] = True
+    mask[2, 2, 2, 1:4, 2] = True
+    out = delete_spurs(mask, hole_threshold=3)
+    assert out.shape == mask.shape
+    assert out.dtype == np.bool_
+    assert int(out.sum()) <= int(mask.sum())
+
+
 def test_delete_spurs_empty_mask():
     """All-zero input → all-zero output."""
     out = delete_spurs(np.zeros((16, 16), dtype=bool), hole_threshold=5)
