@@ -20,11 +20,13 @@ needs_experimental = pytest.mark.skipif(
     reason="ncolor.label_experimental_wip is dev scratch, not shipped in the package",
 )
 
-# format_labels(clean=True) routes through scikit-image; auto-skip when
-# the [clean] extra isn't installed (default install is cpp-only).
-needs_clean_extra = pytest.mark.skipif(
-    importlib.util.find_spec("skimage") is None,
-    reason="format_labels(clean=True) needs ncolor[clean] (scikit-image)",
+# Parity-vs-skimage reference checks: only the parity tests below
+# need scikit-image + fastremap to construct the reference output.
+# format_labels(clean=True) itself runs cpp-only and works without them.
+needs_skimage_ref = pytest.mark.skipif(
+    importlib.util.find_spec("skimage") is None
+    or importlib.util.find_spec("fastremap") is None,
+    reason="parity-vs-skimage reference needs scikit-image + fastremap",
 )
 
 
@@ -44,7 +46,6 @@ def test_format_labels_handles_negative_background():
     assert np.array_equal(nonzero, np.arange(1, nonzero.size + 1))
 
 
-@needs_clean_extra
 def test_format_labels_clean_removes_single_pixel_regions():
     arr = np.array(
         [
@@ -105,8 +106,87 @@ def test_format_labels_first_seen_matches_fastremap_bit_for_bit():
         assert np.array_equal(prod, legacy)
 
 
+def _ref_clean_with_skimage(arr, min_area, background=0):
+    """Reference clean=True implementation using the original
+    skimage+fastremap pipeline. Used to lock the cpp rewrite to
+    bit-identical output."""
+    from skimage import measure
+    import fastremap
+
+    labels = arr.astype(np.int32, copy=True)
+    if background is None:
+        m = int(np.min(labels))
+        background = m if m < 0 else 0
+    if background != 0:
+        labels -= background
+        background = 0
+    labels = labels.astype(np.uint32)
+
+    inds = np.unique(labels)
+    for j in inds[inds > background]:
+        mask = labels == j
+        lbl = measure.label(mask)
+        regions = measure.regionprops(lbl)
+        regions.sort(key=lambda x: x.area, reverse=True)
+        if len(regions) == 0:
+            continue
+        if len(regions) > 1:
+            for rg in regions[1:]:
+                if rg.area < min_area:
+                    labels[tuple(rg.coords.T)] = background
+                else:
+                    labels[tuple(rg.coords.T)] = np.max(labels) + 1
+        rg0 = regions[0]
+        if rg0.area <= min_area:
+            labels[tuple(rg0.coords.T)] = background
+
+    fastremap.renumber(labels, in_place=True)
+    return fastremap.refit(labels)
+
+
+def _make_clean_test_inputs(rng, n_cases=15):
+    """Generate label images with disjoint components, single pixels,
+    and varied geometry to exercise the clean=True logic."""
+    cases = []
+    for _ in range(n_cases):
+        H = int(rng.integers(20, 64))
+        W = int(rng.integers(20, 64))
+        arr = np.zeros((H, W), dtype=np.uint16)
+        n_labels = int(rng.integers(3, 12))
+        yy, xx = np.ogrid[:H, :W]
+        for k in range(1, n_labels + 1):
+            n_blobs = int(rng.integers(1, 4))  # may be disjoint
+            for _ in range(n_blobs):
+                cy, cx = rng.integers(0, H), rng.integers(0, W)
+                r = int(rng.integers(1, 6))
+                arr[(yy - cy) ** 2 + (xx - cx) ** 2 <= r * r] = k
+        # Sprinkle a few stray single pixels of various labels to test
+        # the small-region removal branch.
+        for _ in range(int(rng.integers(0, 5))):
+            y, x = rng.integers(0, H), rng.integers(0, W)
+            arr[y, x] = int(rng.integers(1, n_labels + 1))
+        cases.append(arr)
+    return cases
+
+
+@needs_skimage_ref
+@pytest.mark.parametrize("min_area", [3, 9, 25])
+def test_clean_path_matches_skimage_reference(min_area):
+    """The cpp-helpers rewrite of format_labels(clean=True) must produce
+    bit-identical output to the original skimage+fastremap implementation
+    across a varied corpus of disjoint-region label images."""
+    rng = np.random.default_rng(min_area * 17)
+    for arr in _make_clean_test_inputs(rng, n_cases=20):
+        ours = format_labels(arr.copy(), clean=True, min_area=min_area, background=0)
+        ref = _ref_clean_with_skimage(arr.copy(), min_area=min_area, background=0)
+        assert ours.dtype == ref.dtype, f"dtype mismatch: {ours.dtype} vs {ref.dtype}"
+        assert np.array_equal(ours, ref), (
+            f"clean output diverged from skimage ref (min_area={min_area})"
+        )
+
+
 @needs_experimental
-@needs_clean_extra
+@needs_skimage_ref
 def test_experimental_formatter_falls_back_when_clean_requested():
     arr = np.array([[0, 1], [0, 0]], dtype=np.int32)
     ref = format_labels(arr.copy(), clean=True, min_area=2, background=0)

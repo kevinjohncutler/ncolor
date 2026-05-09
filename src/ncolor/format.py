@@ -1,39 +1,5 @@
 import numpy as np
 
-# Lazy imports for heavy dependencies. fastremap, scipy, and scikit-image
-# are all in the [clean] extra; the cpp fast-path below never imports
-# them. Only the legacy ``format_labels(clean=True/...)`` slow path and
-# ``delete_spurs`` reach for them.
-def _lazy_import_fastremap():
-    try:
-        import fastremap
-    except ImportError as exc:
-        raise ImportError(
-            "ncolor.format_labels(clean=True) and the legacy fallback "
-            "use fastremap. Install with `pip install ncolor[clean]`."
-        ) from exc
-    return fastremap
-
-def _lazy_import_skimage_measure():
-    try:
-        from skimage import measure
-    except ImportError as exc:
-        raise ImportError(
-            "ncolor.format_labels(clean=True) uses scikit-image. "
-            "Install with `pip install ncolor[clean]`."
-        ) from exc
-    return measure
-
-def _lazy_import_skimage_morphology():
-    try:
-        from skimage.morphology import remove_small_holes
-    except ImportError as exc:
-        raise ImportError(
-            "ncolor.delete_spurs uses scikit-image. "
-            "Install with `pip install ncolor[clean]`."
-        ) from exc
-    return remove_small_holes
-
 
 # Module-level ExpandEngine singleton. Constructing one per call adds
 # ~5-10 ms of pool-spinup overhead — matches the rationale in color.py's
@@ -112,122 +78,90 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
             labels -= background
             background = 0
     labels = labels.astype('uint32')
-    
-    # optional cleanup 
+
+    # optional cleanup
     if clean:
+        # Lazy in-function import: ncolor.color top-imports format.py, so
+        # a top-level import here would deadlock module init.
+        from .color import connected_components, regionprops as _regionprops
         inds = np.unique(labels)
-        for j in inds[inds>background]:
-            mask = labels==j
+        for j in inds[inds > background]:
+            mask = (labels == j)
             if despur:
-                labels[mask] = 0 #clear old label
-                mask = delete_spurs(mask) #needs updating for ND 
-                labels[mask] = j # put label back in
-                
-            measure = _lazy_import_skimage_measure()
-            lbl = measure.label(mask)
-            regions = measure.regionprops(lbl)
-            regions.sort(key=lambda x: x.area, reverse=True)
-            
-            # If no regions were found (e.g. the mask was completely removed by the
-            # cleaning/despur operations), skip further processing for this label.
-            if len(regions) == 0:
+                labels[mask] = 0
+                mask = delete_spurs(mask)
+                labels[mask] = j
+
+            lbl, n_comp = connected_components(mask.astype(np.uint8), conn=mask.ndim)
+            if n_comp == 0:
                 continue
-            
-            if len(regions) > 1:
-                if verbose:
-                    print('Warning - found mask with disjoint label.')
-                for rg in regions[1:]:
-                    if rg.area < min_area:
-                        labels[tuple(rg.coords.T)] = background
+            areas = _regionprops(lbl, n_comp)['area']
+            # Stable descending-area order matches skimage's
+            # regionprops(...).sort(key=lambda r: r.area, reverse=True):
+            # ties keep ascending-component-id order. ncolor.cc_label
+            # numbers components in raster scan order, identical to
+            # skimage.measure.label, so the per-component decisions land
+            # on the same coords.
+            order = np.argsort(-areas, kind='stable')
+
+            if n_comp > 1 and verbose:
+                print('Warning - found mask with disjoint label.')
+
+            cur_max = int(labels.max())
+            for rank, comp_idx in enumerate(order):
+                comp_id = int(comp_idx) + 1  # cpp cc_label uses 1..N
+                area = int(areas[comp_idx])
+                coords_t = tuple(np.argwhere(lbl == comp_id).T)
+                if rank == 0:
+                    if area <= min_area:
+                        labels[coords_t] = background
+                        if verbose:
+                            print('Warning - found mask area less than', min_area)
+                            print('Removing it.')
+                else:
+                    if area < min_area:
+                        labels[coords_t] = background
                         if verbose:
                             print('secondary disjoint part smaller than min_area. Removing it.')
                     else:
                         if verbose:
-                            print('secondary disjoint part bigger than min_area, relabeling. Area:',rg.area, 
-                                    'Label value:',np.unique(labels[tuple(rg.coords.T)]))
-                        labels[tuple(rg.coords.T)] = np.max(labels)+1
-                        
-            rg0 = regions[0]
-            if rg0.area <= min_area:
-                labels[tuple(rg0.coords.T)] = background
-                if verbose:
-                    print('Warning - found mask area less than', min_area)
-                    print('Removing it.')
-    
-    fastremap = _lazy_import_fastremap()
-    fastremap.renumber(labels, in_place=True)  # unit increments from 1..N cells
-    labels = fastremap.refit(labels)           # downcast dtype if possible
-    return labels
+                            print('secondary disjoint part bigger than min_area, relabeling. Area:', area,
+                                  'Label value:', np.unique(labels[coords_t]))
+                        cur_max += 1
+                        labels[coords_t] = cur_max
 
-def delete_spurs(mask):
-    pad = 1
-    #must fill single holes in image to avoid cusps causing issues. Will limit to holes of size ___
-    remove_small_holes = _lazy_import_skimage_morphology()
-    skel = remove_small_holes(np.pad(mask,pad,mode='constant'),5)
-    nbad = 1
-    niter = 0
-    while (nbad > 0):
-        bad_points = endpoints(skel) 
-        skel = np.logical_and(skel,np.logical_not(bad_points))
-        nbad = np.sum(bad_points)
-        niter+=1
-    
-    unpad =  tuple([slice(pad,-pad)]*skel.ndim)
-    skel = skel[unpad] #unpad
+    # Final compaction — cpp ``format_labels`` with first_seen=True is
+    # bit-identical to fastremap.renumber for raster-scan label
+    # assignment. The cpp side always returns int32; downcast to the
+    # smallest unsigned dtype that fits ``n_used`` to match
+    # fastremap.refit's semantics on a uint32-typed input.
+    eng = _get_format_engine()
+    out, n_used = eng.format_labels(
+        np.ascontiguousarray(labels.astype(np.int32)),
+        first_seen=True,
+    )
+    if n_used <= 0xFF:
+        return out.astype(np.uint8, copy=False)
+    if n_used <= 0xFFFF:
+        return out.astype(np.uint16, copy=False)
+    return out.astype(np.uint32, copy=False)
 
-    return skel
+def delete_spurs(mask, hole_threshold=5):
+    """N-D skeleton cleanup. Pads input by 1, fills bg holes with
+    pixel count ≤ ``hole_threshold`` (face-connected), then iteratively
+    prunes endpoints (fg pixels with exactly one fg neighbour) until no
+    pixels change in a pass. Returns a fresh boolean array of the input
+    shape.
 
-def endpoints_nd(skel):
+    Endpoint connectivity matches the original Python implementation:
+    8-conn (full diagonal) for 2D, face-only for ndim ≥ 3.
+
+    Implemented in cpp (``ncolor._backend._impl.delete_spurs``); no
+    scikit-image / scipy required.
     """
-    Detect endpoints in an N-dimensional skeleton.
-
-    An endpoint is a foreground pixel that has exactly one foreground neighbor
-    in its connectivity neighborhood.
-
-    For 2D: Uses 8-connectivity (includes diagonal neighbors) to match original behavior
-    For 3D+: Uses face connectivity (more appropriate for higher dimensions)
-
-    Parameters
-    ----------
-    skel : ndarray
-        Binary skeleton image of any dimensionality
-
-    Returns
-    -------
-    endpoints : ndarray
-        Binary image with endpoints marked as True
-    """
-    from scipy import ndimage
-
-    ndim = skel.ndim
-
-    # Choose connectivity by dimensionality: 8-conn (diagonals) for 2D
-    # — mahotas-compatible default; face-only for ndim ≥ 3.
-    if ndim == 2:
-        connectivity = ndimage.generate_binary_structure(ndim, 2)  # 8-connectivity
-    else:
-        connectivity = ndimage.generate_binary_structure(ndim, 1)  # face connectivity
-
-    # Create kernel (exclude center pixel)
-    kernel = connectivity.astype(np.float32)
-    center_idx = tuple(np.array(kernel.shape) // 2)
-    kernel[center_idx] = 0
-
-    # Count neighbors
-    neighbor_count = ndimage.convolve(skel.astype(np.float32), kernel,
-                                     mode='constant', cval=0)
-
-    # Endpoints are foreground pixels with exactly 1 neighbor
-    endpoints = (skel > 0) & (neighbor_count == 1)
-
-    return endpoints
-
-# Current endpoints function - uses the ND version
-def endpoints(skel):
-    """
-    Detect endpoints in a skeleton. Uses the ND scipy.ndimage implementation.
-    """
-    return endpoints_nd(skel)
+    from ._backend import _impl as _b
+    arr = np.ascontiguousarray(mask).astype(np.uint8, copy=False)
+    return _b.delete_spurs(arr, int(hole_threshold))
 
 
 # import sys

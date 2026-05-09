@@ -19,6 +19,7 @@
 #include "cc_label.hpp"
 #include "chamfer.hpp"
 #include "color.hpp"
+#include "delete_spurs.hpp"
 #include "expand_lp.hpp"
 #include "format_labels.hpp"
 #include "connect.hpp"
@@ -974,4 +975,19 @@ PYBIND11_MODULE(_impl, m) {
           "(n_labels, ndim), 'centroid' (n_labels, ndim). Pass n_labels=0\n"
           "to auto-detect from labels.max(). One raster pass; no per-component\n"
           "Python objects.");
+
+    // delete_spurs — N-D skeleton hole-fill + iterative endpoint pruning.
+    // Replaces the original Python implementation that used
+    // skimage.morphology.remove_small_holes + scipy.ndimage.convolve.
+    m.def("delete_spurs",
+          [](py::array mask, int hole_threshold) {
+              return ncolor_cpp::delete_spurs_nd(mask, hole_threshold);
+          },
+          py::arg("mask"), py::arg("hole_threshold") = 5,
+          "Skeleton cleanup: pad-by-1 with constant 0, fill bg holes with\n"
+          "≤ hole_threshold pixels via face-connected CCL, then iteratively\n"
+          "prune endpoints (fg pixels with exactly 1 fg neighbour) until\n"
+          "convergence. Connectivity for endpoint detection: 8-conn for\n"
+          "2D, face-only (2·ndim) for ndim≥3 — matches the original\n"
+          "ncolor.format.endpoints_nd behavior.");
 }

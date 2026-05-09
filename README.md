@@ -14,15 +14,11 @@ pip install ncolor
 ```
 
 This pulls a precompiled wheel (Linux x86_64 / aarch64, macOS arm64,
-Windows AMD64) and only `numpy` + `platformdirs`. Everything in the
-public API below works on this default install.
-
-The `[clean]` extra adds `scipy`, `scikit-image`, and `fastremap` for
-`format_labels(clean=True)` and `delete_spurs`:
-
-```bash
-pip install "ncolor[clean]"
-```
+Windows AMD64) and only `numpy` + `platformdirs`. The entire public
+API — `label`, `expand_labels`, `format_labels` (including
+`clean=True`), `connected_components`, `regionprops`,
+`delete_spurs` — runs cpp-only on this minimal install. The previous
+`[clean]` and `[legacy]` extras have been retired in v2.
 
 ## Usage
 
@@ -38,17 +34,19 @@ If you need the number of unique labels returned:
 ncolor_masks, num_labels = ncolor.label(masks, return_n=True)
 ```
 
-To compact a sparse label image into contiguous `1..N` (without any
-clean-up — works on the default install):
+To compact a sparse label image into contiguous `1..N`:
 ```python
 labels = ncolor.format_labels(masks)
 ```
 
-Or with disjoint-component splitting and small-region removal (this
-path uses scikit-image; install the `[clean]` extra above):
+Pass `clean=True` to additionally split disjoint components and drop
+regions smaller than `min_area`:
 ```python
 labels = ncolor.format_labels(masks, clean=True, min_area=9)
 ```
+
+`clean=True` is bit-identical to the prior `skimage + fastremap`
+pipeline but runs cpp-only with no extras.
 
 The integer array `ncolor_masks` can be visualized using any color map you prefer. The example in this README uses the viridis colormap. See `example.ipynb` for more details.
 
@@ -63,7 +61,7 @@ props     = ncolor.regionprops(labels, n)               # area, bbox, centroid (
 ```
 
 These run 1.5–3× faster than `scikit-image` on typical instance-mask
-inputs and don't require the `[clean]` extra.
+inputs.
 
 ## Backend
 

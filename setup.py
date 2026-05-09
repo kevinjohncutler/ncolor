@@ -32,27 +32,19 @@ except ImportError:
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-# Hard runtime deps for the cpp pipeline. ncolor.label, ncolor.expand_labels,
-# ncolor.format_labels, ncolor.connected_components, ncolor.regionprops all
-# work with just numpy + platformdirs.
+# Hard runtime deps for the cpp pipeline. The entire public API —
+# ncolor.label, expand_labels, format_labels (incl. clean=True),
+# connected_components, regionprops, delete_spurs — runs end-to-end on
+# just numpy + platformdirs as of v2.0.0. The previous [legacy] (numba
+# reference) and [clean] (scipy/scikit-image/fastremap) extras are
+# both retired; clean=True now uses the cpp connected_components +
+# regionprops + format_labels(first_seen=True) chain, and delete_spurs
+# is a cpp implementation of the original skimage+scipy pipeline.
 install_deps = [
     "numpy",
     "platformdirs",  # SMT calibration cache + native loader
 ]
-
-# Optional features:
-#   [clean]:  ncolor.format_labels(clean=True) + ncolor.delete_spurs use
-#             scikit-image (CCL + remove_small_holes), scipy.ndimage
-#             (convolve), and fastremap.renumber/refit. ~140 MB extra disk.
-#             Cpp ncolor.connected_components / ncolor.regionprops are
-#             available without this extra.
-#
-# The numba reference implementation was retired in v1.6.0 — the cpp
-# engine is the only backend. The numba sources still live in the repo
-# at ``legacy_numba/`` (gitignored) for parity-testing if needed.
-extras_deps = {
-    "clean": ["scipy", "scikit-image", "fastremap"],
-}
+extras_deps = {}
 
 extra_compile_args = []
 extra_link_args = []
