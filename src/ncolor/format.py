@@ -62,6 +62,9 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
         from ._backend import _impl as _b
 
         ndim = labels.ndim
+        # uint32 → int32 by view (zero-copy, same byte width). Safe
+        # because no realistic label image has > 2^31 distinct values;
+        # the upper bit is always clear so reinterpretation is identical.
         labels_i32 = labels.view(np.int32) if labels.dtype == np.uint32 \
                      else labels.astype(np.int32, copy=False)
         nmax = int(labels.max()) if labels.size else 0

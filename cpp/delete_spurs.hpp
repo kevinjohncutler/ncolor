@@ -122,6 +122,10 @@ delete_spurs_nd(py::array mask, int hole_threshold) {
     }
 
     // Step 1: remove_small_holes (face-connected bg components ≤ threshold).
+    // The pad-by-1 step above is what makes this safe: the outer
+    // background wraps the entire image, so it always shows up as one
+    // huge component that's well over any sane hole_threshold. Only
+    // truly interior holes can fall below the threshold and get filled.
     if (hole_threshold > 0) {
         std::vector<uint8_t> inv(static_cast<size_t>(padded_total));
         for (int64_t i = 0; i < padded_total; ++i) inv[i] = skel[i] ? 0u : 1u;

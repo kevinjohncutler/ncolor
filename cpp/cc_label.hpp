@@ -424,6 +424,9 @@ inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
 
     // Source-label table: input value of each component, recorded on
     // first sight. Kept as a separate scan so pass 2 stays tight.
+    // ``left`` lets us bail out as soon as every component has been
+    // seen — for typical compact outputs that stops well before the
+    // end of the image.
     source_labels_out.assign(static_cast<size_t>(next_label), T{0});
     if (next_label > 0) {
         std::vector<uint8_t> seen(static_cast<size_t>(next_label) + 1, 0u);
