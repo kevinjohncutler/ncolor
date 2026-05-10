@@ -836,9 +836,6 @@ PYBIND11_MODULE(_impl, m) {
              "label() output. 0 means the coloring is valid; nonzero\n"
              "means the solver bailed out without finding a clean coloring.");
 
-    // Standalone N-D connected-components labelling. Single-threaded
-    // two-pass union-find. Drop-in for skimage.measure.label on integer
-    // (or boolean) input.
     m.def("cc_label",
           [](py::array mask, int conn) -> std::pair<py::array_t<int32_t>, int32_t> {
               if (!(mask.flags() & py::array::c_style)) {
@@ -876,8 +873,6 @@ PYBIND11_MODULE(_impl, m) {
           "(full diagonal). Compatible with skimage.measure.label output\n"
           "format (int32, dense 1..N labels, 0 = bg).");
 
-    // Timed variant: returns (labels, n, {fg_mask_ms, pass1_ms, pass2_ms})
-    // for diagnostic profiling.
     m.def("cc_label_timed",
           [](py::array mask, int conn) {
               if (!(mask.flags() & py::array::c_style)) {
@@ -915,10 +910,6 @@ PYBIND11_MODULE(_impl, m) {
           py::arg("mask"), py::arg("conn") = 2,
           "Diagnostic: same as cc_label but returns (labels, n, stage_times).");
 
-    // Region properties for a dense 1..N labelled image. Returns a dict
-    // of int64/double arrays — minimal-overhead, vectorised consumption
-    // pattern (a list of namedtuples like skimage.measure.regionprops
-    // returns is much heavier).
     m.def("regionprops",
           [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
              int n_labels_arg) -> py::dict {

@@ -1,8 +1,7 @@
 """Equivalence tests for ncolor.connected_components and ncolor.regionprops
-vs scikit-image. Locks in the invariant that cpp output and skimage output
-induce the same partition (cc) and produce identical area/bbox/centroid
-(regionprops). Skipped automatically when scikit-image isn't installed —
-i.e. on a default ``pip install ncolor`` without the [clean] extra.
+vs scikit-image. Confirms the cpp output and skimage output induce the
+same partition and produce identical area / bbox / centroid arrays.
+Auto-skipped when scikit-image is not installed.
 """
 from __future__ import annotations
 

@@ -172,9 +172,8 @@ def _make_clean_test_inputs(rng, n_cases=15):
 @needs_skimage_ref
 @pytest.mark.parametrize("min_area", [3, 9, 25])
 def test_clean_path_matches_skimage_reference(min_area):
-    """The cpp-helpers rewrite of format_labels(clean=True) must produce
-    bit-identical output to the original skimage+fastremap implementation
-    across a varied corpus of disjoint-region label images."""
+    """format_labels(clean=True) is bit-identical to the skimage+fastremap
+    reference across a varied corpus of 2D disjoint-region label images."""
     rng = np.random.default_rng(min_area * 17)
     for arr in _make_clean_test_inputs(rng, n_cases=20):
         ours = format_labels(arr.copy(), clean=True, min_area=min_area, background=0)
@@ -186,9 +185,7 @@ def test_clean_path_matches_skimage_reference(min_area):
 
 
 def _make_clean_3d_inputs(rng, n_cases=8, D=24):
-    """3D label volumes with disjoint blobs + stray voxels — exercises
-    the same disjoint-component-splitting and small-region-removal
-    branches as the 2D fixture but in a 3D shape."""
+    """3D label volumes with disjoint blobs and stray voxels."""
     cases = []
     for _ in range(n_cases):
         arr = np.zeros((D, D, D), dtype=np.uint16)
@@ -211,9 +208,7 @@ def _make_clean_3d_inputs(rng, n_cases=8, D=24):
 @needs_skimage_ref
 @pytest.mark.parametrize("min_area", [2, 5, 15])
 def test_clean_path_matches_skimage_reference_3d(min_area):
-    """N-D parity check: format_labels(clean=True) on 3D volumes must
-    still be bit-identical to the skimage reference. Confirms the
-    cc_label_per_label fast path generalises beyond 2D."""
+    """3D parity vs the skimage reference."""
     rng = np.random.default_rng(min_area * 23 + 1)
     for arr in _make_clean_3d_inputs(rng, n_cases=8):
         ours = format_labels(arr.copy(), clean=True, min_area=min_area, background=0)
@@ -225,14 +220,12 @@ def test_clean_path_matches_skimage_reference_3d(min_area):
 
 
 def test_clean_path_4d_smoke():
-    """4D smoke test: no skimage cross-check (skimage.measure.regionprops
-    only goes up to 3D), but make sure the cpp path doesn't crash and
-    produces a sensible cleaned label image."""
+    """4D smoke: skimage.measure.regionprops caps at 3D, so no parity
+    cross-check; just verify the cpp path runs and applies the rules."""
     arr = np.zeros((6, 6, 6, 6), dtype=np.uint16)
-    arr[1:4, 1:4, 1:4, 1:4] = 1   # solid 4D block of label 1
-    arr[5, 5, 5, 5] = 2           # isolated single-voxel "speckle"
+    arr[1:4, 1:4, 1:4, 1:4] = 1
+    arr[5, 5, 5, 5] = 2  # isolated single-voxel speckle, should drop
     out = format_labels(arr, clean=True, min_area=2, background=0)
-    # Speckle should drop, label 1 block stays.
     assert out.shape == arr.shape
     assert int(out.max()) == 1
     assert out[5, 5, 5, 5] == 0

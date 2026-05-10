@@ -1,7 +1,5 @@
-"""Parity tests for the cpp delete_spurs against the original
-skimage+scipy Python implementation. Auto-skipped on installs without
-scikit-image / scipy (the cpp version itself never needs them, but the
-reference does)."""
+"""Parity tests for delete_spurs against a skimage + scipy reference.
+Auto-skipped on installs without scikit-image or scipy."""
 from __future__ import annotations
 
 import numpy as np
@@ -14,8 +12,7 @@ scipy_ndimage = pytest.importorskip("scipy.ndimage")
 
 
 def _ref_delete_spurs(mask, hole_threshold=5):
-    """Reference: original ncolor.format.delete_spurs body, verbatim
-    aside from the lazy-import shim."""
+    """skimage + scipy reference for delete_spurs."""
     pad = 1
     skel = skimage_morphology.remove_small_holes(
         np.pad(mask, pad, mode="constant"), hole_threshold
@@ -72,14 +69,10 @@ def test_delete_spurs_matches_reference_2d(seed, hole_threshold):
         f"2D delete_spurs diverged from skimage+scipy ref "
         f"(seed={seed}, hole_threshold={hole_threshold})"
     )
-    # Sanity: with the random-stroke fixture, pruning should always
-    # remove a meaningful number of pixels (every isolated segment has
-    # endpoints to peel). Guards against a regression where both
-    # implementations trivially return the input unchanged.
+    # Guard against both implementations trivially returning the input.
     removed = int(mask.sum()) - int(ours.sum())
     assert removed >= 10, (
-        f"too few pixels pruned (in={int(mask.sum())}, out={int(ours.sum())}) — "
-        f"the parity check passed but the test isn't exercising the loop"
+        f"too few pixels pruned (in={int(mask.sum())}, out={int(ours.sum())})"
     )
 
 
@@ -108,9 +101,7 @@ def test_delete_spurs_matches_reference_3d(seed):
 
 @pytest.mark.parametrize("seed", range(3))
 def test_delete_spurs_matches_reference_4d(seed):
-    """4D parity vs the skimage+scipy reference. Locks in that the
-    N-D pad / cc_label / endpoint-prune chain doesn't bake any
-    2D/3D-specific assumptions into the cpp implementation."""
+    """4D parity vs the skimage+scipy reference."""
     rng = np.random.default_rng(seed * 31 + 5)
     D = 8
     img = np.zeros((D, D, D, D), dtype=bool)
@@ -128,10 +119,7 @@ def test_delete_spurs_matches_reference_4d(seed):
 
 
 def test_delete_spurs_5d_smoke():
-    """5D smoke test (no skimage cross-check above 3D for the
-    morphology helpers, but the cpp code is dimension-agnostic).
-    Confirms the function returns sensibly on a 5-D input — same
-    shape, bool dtype, and at least some pruning happens."""
+    """5D smoke: same shape and bool dtype out, at least some pruning."""
     mask = np.zeros((5, 5, 5, 5, 5), dtype=bool)
     mask[2, 2, 2, 2, 1:4] = True
     mask[2, 2, 2, 1:4, 2] = True
@@ -156,36 +144,27 @@ def test_delete_spurs_solid_block():
 
 
 def test_delete_spurs_hole_threshold_actually_fills():
-    """Closed shape with interior holes of varying size: small holes
-    (≤ threshold pixels) get filled in by the bg-CCL pass; larger ones
-    survive. Confirms the hole_threshold parameter has real effect and
-    that the cpp + reference agree on which holes are filled."""
+    """hole_threshold actually selects which interior holes get filled."""
     mask = np.zeros((20, 20), dtype=bool)
-    # 16x16 solid block centred in the array — fully interior (the
-    # outer bg has plenty of room to be one big component).
     mask[2:18, 2:18] = True
-    # Punch holes of size 1, 4 (2x2), and 16 (4x4):
-    mask[5, 5] = False
-    mask[8:10, 8:10] = False
-    mask[12:16, 12:16] = False
+    mask[5, 5] = False           # 1-px hole
+    mask[8:10, 8:10] = False     # 4-px hole
+    mask[12:16, 12:16] = False   # 16-px hole
 
-    # threshold=1: only the single-pixel hole gets filled.
     a = delete_spurs(mask, hole_threshold=1)
     b = _ref_delete_spurs(mask, hole_threshold=1)
     assert np.array_equal(a, b)
-    assert a[5, 5] == True, "single-pixel hole should be filled at threshold=1"
-    assert a[8, 8] == False, "2x2 hole survives threshold=1"
-    assert a[12, 12] == False, "4x4 hole survives threshold=1"
+    assert a[5, 5] == True
+    assert a[8, 8] == False
+    assert a[12, 12] == False
 
-    # threshold=5: 1-px and 2x2 holes (4 px) fill; 4x4 (16 px) doesn't.
     a = delete_spurs(mask, hole_threshold=5)
     b = _ref_delete_spurs(mask, hole_threshold=5)
     assert np.array_equal(a, b)
     assert a[5, 5] == True
-    assert a[8, 8] == True, "4-px hole should be filled at threshold=5"
-    assert a[12, 12] == False, "16-px hole survives threshold=5"
+    assert a[8, 8] == True
+    assert a[12, 12] == False
 
-    # threshold=20: every hole fills.
     a = delete_spurs(mask, hole_threshold=20)
     b = _ref_delete_spurs(mask, hole_threshold=20)
     assert np.array_equal(a, b)
@@ -193,36 +172,24 @@ def test_delete_spurs_hole_threshold_actually_fills():
 
 
 def test_delete_spurs_preserves_junction():
-    """A T-junction (vertical line meeting a horizontal line) is a
-    pixel with neighbour count 3 — never an endpoint, so iterative
-    pruning peels the arms back toward it and stops once everything
-    adjacent to the junction has count > 1. Confirms count≥2 pixels
-    survive the loop and parity holds on a structured input."""
+    """A cross of two 1-wide bars eats down to the junction pixel."""
     mask = np.zeros((15, 15), dtype=bool)
-    mask[3:12, 7] = True  # vertical bar
-    mask[7, 3:12] = True  # horizontal bar through it (T-junction at [7, 7])
+    mask[3:12, 7] = True
+    mask[7, 3:12] = True
     in_fg = int(mask.sum())
 
     a = delete_spurs(mask, hole_threshold=5)
     b = _ref_delete_spurs(mask, hole_threshold=5)
-    assert np.array_equal(a, b), "junction case diverged from reference"
+    assert np.array_equal(a, b)
 
     out_fg = int(a.sum())
-    # Pruning eats the arms iteratively; the junction itself peels
-    # last (count 4 → 3 → 2 → 1 → 0). For a 9+9 cross with both arms
-    # length 4 from centre, every pixel is on a 1-wide spur and the
-    # whole structure ends up consumed (the centre becomes isolated
-    # at the very end and stays as a single pixel). Verify the cpp
-    # and reference agree on that outcome.
-    assert out_fg < in_fg, "expected pruning on cross-shape"
-    assert out_fg == int(b.sum()), "cpp and ref disagree on residue size"
+    assert out_fg < in_fg
+    assert out_fg == int(b.sum())
 
 
 def test_delete_spurs_closed_loop_unchanged():
-    """A square loop has no endpoints (every pixel has count 2 along
-    the loop). Pruning should be a no-op and parity should hold."""
+    """A square loop has no endpoints; pruning is a no-op."""
     mask = np.zeros((12, 12), dtype=bool)
-    # 6x6 square outline (every loop pixel has exactly 2 neighbours).
     mask[3:9, 3] = True
     mask[3:9, 8] = True
     mask[3, 3:9] = True
@@ -230,6 +197,4 @@ def test_delete_spurs_closed_loop_unchanged():
     a = delete_spurs(mask, hole_threshold=1)
     b = _ref_delete_spurs(mask, hole_threshold=1)
     assert np.array_equal(a, b)
-    # No endpoints → no pruning. Hole inside the loop (16 px) is
-    # larger than threshold=1, so it doesn't fill either.
-    assert np.array_equal(a, mask), "closed loop should be unchanged"
+    assert np.array_equal(a, mask)
