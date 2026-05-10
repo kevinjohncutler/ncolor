@@ -1,5 +1,6 @@
-"""Public ``ncolor.label`` / ``ncolor.connect`` API — thin wrappers over
-the :mod:`ncolor._backend` C++ engine.
+"""Public ``ncolor.label`` / ``ncolor.connect`` API.
+
+Thin wrappers over the C++ Solver in :mod:`ncolor._backend`.
 """
 from __future__ import annotations
 
@@ -8,11 +9,7 @@ import numpy as np
 from .format import format_labels
 
 
-# Module-level Solver singleton. The C++ Solver owns a persistent thread
-# pool; constructing it per call adds ~5–10 ms of pool-spinup overhead
-# that swamps small-image latencies. One Solver per process is plenty —
-# label() / expand_labels() are not called concurrently from within a
-# single ncolor consumer.
+# Persistent thread pool; constructing per call costs ~5-10 ms.
 _SOLVER = None
 
 
@@ -20,7 +17,7 @@ def _get_solver():
     global _SOLVER
     if _SOLVER is None:
         from ._backend import Solver
-        _SOLVER = Solver()  # auto-thread count from calibration cache
+        _SOLVER = Solver()
     return _SOLVER
 
 
@@ -31,43 +28,30 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     """4-color graph coloring of a label image.
 
     Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
-    across calls — useful for batch pipelines.
+    across calls.
 
     ``p`` selects the Voronoi expand metric:
-        p=1 — Saito-Toriwaki separable sweep (Manhattan, default)
-        p=2 — Felzenszwalb parabolic envelope (Euclidean²)
+        p=1: Saito-Toriwaki separable sweep (Manhattan; default)
+        p=2: Felzenszwalb parabolic envelope (Euclidean²)
     L1 is faster and produces a different (but equally valid) coloring
     at boundary tie-break regions; both satisfy the 4-coloring constraint.
 
-    ``wrap=True`` treats the image as a torus: left/right and top/bottom
-    edges are neighbours, so cells on opposite image edges become
-    adjacent in the colouring graph. Increases constraint pressure on
-    perimeter cells and produces a more uniform colour distribution on
+    ``wrap=True`` treats the image as a torus: opposite edges are
+    treated as adjacent. Increases constraint pressure on perimeter
+    cells and produces a more uniform colour distribution on
     tightly-cropped images. Negligible runtime cost.
 
-    ``balance=True`` uses the Welsh-Powell heuristic in the BFS
-    coloring: cells are visited in descending-degree order so the
-    most-constrained cells get coloured first. Spreads colour usage
-    more evenly than the default label-ID order at ~zero runtime cost
-    (one O(N) bucket sort). Recommended for visual uniformity,
-    especially with p=1 where the BFS would otherwise concentrate
-    color 4 unevenly.
+    ``balance=True`` uses the Welsh-Powell heuristic: cells are
+    visited in descending-degree order so the most-constrained cells
+    get coloured first. Spreads colour usage more evenly than the
+    default label-ID order at ~zero runtime cost. Recommended with
+    p=1, where BFS would otherwise concentrate color 4 unevenly.
     """
-    # ``verbose`` was a stage-trace flag for the (now-retired) numba
-    # reference impl. Accepted for back-compat; ignored on the cpp path.
-    del verbose
+    del verbose  # accepted for back-compat; cpp pipeline doesn't trace stages
 
-    # Common path: cpp Solver handles format_labels (compact 1..N with
-    # min-shift), expand (or skip when expand=False), connect, color,
-    # apply_lut, and bg-masking under one GIL release. The wrapper just
-    # dispatches; no per-call numpy scans.
     lab_arr = np.asarray(lab)
     solver = _get_solver()
 
-    # Single cpp path for all (p, wrap) combinations: Solver.label's
-    # internal expand step is natively toroidal for both L1 (chamfer
-    # with extra wrap-aware sweeps) and L2 (envelope with ghost seeds).
-    # No Python-level np.pad workaround.
     out_array, n_used = solver.label(
         lab_arr,
         n_colors=int(n), max_depth=int(max_depth),
@@ -76,9 +60,6 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
         balance=bool(balance))
     out = out_array
 
-    # return_lut / check_conflicts / return_conflicts: read accessors from
-    # the Solver (cheap — lut and conflict count were computed inside the
-    # GIL-released label() call).
     if return_lut or check_conflicts or return_conflicts:
         lut = solver.get_last_lut() if return_lut else None
         conflicts = solver.get_last_n_conflicts() \
@@ -136,15 +117,14 @@ def regionprops(labels, n_labels=0):
     """Region properties for a dense int32 1..N labelled image.
 
     Returns ``dict`` with vectorised numpy arrays:
-        ``area`` (n_labels,)            — int64 pixel counts
-        ``bbox_min`` (n_labels, ndim)   — int64 inclusive lower bounds
-        ``bbox_max`` (n_labels, ndim)   — int64 exclusive upper bounds
-        ``centroid`` (n_labels, ndim)   — float64 centroids
+        ``area`` (n_labels,):           int64 pixel counts
+        ``bbox_min`` (n_labels, ndim):  int64 inclusive lower bounds
+        ``bbox_max`` (n_labels, ndim):  int64 exclusive upper bounds
+        ``centroid`` (n_labels, ndim):  float64 centroids
     Pass ``n_labels=0`` (default) to auto-detect from ``labels.max()``.
 
-    Drop-in for the common subset of ``skimage.measure.regionprops`` —
-    much faster (1.9–8× depending on shape) and returns vectorised
-    arrays instead of per-region Python objects.
+    Drop-in for the common subset of ``skimage.measure.regionprops``;
+    returns vectorised arrays instead of per-region Python objects.
     """
     from ._backend import _impl as _b
     return _b.regionprops(labels, int(n_labels))

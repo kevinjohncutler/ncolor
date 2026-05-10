@@ -1,20 +1,7 @@
-// delete_spurs — N-D skeleton cleanup (matches the original Python
-// delete_spurs in src/ncolor/format.py). Three steps:
-//
-//   1. Pad input by 1 with constant 0 (so the outer background wraps
-//      into a single huge component at step 2 and edge-adjacent
-//      endpoints have well-defined neighbours at step 3).
-//   2. ``remove_small_holes`` — invert, label face-connected bg
-//      components via ``cc_label_nd``, fill components whose pixel
-//      count is ≤ ``hole_threshold`` back into the foreground.
-//   3. Iterative endpoint pruning — for each fg pixel, count fg
-//      neighbours; flip pixels with exactly one neighbour to bg;
-//      repeat until a sweep produces no change. Connectivity here
-//      matches scipy.ndimage.generate_binary_structure(ndim, k):
-//      k=ndim (full diagonal) for 2D, k=1 (face) for ndim≥3.
-//
-// All steps work on a flat uint8 buffer keyed by row-major strides
-// computed from the padded shape — no dimension-specific code paths.
+// N-D skeleton cleanup: pad-by-1, fill bg holes ≤ hole_threshold via
+// face-connected CCL, then iteratively strip pixels with exactly one
+// foreground neighbour until convergence. 2D uses 8-connectivity for
+// the endpoint check; ndim≥3 uses face-only.
 #pragma once
 
 #include <cstdint>
@@ -32,17 +19,9 @@ namespace py = pybind11;
 namespace ncolor_cpp {
 namespace delete_spurs_detail {
 
-// Build the set of byte-offsets within an N-D buffer of given strides
-// that correspond to neighbours under the requested connectivity. The
-// offsets do not include 0 (the centre pixel itself).
-//
-//   kind=1     → face only            (2·ndim offsets)
-//   kind=2     → face + edge          (depends on ndim; 8 for 2D, 18 for 3D)
-//   kind=ndim  → face + edge + corner (3^ndim − 1 offsets)
-//
-// Walks every cell of the {-1,0,1}^ndim cube, keeps cells whose L1
-// distance from origin lies in [1, kind], and turns each kept coord
-// into a strided byte-offset into the buffer.
+// Strided offsets to N-D neighbours under the given connectivity.
+// kind=1 is face-only (2·ndim offsets); kind=ndim is full diagonal
+// (3^ndim - 1 offsets). The centre cell (offset 0) is excluded.
 inline std::vector<int64_t>
 make_neighbour_offsets(const std::vector<int64_t>& strides, int ndim, int kind) {
     std::vector<int64_t> offsets;
@@ -74,10 +53,8 @@ make_neighbour_offsets(const std::vector<int64_t>& strides, int ndim, int kind) 
     return offsets;
 }
 
-// Read the input buffer at byte-offset ``byte_off``, returning whether
-// any byte of the underlying value is nonzero. The caller passes
-// ``itemsize`` from the numpy buffer protocol — this lets us accept
-// bool / uint8 / int32 / etc. from Python without dtype-specific paths.
+// Dtype-agnostic nonzero test via the numpy buffer protocol's
+// itemsize. Accepts bool / uint8 / int32 / etc. without templating.
 inline bool nonzero_at(const char* base, py::ssize_t byte_off, py::ssize_t itemsize) {
     const char* p = base + byte_off;
     for (py::ssize_t b = 0; b < itemsize; ++b) {
@@ -89,11 +66,8 @@ inline bool nonzero_at(const char* base, py::ssize_t byte_off, py::ssize_t items
 }  // namespace delete_spurs_detail
 
 
-// Public entry: returns a fresh boolean array of the input shape.
-//
-// ``hole_threshold`` matches skimage.morphology.remove_small_holes'
-// ``area_threshold`` semantics: components with pixel count ≤ threshold
-// are filled. Default mirrors the original Python implementation.
+// Returns a fresh boolean array of the input shape. Components with
+// pixel count ≤ ``hole_threshold`` are filled (face-connected).
 inline py::array_t<bool>
 delete_spurs_nd(py::array mask, int hole_threshold) {
     py::buffer_info info = mask.request();
@@ -168,26 +142,13 @@ delete_spurs_nd(py::array mask, int hole_threshold) {
         }
     }
 
-    // Step 2: iterative endpoint pruning.
-    //
-    // The naive algorithm scans the full padded buffer twice per
-    // iteration (mark + subtract). For a 1024² image with stroke
-    // lengths ~256 the iteration count is on that order, so the cost
-    // is ~iterations × image_pixels. On dense skeletons this is fine,
-    // but for sparse foregrounds it bills work proportional to the
-    // empty background.
-    //
-    // Optimised version: maintain a *candidate set* of pixel offsets
-    // that need checking on each iteration. Initial set = every fg
-    // pixel (one full pass). On subsequent iterations the candidate
-    // set is the union of *neighbours of pixels removed last
-    // iteration* — only those can have had their neighbour count
-    // change. Equivalent to the parallel-removal semantics of the
-    // original algorithm because all endpoints in iteration k are
-    // identified before any are removed (we collect into ``ep``
-    // first, then subtract in bulk). Total work scales with
-    // (pixels removed × neighbours_per_pixel) instead of
-    // (iterations × image_pixels).
+    // Step 2: iterative endpoint pruning, candidate-list driven.
+    // Each iteration only re-checks pixels whose neighbour count could
+    // have changed (the previous iteration's removals + their fg
+    // neighbours). Total work is O(pixels_removed · n_neighbours)
+    // instead of O(iterations · image_pixels). Endpoints are collected
+    // before any are removed so the parallel-removal semantics of the
+    // naive algorithm are preserved.
     {
         // Match endpoints_nd: 2D uses full (8-conn), ndim≥3 uses face-only.
         const int neigh_kind = (ndim == 2) ? ndim : 1;
@@ -218,12 +179,11 @@ delete_spurs_nd(py::array mask, int hole_threshold) {
             }
             if (ep.empty()) break;
 
-            // Subtract — done in bulk so all reads above saw the same skel state.
+            // Bulk subtract so the read pass above saw a consistent skel.
             for (int64_t i : ep) skel[i] = 0u;
 
-            // Next candidates: fg neighbours of just-removed pixels. Duplicates
-            // are harmless (the skel check above filters re-entries on the next
-            // iteration), so we skip an explicit visited set.
+            // Duplicates in next_candidates are harmless: the skel check
+            // at the top of the next iteration filters re-entries.
             next_candidates.clear();
             next_candidates.reserve(ep.size() * static_cast<size_t>(n_nbs));
             for (int64_t i : ep) {

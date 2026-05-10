@@ -976,12 +976,6 @@ PYBIND11_MODULE(_impl, m) {
           "to auto-detect from labels.max(). One raster pass; no per-component\n"
           "Python objects.");
 
-    // cc_label_per_label — like cc_label, but a pair of neighbouring
-    // pixels is unioned only if they share the same input value (and
-    // both are nonzero). Returns (labels, n_components, source_labels).
-    // ``source_labels[i]`` is the input value of the (i+1)-th component
-    // — lets format_labels(clean=True) group components by their
-    // original label without rescanning the image.
     m.def("cc_label_per_label",
           [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> input,
              int conn) {
@@ -1021,18 +1015,13 @@ PYBIND11_MODULE(_impl, m) {
           "(labels, n_components, source_labels) where source_labels[i] is\n"
           "the input value of the (i+1)-th component.");
 
-    // delete_spurs — N-D skeleton hole-fill + iterative endpoint pruning.
-    // Replaces the original Python implementation that used
-    // skimage.morphology.remove_small_holes + scipy.ndimage.convolve.
     m.def("delete_spurs",
           [](py::array mask, int hole_threshold) {
               return ncolor_cpp::delete_spurs_nd(mask, hole_threshold);
           },
           py::arg("mask"), py::arg("hole_threshold") = 5,
-          "Skeleton cleanup: pad-by-1 with constant 0, fill bg holes with\n"
-          "≤ hole_threshold pixels via face-connected CCL, then iteratively\n"
-          "prune endpoints (fg pixels with exactly 1 fg neighbour) until\n"
-          "convergence. Connectivity for endpoint detection: 8-conn for\n"
-          "2D, face-only (2·ndim) for ndim≥3 — matches the original\n"
-          "ncolor.format.endpoints_nd behavior.");
+          "N-D skeleton cleanup: fill bg holes ≤ hole_threshold pixels\n"
+          "(face-connected), then iteratively strip endpoints (fg pixels\n"
+          "with exactly one fg neighbour) until convergence. Endpoint\n"
+          "connectivity is 8-conn for 2D, face-only for ndim≥3.");
 }

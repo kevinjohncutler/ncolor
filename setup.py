@@ -32,14 +32,6 @@ except ImportError:
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-# Hard runtime deps for the cpp pipeline. The entire public API —
-# ncolor.label, expand_labels, format_labels (incl. clean=True),
-# connected_components, regionprops, delete_spurs — runs end-to-end on
-# just numpy + platformdirs as of v2.0.0. The previous [legacy] (numba
-# reference) and [clean] (scipy/scikit-image/fastremap) extras are
-# both retired; clean=True now uses the cpp connected_components +
-# regionprops + format_labels(first_seen=True) chain, and delete_spurs
-# is a cpp implementation of the original skimage+scipy pipeline.
 install_deps = [
     "numpy",
     "platformdirs",  # SMT calibration cache + native loader

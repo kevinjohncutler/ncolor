@@ -1,9 +1,7 @@
 import numpy as np
 
 
-# Module-level ExpandEngine singleton. Constructing one per call adds
-# ~5-10 ms of pool-spinup overhead — matches the rationale in color.py's
-# _SOLVER. Engine is thread-safe for sequential format_labels calls.
+# Persistent thread pool; constructing per call costs ~5-10 ms.
 _FORMAT_ENGINE = None
 
 
@@ -18,54 +16,31 @@ def _get_format_engine():
 def format_labels(labels, clean=False, min_area=9, despur=False,
                   verbose=False, background=None, ignore=False,
                   first_seen=False):
-    """
-    Puts labels into 'standard form', i.e. background=0 and cells 1,2,3,...,N-1,N.
-    Optional clean flag: disconnect and disjoint masks and discard small masks below min_area.
-    min_area default is 9px.
-    Optional ignore flag: 0 is now 'ignore' and 1 is background. We do not want to shift 1->0 in that case.
+    """Compact labels into background=0, cells 1..N.
 
-    first_seen (default False): when False, the new label assigned to a
-    source value is its rank among present values (ascending-source,
-    parallel build, fast). When True, labels are assigned in input scan
-    order — matches ``fastremap.renumber`` bit-for-bit, serial build,
-    ~2× slower. Set to True only if downstream code depends on the
-    legacy fastremap ordering.
+    ``clean=True`` splits disjoint components per label and drops
+    components below ``min_area``. ``despur=True`` additionally runs
+    :func:`delete_spurs` on each label's mask before splitting.
+
+    ``ignore=True`` keeps ``0`` as an "ignore" marker and treats ``1``
+    as background (the input min-shift is skipped).
+
+    ``first_seen=True`` numbers compacted labels in input scan order
+    instead of the default ascending-source order. ~2× slower; only
+    needed if downstream code requires that exact ordering.
     """
-    # Hot path: simple compaction (no cleanup, default min-shift) ->
-    # cpp engine. Skips the numpy.copy + astype + np.min + fastremap
-    # round-trip that this function used to do per call.
     if (not clean and not ignore and background is None and not verbose):
-        try:
-            eng = _get_format_engine()
-        except ImportError:
-            pass  # fall through to legacy path
-        else:
-            # Pass the original-dtype array straight to cpp. ExpandEngine
-            # casts to int32 in parallel inside the released-GIL block via
-            # cast_to_int32 — no numpy.astype + .copy() round-trip outside
-            # the GIL release. Output uses ascending-source numbering: the
-            # new label assigned to source value k is its rank among
-            # present values. Differs from fastremap.renumber's
-            # input-order numbering by a permutation, but both produce a
-            # valid 1..N compaction; downstream callers treat label
-            # values as opaque identifiers.
-            arr = np.ascontiguousarray(labels)
-            out, _n = eng.format_labels(arr, first_seen=bool(first_seen))
-            return out
+        eng = _get_format_engine()
+        arr = np.ascontiguousarray(labels)
+        out, _n = eng.format_labels(arr, first_seen=bool(first_seen))
+        return out
 
-    # Legacy path: clean=True / ignore / custom background / verbose.
-    # Labels are stored as a part of a float array in Cellpose, so it must be cast back here.
-    # some people also use -1 as background, so we must cast to the signed integar class. We
-    # can safely assume no 2D or 3D image will have more than 2^31 cells. Finally, cv2 does not
-    # play well with unsigned integers (saves to default uint8), so we cast to uint32.
-    labels = labels.copy()
-    labels = labels.astype('int32') #uint vs int
+    # Cellpose stores labels inside float arrays; cast back to int.
+    # Some segmenters use -1 as background, so use a signed dtype here.
+    labels = labels.copy().astype('int32')
     if background is None:
-        # Treat min as bg ONLY when negative (e.g. -1 used as bg by some
-        # segmenters). For min >= 0 the input either already has bg at 0
-        # or has no bg (every pixel labeled — typical for already-expanded
-        # label maps); shifting in those cases would absorb the smallest
-        # cell into the bg. Mirrors the cpp fix in format_labels_inplace.
+        # Min-shift only when the min is negative; otherwise the smallest
+        # cell would be absorbed into the background.
         m = int(np.min(labels))
         background = m if m < 0 else 0
     else:
@@ -79,15 +54,7 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
             background = 0
     labels = labels.astype('uint32')
 
-    # optional cleanup
     if clean:
-        # The despur=True branch still runs per-label (it mutates the
-        # mask between cc passes); the common despur=False path uses a
-        # single global cpp call into cc_label_per_label which returns
-        # (component_labels, n_components, source_label_per_component)
-        # in one round-trip. That avoids paying ~290 µs of Python⇄cpp
-        # boundary overhead per input label, which was the bottleneck
-        # after bbox-cropping was already in place.
         from .color import connected_components, regionprops as _regionprops
         from ._backend import _impl as _b
 
@@ -97,11 +64,8 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
         nmax = int(labels.max()) if labels.size else 0
 
         if despur:
-            # Per-label loop required: delete_spurs needs the binary
-            # mask of just one label, and despur mutates the labels
-            # buffer in-place between iterations. Bbox-cropped path,
-            # same as before — only used when the user explicitly
-            # passes despur=True.
+            # delete_spurs mutates the per-label mask between rounds, so
+            # the despur path stays per-label (bbox-cropped).
             global_props = _regionprops(np.ascontiguousarray(labels_i32), nmax) if nmax > 0 else None
             bbox_min_all = global_props['bbox_min'] if global_props else None
             bbox_max_all = global_props['bbox_max'] if global_props else None
@@ -147,27 +111,24 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                             cur_max += 1
                             labels[global_t] = cur_max
         elif nmax > 0:
-            # Fast path: one global label-aware CCL gives every
-            # component of every input label in a single pass, plus
-            # a (n_components,) array of source labels.
+            # One label-aware CCL pass yields every component of every
+            # input label, plus the source label of each component.
             comp_labels, n_total, source_per_comp = _b.cc_label_per_label(
                 np.ascontiguousarray(labels_i32), conn=ndim,
             )
             if n_total > 0:
-                # One regionprops call: areas for all components.
-                comp_props = _regionprops(comp_labels, n_total)
-                comp_areas = comp_props['area']
+                comp_areas = _regionprops(comp_labels, n_total)['area']
 
-                # Group components by source label via a stable sort on
-                # source_per_comp. After sorting, components sharing a
-                # source label are contiguous, located by searchsorted.
+                # Group components by source label: stable-sort packs
+                # same-source components into contiguous slices that
+                # searchsorted can then index by source value.
                 sort_idx = np.argsort(source_per_comp, kind='stable')
                 sorted_sources = source_per_comp[sort_idx]
                 unique_sources = np.unique(source_per_comp)
                 unique_sources = unique_sources[unique_sources > 0]
 
-                # remap[c+1] = the new label value for component c+1.
-                # Bg pixels (comp_label == 0) read remap[0] = 0.
+                # remap[c+1] is the new label value for component (c+1).
+                # remap[0] = 0 keeps background pixels as background.
                 remap = np.zeros(n_total + 1, dtype=np.int32)
                 cur_max = nmax
                 for j in unique_sources:
@@ -181,22 +142,19 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                     if comp_indices.size > 1 and verbose:
                         print('Warning - found mask with disjoint label.')
                     for rank, k in enumerate(order):
-                        ci = int(comp_indices[k])  # 0-based
+                        ci = int(comp_indices[k])
                         area = int(areas_for_j[k])
                         if rank == 0:
-                            # Largest component: keep at j unless ≤ min_area.
                             if area <= min_area:
                                 if verbose:
                                     print('Warning - found mask area less than', min_area)
                                     print('Removing it.')
-                                # remap[ci + 1] stays 0 → drops to bg
                             else:
                                 remap[ci + 1] = int(j)
                         else:
                             if area < min_area:
                                 if verbose:
                                     print('secondary disjoint part smaller than min_area. Removing it.')
-                                # remap[ci + 1] stays 0 → drops to bg
                             else:
                                 if verbose:
                                     print('secondary disjoint part bigger than min_area, relabeling. Area:', area,
@@ -204,16 +162,9 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                                 cur_max += 1
                                 remap[ci + 1] = cur_max
 
-                # Single fancy-index pass writes the cleaned labels.
-                # Pixels where comp_labels == 0 (always-bg) read remap[0] = 0,
-                # so this also clears any bg that was non-zero originally.
                 labels = remap[comp_labels].astype(np.uint32, copy=False)
 
-    # Final compaction — cpp ``format_labels`` with first_seen=True is
-    # bit-identical to fastremap.renumber for raster-scan label
-    # assignment. The cpp side always returns int32; downcast to the
-    # smallest unsigned dtype that fits ``n_used`` to match
-    # fastremap.refit's semantics on a uint32-typed input.
+    # Compact to 1..N and downcast to the smallest unsigned int that fits.
     eng = _get_format_engine()
     out, n_used = eng.format_labels(
         np.ascontiguousarray(labels.astype(np.int32)),
@@ -225,23 +176,13 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
         return out.astype(np.uint16, copy=False)
     return out.astype(np.uint32, copy=False)
 
+
 def delete_spurs(mask, hole_threshold=5):
-    """N-D skeleton cleanup. Pads input by 1, fills bg holes with
-    pixel count ≤ ``hole_threshold`` (face-connected), then iteratively
-    prunes endpoints (fg pixels with exactly one fg neighbour) until no
-    pixels change in a pass. Returns a fresh boolean array of the input
-    shape.
-
-    Endpoint connectivity matches the original Python implementation:
-    8-conn (full diagonal) for 2D, face-only for ndim ≥ 3.
-
-    Implemented in cpp (``ncolor._backend._impl.delete_spurs``); no
-    scikit-image / scipy required.
+    """N-D skeleton cleanup: fill bg holes ≤ ``hole_threshold`` pixels
+    (face-connected), then iteratively strip endpoints until no pixel
+    has exactly one foreground neighbour. Endpoint connectivity is
+    8-conn for 2D, face-only for ndim ≥ 3.
     """
     from ._backend import _impl as _b
     arr = np.ascontiguousarray(mask).astype(np.uint8, copy=False)
     return _b.delete_spurs(arr, int(hole_threshold))
-
-
-# import sys
-# sys.modules[__name__] = format_labels

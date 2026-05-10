@@ -1,13 +1,13 @@
-"""Public ``ncolor.expand_labels`` API — thin wrapper over the C++
-:class:`ncolor._backend.ExpandEngine`.
+"""Public ``ncolor.expand_labels`` API.
+
+Thin wrapper over the C++ ExpandEngine in :mod:`ncolor._backend`.
 """
 from __future__ import annotations
 
 import numpy as np
 
 
-# Module-level singleton — the engine owns a persistent thread pool;
-# constructing per call swamps small-image latencies.
+# Persistent thread pool; constructing per call costs ~5-10 ms.
 _ENGINE = None
 
 
@@ -15,7 +15,7 @@ def _get_engine():
     global _ENGINE
     if _ENGINE is None:
         from ._backend import ExpandEngine
-        _ENGINE = ExpandEngine()  # auto-thread count from calibration cache
+        _ENGINE = ExpandEngine()
     return _ENGINE
 
 
@@ -24,23 +24,16 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
     """Voronoi label expansion across background pixels under L_p metric.
 
     ``p=2`` uses the Felzenszwalb-Huttenlocher parabolic envelope (any
-    ndim, default). ``p=1`` uses the Saito-Toriwaki separable sweep —
-    Manhattan distance, ~5× faster on 2D, slightly different boundary
-    placement at ties.
+    ndim, default). ``p=1`` uses the Saito-Toriwaki separable sweep
+    (Manhattan distance, ~5× faster on 2D, slightly different boundary
+    placement at ties).
 
-    Legacy ``metric='l1'``/``'l2'`` strings are accepted for backward
-    compatibility and translated to ``p=1``/``p=2``.
+    ``metric='l1'``/``'l2'`` strings are accepted as legacy aliases.
 
     ``wrap=True`` makes the expansion toroidal: opposite image edges are
-    treated as adjacent, so a cell near the right edge has its Voronoi
-    territory wrap around to compete with cells near the left edge.
-    Implemented natively in cpp for both metrics:
-        L1: extra wrap-aware forward+backward sweeps per axis
-            (~1.1× standard cost).
-        L2: envelope sweep iterates [-N, 2N) with ghost seeds at v ± N
-            (~1.4-1.6× standard cost; 6.6× faster than the prior
-            np.pad workaround at 2048²).
-    Useful for tile-equivalent or periodic-imaging assumptions.
+    treated as adjacent, so a seed near one edge competes for territory
+    with seeds near the opposite edge. ~1.1× cost for L1, ~1.4-1.6× for
+    L2. Useful for tile-equivalent or periodic-imaging assumptions.
     """
     if metric is not None:
         if metric == "l2":
@@ -54,17 +47,9 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
 
     arr = np.asarray(label_image)
     if arr.size == 0 or int(arr.max()) == 0:
-        # Nothing to expand: empty array or no foreground seeds. The cpp
-        # ExpandEngine assumes at least one seed; short-circuit to an
-        # int32 copy so callers always get a fresh writable buffer of
-        # the canonical expand_labels dtype.
+        # No seeds to expand from; return a fresh int32 copy so callers
+        # always get a writable buffer of the canonical output dtype.
         return arr.astype(np.int32, copy=True)
 
     arr32 = arr.astype(np.int32, copy=False)
-    # Native cpp toroidal kernels for both L1 and L2:
-    #   L1 (Saito-Toriwaki): extra wrap-aware forward+backward sweeps per
-    #       axis, ~1.1× standard cost.
-    #   L2 (Felzenszwalb): envelope sweep iterates [-N, 2N) with ghost
-    #       seeds at v ± N, Phase 2 fill unchanged. ~1.4-1.6× standard
-    #       cost, 6.6× faster than the prior np.pad workaround at 2048².
     return _get_engine().expand_labels(arr32, p=p, wrap=bool(wrap))

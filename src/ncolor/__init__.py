@@ -1,11 +1,8 @@
 """ncolor — 4-color label graph coloring and label expansion utilities.
 
-Public API resolves lazily (PEP 562 ``__getattr__``): bare ``import ncolor``
-does almost no work; submodules — and the C++ extension — load only on
-first attribute access.
-
-The original numba reference implementation was retired in v1.6.0; the
-C++ engine in :mod:`ncolor._backend` is the only backend.
+The public API resolves lazily via PEP 562 ``__getattr__``: bare
+``import ncolor`` does almost no work; submodules and the C++
+extension load on first attribute access.
 
 Public names:
 
@@ -16,12 +13,8 @@ Public names:
 * ``connected_components`` — N-D connected-components labelling
 * ``regionprops``          — area / bbox / centroid for a labelled image
 * ``delete_spurs``         — N-D skeleton hole-fill + endpoint pruning
-
-The pure-numpy helpers ``unique_nonzero`` and ``is_sequential`` were
-removed in v2 — they aren't called from any ncolor hot path; identical
-implementations now live in ``ocdkit.array.ops``.
 """
-from ._version import __version__  # cheap; no heavy deps
+from ._version import __version__
 
 __all__ = [
     "label",
@@ -33,7 +26,6 @@ __all__ = [
     "delete_spurs",
 ]
 
-# Map public attribute -> source module (relative path).
 _LAZY_ATTRS = {
     "label": ".color",
     "get_lut": ".color",

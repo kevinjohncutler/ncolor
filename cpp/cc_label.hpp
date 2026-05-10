@@ -309,23 +309,13 @@ inline int32_t cc_label_nd(const T* input, int32_t* output,
 }
 
 
-// Label-aware connected components: like cc_label_nd, but a pair of
-// neighbouring pixels is unioned into the same component only if they
-// share the same input value (and that value is nonzero). One pass over
-// the image partitions every nonzero pixel into a maximal same-value
-// connected region.
-//
-// On return:
-//   * ``output`` holds dense 1..N component IDs (0 = bg, same encoding
-//     as cc_label_nd).
-//   * ``source_labels_out`` is sized to N and holds the input value of
-//     each component (i.e. the original label that the component
-//     belongs to) so callers can group components by source label
-//     without rescanning the image.
-//
-// Used by ``ncolor.format_labels(clean=True)`` to do all per-label
-// connected-component analysis in a single cpp call instead of one
-// call per input label (which billed pure Python⇄cpp boundary cost).
+// Label-aware connected components. Like cc_label_nd, but neighbours
+// are only unioned when they share the same nonzero input value, so
+// each output component lies entirely within one source label.
+// ``output`` holds dense 1..N component IDs (0 = bg);
+// ``source_labels_out`` is sized to N with the source value of each
+// component so callers can group components by source without
+// rescanning the image.
 template <typename T>
 inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
                                       const std::vector<int64_t>& shape,
@@ -353,10 +343,9 @@ inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
     const int inner = ndim - 1;
     const int64_t W = shape[inner];
 
-    // Per-pixel checked path, used everywhere (no inner-row fast-path
-    // unrolling — the per-label union check needs to read input[] at
-    // each neighbour anyway, so the unrolled fg-only version doesn't
-    // apply). Single-image pass is plenty fast even without it.
+    // No inner-row fast path: the per-label union check has to read
+    // input[] at every neighbour anyway, so the unrolled fg-only
+    // variant in cc_label_nd doesn't help here.
     auto step_pixel_checked = [&](const int64_t* coords, int64_t flat) {
         const T cur = input[flat];
         if (cur == T{0}) return;  // bg
@@ -433,10 +422,8 @@ inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
         prev_final = final_lab;
     }
 
-    // Source-label table: the input value of each final component. Walk
-    // the output once and record on first-seen. Could fold into pass 2,
-    // but keeping it separate keeps that loop's tight cache-friendly
-    // shape and only adds one more linear scan.
+    // Source-label table: input value of each component, recorded on
+    // first sight. Kept as a separate scan so pass 2 stays tight.
     source_labels_out.assign(static_cast<size_t>(next_label), T{0});
     if (next_label > 0) {
         std::vector<uint8_t> seen(static_cast<size_t>(next_label) + 1, 0u);
