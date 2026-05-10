@@ -1,7 +1,8 @@
 // N-D skeleton cleanup: pad-by-1, fill bg holes ≤ hole_threshold via
 // face-connected CCL, then iteratively strip pixels with exactly one
-// foreground neighbour until convergence. 2D uses 8-connectivity for
-// the endpoint check; ndim≥3 uses face-only.
+// foreground neighbour until convergence. The endpoint check uses
+// full-diagonal connectivity (3^ndim - 1 neighbours); face / edge /
+// vertex contacts all count as a single connection.
 #pragma once
 
 #include <cstdint>
@@ -154,8 +155,12 @@ delete_spurs_nd(py::array mask, int hole_threshold) {
     // before any are removed so the parallel-removal semantics of the
     // naive algorithm are preserved.
     {
-        // Match endpoints_nd: 2D uses full (8-conn), ndim≥3 uses face-only.
-        const int neigh_kind = (ndim == 2) ? ndim : 1;
+        // Full-diagonal connectivity in every dim (2D: 8-conn; 3D: 26-conn;
+        // ND: 3^ndim - 1 neighbours). A pixel is an endpoint iff it has
+        // exactly one fg neighbour under "any contact" — face, edge, or
+        // vertex — so a single-pixel spur attached at any kind of corner
+        // peels off the same way regardless of how it touches the body.
+        const int neigh_kind = ndim;
         const std::vector<int64_t> offsets =
             delete_spurs_detail::make_neighbour_offsets(pstrides, ndim, neigh_kind);
         const int n_nbs = static_cast<int>(offsets.size());

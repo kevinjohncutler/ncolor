@@ -192,7 +192,8 @@ def delete_spurs(mask, hole_threshold=5):
     """N-D skeleton cleanup: fill bg holes ≤ ``hole_threshold`` pixels
     (face-connected), then iteratively strip endpoints until no pixel
     has exactly one foreground neighbour. Endpoint connectivity is
-    8-conn for 2D, face-only for ndim ≥ 3.
+    full-diagonal in every dimension — face, edge, and vertex contacts
+    all count as a single connection.
     """
     from ._backend import _impl as _b
     arr = np.ascontiguousarray(mask).astype(np.uint8, copy=False)

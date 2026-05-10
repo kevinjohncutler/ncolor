@@ -1014,5 +1014,6 @@ PYBIND11_MODULE(_impl, m) {
           "N-D skeleton cleanup: fill bg holes ≤ hole_threshold pixels\n"
           "(face-connected), then iteratively strip endpoints (fg pixels\n"
           "with exactly one fg neighbour) until convergence. Endpoint\n"
-          "connectivity is 8-conn for 2D, face-only for ndim≥3.");
+          "connectivity is full-diagonal in every dim — face, edge, and\n"
+          "vertex contacts all count as a single connection.");
 }

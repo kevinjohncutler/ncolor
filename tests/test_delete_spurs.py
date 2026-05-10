@@ -12,17 +12,20 @@ scipy_ndimage = pytest.importorskip("scipy.ndimage")
 
 
 def _ref_delete_spurs(mask, hole_threshold=5):
-    """skimage + scipy reference for delete_spurs."""
+    """skimage + scipy reference for delete_spurs.
+
+    Endpoint connectivity is full-diagonal in every dim (3^ndim - 1
+    neighbours), matching the cpp implementation. A pixel is an
+    endpoint iff exactly one of its neighbours — face, edge, or
+    vertex — is fg.
+    """
     pad = 1
     skel = skimage_morphology.remove_small_holes(
         np.pad(mask, pad, mode="constant"), hole_threshold
     )
     while True:
         ndim = skel.ndim
-        if ndim == 2:
-            connectivity = scipy_ndimage.generate_binary_structure(ndim, 2)
-        else:
-            connectivity = scipy_ndimage.generate_binary_structure(ndim, 1)
+        connectivity = scipy_ndimage.generate_binary_structure(ndim, ndim)
         kernel = connectivity.astype(np.float32)
         kernel[tuple(np.array(kernel.shape) // 2)] = 0
         nb = scipy_ndimage.convolve(
@@ -185,6 +188,31 @@ def test_delete_spurs_preserves_junction():
     out_fg = int(a.sum())
     assert out_fg < in_fg
     assert out_fg == int(b.sum())
+
+
+def test_delete_spurs_removes_diagonal_spurs_3d():
+    """Single-voxel spurs touching a 3D ball at a face / edge / vertex
+    should ALL get pruned. The previous face-only connectivity rule
+    left edge- and vertex-touching spurs alone — this test guards
+    against regressing to that behaviour."""
+    grids = np.indices((16, 16, 16))
+    cz, cy, cx = 8, 8, 8
+    base = ((grids[0] - cz) ** 2 + (grids[1] - cy) ** 2 + (grids[2] - cx) ** 2) <= 16
+
+    # A surface voxel of the ball; pick one and place spurs around it.
+    surface_zyx = (8, 8, 12)  # face-east tip of the ball
+    spurs = {
+        "face":   (8, 8, 13),    # +1 along one axis
+        "edge":   (8, 9, 13),    # +1 along two axes
+        "vertex": (9, 9, 13),    # +1 along three axes
+    }
+    assert base[surface_zyx], "surface voxel must be on the ball"
+    for kind, p in spurs.items():
+        assert not base[p], f"{kind} spur must start outside the ball"
+        m = base.copy()
+        m[p] = True
+        out = delete_spurs(m, hole_threshold=0)
+        assert not out[p], f"{kind}-touching spur was not pruned"
 
 
 def test_delete_spurs_closed_loop_unchanged():
