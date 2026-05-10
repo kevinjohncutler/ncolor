@@ -115,26 +115,6 @@ def connect(img, conn=1):
     return _get_solver().connect(img, conn=int(conn))
 
 
-def unique_nonzero(labels):
-    """Unique nonzero labels."""
-    arr = np.asarray(labels)
-    u = np.unique(arr)
-    return u[u != 0]
-
-
-def is_sequential(labels):
-    """Whether the unique label values form a contiguous integer run.
-
-    ``True`` for label arrays already in canonical 1..N (or 0..N) form;
-    ``False`` if any value is missing from the run. Empty arrays are
-    treated as sequential.
-    """
-    u = np.unique(np.asarray(labels))
-    if u.size <= 1:
-        return True
-    return bool(np.all(np.diff(u) == 1))
-
-
 def connected_components(mask, conn=2):
     """N-D connected-components labelling. Foreground = ``mask != 0``.
 

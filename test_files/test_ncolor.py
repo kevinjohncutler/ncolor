@@ -7,7 +7,6 @@ from itertools import product
 import skimage.io
 import ncolor
 from ncolor.format import format_labels
-from ncolor.color import is_sequential
 import pytest
 import numpy as np
 import tempfile
@@ -142,16 +141,6 @@ def test_format_labels_variants(mask_kind, clean, ignore, verbose, background, d
     expected_start = 0
     assert (uniq == np.arange(expected_start, expected_start + uniq.size)).all()
 
-@pytest.mark.parametrize("mask_kind", ["example", "empty", "single", "two_disjoint", "memmap", "disjoint_same"])
-def test_is_sequential(mask_kind):
-    """
-    Test the is_sequential function with various inputs.
-    """
-    masks = generate_mask(mask_kind)
-    
-    # Test with a single element array
-    assert is_sequential(np.array([0]))
-    
 def run_tests():
     # Run all tests in this file
     pytest.main([str(Path(__file__).resolve())])

@@ -10,19 +10,21 @@ C++ engine in :mod:`ncolor._backend` is the only backend.
 Public names:
 
 * ``label``                — 4-color graph coloring of a label image
-* ``unique_nonzero``       — unique nonzero labels
 * ``format_labels``        — normalize labels to contiguous 1..N with bg=0
 * ``get_lut``              — return the color lookup table built by ``label``
 * ``expand_labels``        — Voronoi-style label expansion (L1 / L2)
 * ``connected_components`` — N-D connected-components labelling
 * ``regionprops``          — area / bbox / centroid for a labelled image
 * ``delete_spurs``         — N-D skeleton hole-fill + endpoint pruning
+
+The pure-numpy helpers ``unique_nonzero`` and ``is_sequential`` were
+removed in v2 — they aren't called from any ncolor hot path; identical
+implementations now live in ``ocdkit.array.ops``.
 """
 from ._version import __version__  # cheap; no heavy deps
 
 __all__ = [
     "label",
-    "unique_nonzero",
     "format_labels",
     "get_lut",
     "expand_labels",
@@ -34,7 +36,6 @@ __all__ = [
 # Map public attribute -> source module (relative path).
 _LAZY_ATTRS = {
     "label": ".color",
-    "unique_nonzero": ".color",
     "get_lut": ".color",
     "connected_components": ".color",
     "regionprops": ".color",

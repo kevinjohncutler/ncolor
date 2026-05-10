@@ -1,5 +1,5 @@
 """Coverage for ncolor public-API combinatorics: return_n / return_lut /
-return_conflicts flag combos, get_lut, unique_nonzero, and 2D / expand toggles.
+return_conflicts flag combos, get_lut, and 2D / expand toggles.
 
 Companion to tests/test_ncolor_3d.py (3D smoke) and test_files/test_ncolor.py
 (parametrized mask-kind coverage)."""
@@ -8,7 +8,6 @@ import numpy as np
 import pytest
 
 import ncolor
-from ncolor.color import is_sequential
 
 
 def _two_circle_2d():
@@ -28,31 +27,6 @@ def _adjacent_strips():
     arr[1:11, 5:9] = 2
     arr[1:11, 9:13] = 3
     return arr
-
-
-def test_unique_nonzero_basic():
-    arr = np.array([[0, 1, 1], [2, 0, 3]], dtype=np.int32)
-    out = ncolor.unique_nonzero(arr)
-    assert sorted(out.tolist()) == [1, 2, 3]
-
-
-def test_unique_nonzero_all_zero_returns_empty():
-    arr = np.zeros((4, 4), dtype=np.int32)
-    out = ncolor.unique_nonzero(arr)
-    assert out.size == 0
-    assert out.dtype == arr.dtype
-
-
-def test_unique_nonzero_readonly_input():
-    arr = np.array([[0, 1, 2]], dtype=np.int32)
-    arr.setflags(write=False)
-    out = ncolor.unique_nonzero(arr)
-    assert sorted(out.tolist()) == [1, 2]
-
-
-def test_is_sequential_true_and_false():
-    assert is_sequential(np.array([0, 1, 2, 3]))
-    assert not is_sequential(np.array([0, 1, 3, 4]))
 
 
 def test_label_return_n():
