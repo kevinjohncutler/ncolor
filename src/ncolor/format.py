@@ -29,6 +29,9 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
     instead of the default ascending-source order. ~2× slower; only
     needed if downstream code requires that exact ordering.
     """
+    # Default-shape fast path: cpp engine does the dtype cast + renumber
+    # under one GIL release. The generic path below has to do its own
+    # min-shift / sign handling first, so it can't share this short-cut.
     if (not clean and not ignore and background is None and not verbose):
         eng = _get_format_engine()
         arr = np.ascontiguousarray(labels)
@@ -141,6 +144,11 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                     order = np.argsort(-areas_for_j, kind='stable')
                     if comp_indices.size > 1 and verbose:
                         print('Warning - found mask with disjoint label.')
+                    # Largest component keeps source label j; smaller disjoint
+                    # parts get fresh labels (cur_max+1) or are dropped if too
+                    # small. Note the asymmetric threshold: rank==0 uses
+                    # area<=min_area, rank>0 uses area<min_area — matches the
+                    # original skimage+fastremap pipeline at exactly min_area.
                     for rank, k in enumerate(order):
                         ci = int(comp_indices[k])
                         area = int(areas_for_j[k])

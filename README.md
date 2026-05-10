@@ -63,14 +63,11 @@ inputs.
 
 ## Backend
 
-The C++ engine in `ncolor._backend` is the only backend as of v2 —
-built from `cpp/binding.cpp` into a single pybind11 extension
+The C++ engine in `ncolor._backend` is the only backend, built from
+`cpp/binding.cpp` into a single pybind11 extension
 `ncolor._backend._impl`. It owns a persistent thread pool and runs
 `expand` → `find_pairs` → `color` → `apply_lut` end-to-end under one
 `gil_scoped_release`.
-
-The original numba reference implementation was retired; sources are
-preserved in git history for parity-testing if needed.
 
 The C++ engine auto-calibrates its thread count once per machine
 (~50–300 ms hidden under the user's first `import ncolor`) and caches
