@@ -1,16 +1,24 @@
-"""Equivalence tests for ncolor.connected_components and ncolor.regionprops
-vs scikit-image. Confirms the cpp output and skimage output induce the
-same partition and produce identical area / bbox / centroid arrays.
-Auto-skipped when scikit-image is not installed.
+"""Equivalence tests for ncolor.connected_components and ncolor.regionprops.
+
+The parity-vs-skimage cases carry a ``needs_skimage`` mark and
+auto-skip when scikit-image isn't installed. The two pure edge-case
+tests (empty / single component) only exercise the cpp side and run
+on every install.
 """
 from __future__ import annotations
+
+import importlib.util
 
 import numpy as np
 import pytest
 
 import ncolor
 
-skimage_measure = pytest.importorskip("skimage.measure")
+
+needs_skimage = pytest.mark.skipif(
+    importlib.util.find_spec("skimage") is None,
+    reason="parity-vs-skimage comparison needs scikit-image",
+)
 
 
 def _make_2d(size, n, seed):
@@ -37,11 +45,13 @@ def _make_3d(D, n, seed):
     return m
 
 
+@needs_skimage
 @pytest.mark.parametrize("seed", range(3))
 @pytest.mark.parametrize("conn", [1, 2])
 @pytest.mark.parametrize("size,n", [(128, 30), (256, 50), (512, 100)])
 def test_cc_label_equivalence_2d(seed, conn, size, n):
     """cpp cc_label and skimage.measure.label induce the same partition."""
+    from skimage import measure as skimage_measure
     arr = _make_2d(size, n, seed)
     sk = skimage_measure.label(arr > 0, connectivity=conn).astype(np.int32)
     cp, n_components = ncolor.connected_components(arr, conn=conn)
@@ -57,10 +67,12 @@ def test_cc_label_equivalence_2d(seed, conn, size, n):
         )
 
 
+@needs_skimage
 @pytest.mark.parametrize("seed", range(3))
 @pytest.mark.parametrize("conn", [1, 2])
 @pytest.mark.parametrize("D,n", [(32, 15), (64, 30), (96, 60)])
 def test_cc_label_equivalence_3d(seed, conn, D, n):
+    from skimage import measure as skimage_measure
     arr = _make_3d(D, n, seed)
     sk = skimage_measure.label(arr > 0, connectivity=conn).astype(np.int32)
     cp, n_components = ncolor.connected_components(arr, conn=conn)
@@ -72,10 +84,12 @@ def test_cc_label_equivalence_3d(seed, conn, D, n):
         assert len(sk_lbls) == 1
 
 
+@needs_skimage
 @pytest.mark.parametrize("seed", range(3))
 @pytest.mark.parametrize("conn", [1, 2])
 @pytest.mark.parametrize("size,n", [(128, 30), (256, 50)])
 def test_regionprops_equivalence_2d(seed, conn, size, n):
+    from skimage import measure as skimage_measure
     arr = _make_2d(size, n, seed)
     sk_lab = skimage_measure.label(arr > 0, connectivity=conn).astype(np.int32)
     sk_props = skimage_measure.regionprops(sk_lab)
@@ -94,9 +108,11 @@ def test_regionprops_equivalence_2d(seed, conn, size, n):
     np.testing.assert_allclose(cp["centroid"], sk_centroid, atol=1e-9, rtol=0)
 
 
+@needs_skimage
 @pytest.mark.parametrize("seed", range(3))
 @pytest.mark.parametrize("D,n", [(32, 15), (64, 30)])
 def test_regionprops_equivalence_3d(seed, D, n):
+    from skimage import measure as skimage_measure
     arr = _make_3d(D, n, seed)
     sk_lab = skimage_measure.label(arr > 0, connectivity=2).astype(np.int32)
     sk_props = skimage_measure.regionprops(sk_lab)

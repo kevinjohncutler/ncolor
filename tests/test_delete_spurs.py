@@ -1,14 +1,26 @@
-"""Parity tests for delete_spurs against a skimage + scipy reference.
-Auto-skipped on installs without scikit-image or scipy."""
+"""Tests for delete_spurs.
+
+The parity-vs-reference cases use a Python ``_ref_delete_spurs`` built
+on skimage + scipy. Those tests carry the ``needs_skimage_ref`` mark
+and auto-skip when either dep is missing — typical on CI default
+installs. The other tests (modes, parameters, edge cases) only call
+the cpp ``delete_spurs`` and run on every install.
+"""
 from __future__ import annotations
+
+import importlib.util
 
 import numpy as np
 import pytest
 
 from ncolor.format import delete_spurs
 
-skimage_morphology = pytest.importorskip("skimage.morphology")
-scipy_ndimage = pytest.importorskip("scipy.ndimage")
+
+needs_skimage_ref = pytest.mark.skipif(
+    importlib.util.find_spec("skimage") is None
+    or importlib.util.find_spec("scipy") is None,
+    reason="skimage + scipy reference needed for parity comparison",
+)
 
 
 def _ref_delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
@@ -21,10 +33,11 @@ def _ref_delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
     connectivity ('cardinal' or 'total'); default ``threshold`` is
     ``ndim``.
     """
+    from skimage.morphology import remove_small_holes
+    from scipy import ndimage
+
     pad = 1
-    skel = skimage_morphology.remove_small_holes(
-        np.pad(mask, pad, mode="constant"), hole_threshold
-    )
+    skel = remove_small_holes(np.pad(mask, pad, mode="constant"), hole_threshold)
     ndim = skel.ndim
     conn_arg = 1 if mode == "cardinal" else ndim
     thr = ndim if threshold is None else int(threshold)
@@ -32,12 +45,11 @@ def _ref_delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
     while True:
         if max_iter >= 0 and iters >= max_iter:
             break
-        connectivity = scipy_ndimage.generate_binary_structure(ndim, conn_arg)
+        connectivity = ndimage.generate_binary_structure(ndim, conn_arg)
         kernel = connectivity.astype(np.float32)
         kernel[tuple(np.array(kernel.shape) // 2)] = 0
-        nb = scipy_ndimage.convolve(
-            skel.astype(np.float32), kernel, mode="constant", cval=0
-        )
+        nb = ndimage.convolve(skel.astype(np.float32), kernel,
+                              mode="constant", cval=0)
         ep = (skel > 0) & (nb > 0) & (nb < thr)
         if int(ep.sum()) == 0:
             break
@@ -68,6 +80,7 @@ def _make_2d_skeleton(rng, H=64, W=64, n_strokes=8):
     return img
 
 
+@needs_skimage_ref
 @pytest.mark.parametrize("seed", range(8))
 @pytest.mark.parametrize("hole_threshold", [1, 5, 10])
 def test_delete_spurs_matches_reference_2d(seed, hole_threshold):
@@ -87,6 +100,7 @@ def test_delete_spurs_matches_reference_2d(seed, hole_threshold):
     )
 
 
+@needs_skimage_ref
 @pytest.mark.parametrize("seed", range(4))
 def test_delete_spurs_matches_reference_3d(seed):
     rng = np.random.default_rng(seed * 11 + 1)
@@ -110,6 +124,7 @@ def test_delete_spurs_matches_reference_3d(seed):
     assert np.array_equal(ours, ref), f"3D delete_spurs diverged (seed={seed})"
 
 
+@needs_skimage_ref
 @pytest.mark.parametrize("seed", range(3))
 def test_delete_spurs_matches_reference_4d(seed):
     """4D parity vs the skimage+scipy reference."""
@@ -154,6 +169,7 @@ def test_delete_spurs_solid_block():
     assert np.array_equal(out, mask)
 
 
+@needs_skimage_ref
 def test_delete_spurs_hole_threshold_actually_fills():
     """hole_threshold actually selects which interior holes get filled."""
     mask = np.zeros((20, 20), dtype=bool)
@@ -182,6 +198,7 @@ def test_delete_spurs_hole_threshold_actually_fills():
     assert a[5, 5] == True and a[8, 8] == True and a[12, 12] == True
 
 
+@needs_skimage_ref
 def test_delete_spurs_preserves_junction():
     """A cross of two 1-wide bars eats down to the junction pixel."""
     mask = np.zeros((15, 15), dtype=bool)
@@ -292,6 +309,7 @@ def test_delete_spurs_max_iter_caps_loop():
     assert int(out_5step.sum()) == 31
 
 
+@needs_skimage_ref
 def test_delete_spurs_closed_loop_unchanged():
     """A square loop has no endpoints; pruning is a no-op."""
     mask = np.zeros((12, 12), dtype=bool)
