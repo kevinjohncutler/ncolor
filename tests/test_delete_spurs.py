@@ -16,29 +16,52 @@ import pytest
 from ncolor.format import delete_spurs
 
 
-needs_skimage_ref = pytest.mark.skipif(
-    importlib.util.find_spec("skimage") is None
-    or importlib.util.find_spec("scipy") is None,
-    reason="skimage + scipy reference needed for parity comparison",
+needs_scipy_ref = pytest.mark.skipif(
+    importlib.util.find_spec("scipy") is None,
+    reason="scipy reference needed for parity comparison",
 )
+# Kept as the canonical name for back-compat with existing decorators.
+needs_skimage_ref = needs_scipy_ref
 
 
 def _ref_delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
                       threshold=None, max_iter=-1):
-    """skimage + scipy reference for delete_spurs.
+    """scipy-only reference for delete_spurs.
 
-    Mirrors the cpp implementation: hole-fill via remove_small_holes,
-    then iterative pruning where a pixel is a spur when its
-    fg-neighbour count is in [1, threshold). ``mode`` selects the
-    connectivity ('cardinal' or 'total'); default ``threshold`` is
-    ``ndim``.
+    Mirrors the cpp implementation step-for-step:
+
+      1. Pad by 1 with constant 0.
+      2. Hole fill: bg components (face-connected) with pixel count
+         ≤ ``hole_threshold`` get flipped to foreground. Matches the
+         cpp ``areas[c] <= fill_thresh`` rule directly.
+      3. Iterative spur pruning: a pixel whose fg-neighbour count
+         under the chosen connectivity is in ``[1, threshold)`` is
+         removed each pass; repeat until convergence or ``max_iter``.
+
+    We deliberately avoid ``skimage.morphology.remove_small_holes``
+    because its area-threshold semantics flipped from ``< N`` to
+    ``<= N`` at skimage 0.26 — and 0.26 dropped Py 3.10 support, so
+    pinning it would force-cap our CI matrix. Re-implementing the
+    fill in scipy alone keeps the reference deterministic on every
+    supported Python version.
     """
-    from skimage.morphology import remove_small_holes
     from scipy import ndimage
 
     pad = 1
-    skel = remove_small_holes(np.pad(mask, pad, mode="constant"), hole_threshold)
+    skel = np.pad(mask, pad, mode="constant").astype(bool)
     ndim = skel.ndim
+
+    if hole_threshold > 0:
+        # Face-connected CCL on the inverted mask; fill any bg component
+        # whose pixel count is ≤ hole_threshold.
+        face_struct = ndimage.generate_binary_structure(ndim, 1)
+        bg_labels, _ = ndimage.label(~skel, structure=face_struct)
+        areas = np.bincount(bg_labels.ravel())
+        fillable = np.where(areas <= hole_threshold)[0]
+        fillable = fillable[fillable > 0]  # ignore the "not a bg component" bucket
+        if fillable.size:
+            skel = skel | np.isin(bg_labels, fillable)
+
     conn_arg = 1 if mode == "cardinal" else ndim
     thr = ndim if threshold is None else int(threshold)
     iters = 0

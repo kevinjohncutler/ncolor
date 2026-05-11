@@ -33,11 +33,10 @@ jobs:
           python -m pip install --upgrade build pytest pytest-cov
           # scipy + scikit-image + fastremap are dev-only deps used by
           # the parity tests (the cpp output is checked against a
-          # skimage+scipy reference). The shipped wheel doesn't need any
-          # of them at runtime. scikit-image >= 0.26 is the cut-off
-          # where remove_small_holes(area_threshold=N) semantics
-          # flipped from "< N" to "<= N"; our cpp matches the new rule.
-          python -m pip install scipy "scikit-image>=0.26" fastremap
+          # scipy reference). The shipped wheel doesn't need any of
+          # them at runtime. skimage is here for test_files/test_ncolor.py
+          # which loads its fixture via skimage.io.
+          python -m pip install scipy scikit-image fastremap
           python -m pip install -e .
 
       - name: Run tests

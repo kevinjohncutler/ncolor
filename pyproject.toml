@@ -32,11 +32,7 @@ environment = { NCOLOR_NO_CALIBRATE = "1", NCOLOR_MARCH_NATIVE = "0" }
 # scipy / scikit-image / fastremap are pulled in so the parity-vs-
 # skimage tests actually run on every wheel build (they auto-skip
 # without these deps via the ``needs_skimage_ref`` markers).
-# scikit-image >= 0.26 is the version where remove_small_holes()'s
-# area_threshold semantics flipped from "< N" to "<= N". Our cpp
-# implementation matches the new semantics, so the parity reference
-# must too — older skimage diverges on the boundary case.
-test-requires = ["pytest", "scipy", "scikit-image>=0.26", "fastremap"]
+test-requires = ["pytest", "scipy", "scikit-image", "fastremap"]
 test-command = "pytest -q {project}/tests"
 
 [tool.cibuildwheel.macos]
