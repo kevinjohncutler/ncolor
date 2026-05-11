@@ -7,6 +7,7 @@ extension load on first attribute access.
 Public names:
 
 * ``label``                — 4-color graph coloring of a label image
+* ``connect``              — adjacency pairs in a label image
 * ``format_labels``        — normalize labels to contiguous 1..N with bg=0
 * ``get_lut``              — return the color lookup table built by ``label``
 * ``expand_labels``        — Voronoi-style label expansion (L1 / L2)
@@ -18,6 +19,7 @@ from ._version import __version__
 
 __all__ = [
     "label",
+    "connect",
     "format_labels",
     "get_lut",
     "expand_labels",
@@ -28,6 +30,7 @@ __all__ = [
 
 _LAZY_ATTRS = {
     "label": ".color",
+    "connect": ".color",
     "get_lut": ".color",
     "connected_components": ".color",
     "regionprops": ".color",

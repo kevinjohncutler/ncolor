@@ -18,6 +18,18 @@ def _two_circle_2d():
     return arr
 
 
+def test_connect_returns_adjacency_pairs():
+    """ncolor.connect is part of the public top-level API. Returns the
+    unique (lo, hi) label-adjacency pairs as an (M, 2) int array."""
+    arr = np.array([[0, 1, 1, 2],
+                    [0, 1, 2, 2],
+                    [3, 3, 0, 0]], dtype=np.int32)
+    pairs = ncolor.connect(arr, conn=2)
+    # Expect: (1,2), (1,3), (2,3) all touching under 8-conn.
+    pair_set = {tuple(p) for p in pairs.tolist()}
+    assert pair_set == {(1, 2), (1, 3), (2, 3)}
+
+
 def _adjacent_strips():
     """Touching strips with a zero border → forces non-trivial coloring (≥2 colors)
     while preserving label 1 (format_labels shifts min(label) to 0, so we need

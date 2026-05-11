@@ -1009,8 +1009,41 @@ PYBIND11_MODULE(_impl, m) {
     m.def("delete_spurs",
           [](py::array mask, int hole_threshold, int conn_kind,
              int threshold, int max_iter) {
-              return ncolor_cpp::delete_spurs_nd(
-                  mask, hole_threshold, conn_kind, threshold, max_iter);
+              if (!(mask.flags() & py::array::c_style)) {
+                  mask = py::array::ensure(mask, py::array::c_style);
+              }
+              const auto buf = mask.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              if (ndim < 2) throw std::invalid_argument(
+                  "delete_spurs requires an array of ndim >= 2");
+
+              std::vector<int64_t> shape(ndim);
+              std::vector<py::ssize_t> out_shape(ndim);
+              for (int d = 0; d < ndim; ++d) {
+                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
+                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+              }
+              py::array_t<bool> out(out_shape);
+              bool* out_ptr = static_cast<bool*>(out.request().ptr);
+              const void* src_ptr = buf.ptr;
+
+              // numpy ``bool`` has format '?' and itemsize 1 — share the
+              // uint8 codepath since the memory layout is identical.
+              std::string fmt = buf.format;
+              if (fmt == "?") fmt = "B";
+
+              {
+                  py::gil_scoped_release release;
+                  dispatch_int_dtype(fmt, buf.itemsize, "delete_spurs",
+                      [&](auto* tag) {
+                          using T = std::remove_pointer_t<decltype(tag)>;
+                          ncolor_cpp::delete_spurs_nd<T>(
+                              static_cast<const T*>(src_ptr),
+                              out_ptr, shape, hole_threshold,
+                              conn_kind, threshold, max_iter);
+                      });
+              }
+              return out;
           },
           py::arg("mask"), py::arg("hole_threshold") = 5,
           py::arg("conn_kind") = 1, py::arg("threshold") = -1,

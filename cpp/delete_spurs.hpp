@@ -1,8 +1,28 @@
-// N-D skeleton cleanup: pad-by-1, fill bg holes ≤ hole_threshold via
-// face-connected CCL, then iteratively strip pixels with exactly one
-// foreground neighbour until convergence. The endpoint check uses
-// full-diagonal connectivity (3^ndim - 1 neighbours); face / edge /
-// vertex contacts all count as a single connection.
+// N-D skeleton / boundary cleanup, pure C++ — no pybind dependency.
+//
+// Two steps over a row-major N-D label / mask buffer:
+//
+//   1. Pad-by-1, fill bg components with pixel count ≤ hole_threshold
+//      via face-connected CCL.
+//   2. Iteratively prune pixels whose fg-neighbour count is in
+//      [1, threshold). The connectivity used for the neighbour count is
+//      controlled by ``conn_kind``: 1 → cardinal (face only, 2·ndim
+//      neighbours), ndim → full diagonal (3^ndim − 1 neighbours).
+//      Isolated pixels (count == 0) are always preserved.
+//
+// Templated on input dtype T: any pixel where ``input[i] != T{0}`` is
+// foreground. The output is a separate ``bool`` buffer of the same
+// shape. Callers own both the input and output allocations; raw
+// row-major contiguous element layout is assumed.
+//
+// C++ usage:
+//
+//   #include "delete_spurs.hpp"
+//   std::vector<uint8_t> mask(W * H);   // row-major
+//   std::vector<bool>    out(W * H);
+//   ncolor_cpp::delete_spurs_nd<uint8_t>(
+//       mask.data(), out.data(), {H, W},
+//       /*hole_threshold=*/5, /*conn_kind=*/1, /*threshold=*/-1, /*max_iter=*/-1);
 #pragma once
 
 #include <cstdint>
@@ -10,14 +30,10 @@
 #include <stdexcept>
 #include <vector>
 
-#include <pybind11/numpy.h>
-#include <pybind11/pybind11.h>
-
 #include "cc_label.hpp"
 
-namespace py = pybind11;
-
 namespace ncolor_cpp {
+
 namespace delete_spurs_detail {
 
 // Strided offsets to N-D neighbours under the given connectivity.
@@ -54,52 +70,46 @@ make_neighbour_offsets(const std::vector<int64_t>& strides, int ndim, int kind) 
     return offsets;
 }
 
-// Dtype-agnostic nonzero test via the numpy buffer protocol's
-// itemsize. Accepts bool / uint8 / int32 / etc. without templating.
-inline bool nonzero_at(const char* base, py::ssize_t byte_off, py::ssize_t itemsize) {
-    const char* p = base + byte_off;
-    for (py::ssize_t b = 0; b < itemsize; ++b) {
-        if (p[b] != 0) return true;
-    }
-    return false;
-}
-
 }  // namespace delete_spurs_detail
 
 
-// Returns a fresh boolean array of the input shape. Components with
-// pixel count ≤ ``hole_threshold`` are filled (face-connected).
+// ``input``  — row-major N-D buffer of any integer dtype; non-zero = fg.
+// ``output`` — row-major N-D bool buffer of the same shape; caller-owned.
+// ``shape``  — extent of each axis.
 //
-// ``conn_kind`` selects the connectivity structure used for the
-// endpoint check: 1 → cardinal (face only, 2·ndim neighbours),
-// ndim → full diagonal (3^ndim - 1 neighbours), intermediate values
-// in between (face+edge for kind=2 in 3D, etc.). A pixel is treated
-// as a spur when its fg-neighbour count under that structure is
-// strictly less than ``threshold`` (but greater than 0 — isolated
-// pixels are always preserved). ``max_iter`` caps the iterative
-// pruning loop (-1 means run to convergence).
-inline py::array_t<bool>
-delete_spurs_nd(py::array mask, int hole_threshold,
-                int conn_kind, int threshold, int max_iter) {
-    py::buffer_info info = mask.request();
-    const int ndim = info.ndim;
+// ``conn_kind`` 1 = cardinal (omnipose-style external-spur rule, more
+//               aggressive, fewer iterations to converge); ndim = full
+//               diagonal (preserves 1-voxel-wide skeleton interiors).
+// ``threshold`` — a pixel is pruned when its fg-neighbour count is in
+//                 [1, threshold). Use -1 to default to ndim.
+// ``max_iter``  — caps the pruning loop. -1 runs to convergence.
+template <typename T>
+inline void delete_spurs_nd(const T* input, bool* output,
+                            const std::vector<int64_t>& shape,
+                            int hole_threshold, int conn_kind,
+                            int threshold, int max_iter) {
+    const int ndim = static_cast<int>(shape.size());
     if (ndim < 2) {
-        throw std::invalid_argument("delete_spurs requires an array of ndim >= 2");
+        throw std::invalid_argument("delete_spurs_nd requires shape.size() >= 2");
     }
     if (conn_kind < 1) conn_kind = 1;
     if (conn_kind > ndim) conn_kind = ndim;
-    if (threshold < 1) threshold = ndim;  // default: a pixel is a spur if it
-                                          // has fewer than ndim connections
+    if (threshold < 1) threshold = ndim;
 
-    // Padded geometry: each axis grows by 2 (one cell on each side).
+    // Row-major input strides (in element units).
+    std::vector<int64_t> in_strides(ndim);
+    in_strides[ndim - 1] = 1;
+    for (int d = ndim - 2; d >= 0; --d) {
+        in_strides[d] = in_strides[d + 1] * shape[d + 1];
+    }
+
+    // Padded geometry: each axis grows by 2.
     std::vector<int64_t> padded_shape(ndim);
     int64_t padded_total = 1;
     for (int d = 0; d < ndim; ++d) {
-        padded_shape[d] = info.shape[d] + 2;
+        padded_shape[d] = shape[d] + 2;
         padded_total *= padded_shape[d];
     }
-    // Row-major strides over the padded buffer (in element units, since
-    // the padded buffer is uint8 with itemsize=1).
     std::vector<int64_t> pstrides(ndim);
     pstrides[ndim - 1] = 1;
     for (int d = ndim - 2; d >= 0; --d) {
@@ -108,27 +118,24 @@ delete_spurs_nd(py::array mask, int hole_threshold,
 
     std::vector<uint8_t> skel(static_cast<size_t>(padded_total), 0u);
 
-    // Copy ``mask`` into the interior of skel (offset by +1 in each
-    // axis). N-D walk via an odometer; works for any input dtype since
-    // we only test "nonzero".
+    // Copy input into the interior of skel (offset by +1 in each axis).
+    // N-D walk via an odometer; "fg" is just ``input[i] != T{0}``.
     {
-        const char* base = static_cast<const char*>(info.ptr);
-        const py::ssize_t itemsize = info.itemsize;
         std::vector<int64_t> idx(ndim, 0);
         while (true) {
-            py::ssize_t input_byte_off = 0;
+            int64_t in_off = 0;
             int64_t skel_off = 0;
             for (int d = 0; d < ndim; ++d) {
-                input_byte_off += static_cast<py::ssize_t>(idx[d]) * info.strides[d];
+                in_off   += idx[d] * in_strides[d];
                 skel_off += (idx[d] + 1) * pstrides[d];
             }
-            if (delete_spurs_detail::nonzero_at(base, input_byte_off, itemsize)) {
+            if (input[in_off] != T{0}) {
                 skel[static_cast<size_t>(skel_off)] = 1u;
             }
             int d = ndim - 1;
             while (d >= 0) {
                 ++idx[d];
-                if (idx[d] < info.shape[d]) break;
+                if (idx[d] < shape[d]) break;
                 idx[d] = 0;
                 --d;
             }
@@ -139,8 +146,8 @@ delete_spurs_nd(py::array mask, int hole_threshold,
     // Step 1: remove_small_holes (face-connected bg components ≤ threshold).
     // The pad-by-1 step above is what makes this safe: the outer
     // background wraps the entire image, so it always shows up as one
-    // huge component that's well over any sane hole_threshold. Only
-    // truly interior holes can fall below the threshold and get filled.
+    // huge component well over any sane hole_threshold. Only truly
+    // interior holes can fall below the threshold and get filled.
     if (hole_threshold > 0) {
         std::vector<uint8_t> inv(static_cast<size_t>(padded_total));
         for (int64_t i = 0; i < padded_total; ++i) inv[i] = skel[i] ? 0u : 1u;
@@ -168,13 +175,6 @@ delete_spurs_nd(py::array mask, int hole_threshold,
     // instead of O(iterations · image_pixels). Endpoints are collected
     // before any are removed so the parallel-removal semantics of the
     // naive algorithm are preserved.
-    //
-    // ``conn_kind`` picks the connectivity structure: 1 = cardinal
-    // (omnipose-style external-spur rule, more aggressive, fewer
-    // iterations to converge); ndim = full diagonal (preserves
-    // skeleton interiors). A pixel is pruned when its fg-neighbour
-    // count is strictly below ``threshold`` (but > 0, so isolated
-    // pixels survive).
     {
         const std::vector<int64_t> offsets =
             delete_spurs_detail::make_neighbour_offsets(pstrides, ndim, conn_kind);
@@ -194,7 +194,6 @@ delete_spurs_nd(py::array mask, int hole_threshold,
         while (!candidates.empty()) {
             if (max_iter >= 0 && iter_count >= max_iter) break;
             ep.clear();
-            // Mark endpoints among the candidate set.
             for (int64_t i : candidates) {
                 if (!skel[i]) continue;  // already removed this round
                 int count = 0;
@@ -223,28 +222,24 @@ delete_spurs_nd(py::array mask, int hole_threshold,
         }
     }
 
-    // Unpad: copy interior of skel back to a fresh bool array of the
-    // original shape (row-major contiguous).
-    py::array_t<bool> result(info.shape);
-    bool* out = static_cast<bool*>(result.mutable_data());
+    // Unpad: copy interior of skel back to ``output``.
     {
         std::vector<int64_t> idx(ndim, 0);
-        py::ssize_t out_pos = 0;
+        int64_t out_pos = 0;
         while (true) {
             int64_t skel_off = 0;
             for (int d = 0; d < ndim; ++d) skel_off += (idx[d] + 1) * pstrides[d];
-            out[out_pos++] = skel[static_cast<size_t>(skel_off)] != 0u;
+            output[out_pos++] = skel[static_cast<size_t>(skel_off)] != 0u;
             int d = ndim - 1;
             while (d >= 0) {
                 ++idx[d];
-                if (idx[d] < info.shape[d]) break;
+                if (idx[d] < shape[d]) break;
                 idx[d] = 0;
                 --d;
             }
             if (d < 0) break;
         }
     }
-    return result;
 }
 
 }  // namespace ncolor_cpp
