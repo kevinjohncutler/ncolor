@@ -188,13 +188,40 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
     return out.astype(np.uint32, copy=False)
 
 
-def delete_spurs(mask, hole_threshold=5):
-    """N-D skeleton cleanup: fill bg holes ≤ ``hole_threshold`` pixels
-    (face-connected), then iteratively strip endpoints until no pixel
-    has exactly one foreground neighbour. Endpoint connectivity is
-    full-diagonal in every dimension — face, edge, and vertex contacts
-    all count as a single connection.
+def delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
+                 threshold=None, max_iter=-1):
+    """N-D mask cleanup: fill small bg holes, then iteratively prune
+    pixels whose neighbour count falls below ``threshold``.
+
+    ``hole_threshold`` (default 5): bg components with pixel count ≤
+    this value get filled into the foreground before pruning. Pass 0
+    to skip hole filling entirely.
+
+    ``mode`` selects the connectivity used by the endpoint check:
+
+    * ``"cardinal"`` (default) — face neighbours only (2·ndim of them).
+      Catches pixels sticking out of a flat boundary; matches the
+      omnipose external-spur rule. Aggressive; fewer iterations to
+      converge.
+    * ``"total"`` — full-diagonal (3^ndim − 1 neighbours). Preserves
+      1-voxel-wide skeletons in 3D (their interiors have face=2 but
+      total=2, both equal to ndim=3 minus 1 — under ``threshold=ndim``
+      they survive cardinal but fall below total). Use this when the
+      input may contain genuine thin features you want to keep.
+
+    ``threshold`` (default ``None`` → ``ndim``): a pixel is a spur if
+    its fg-neighbour count is in ``[1, threshold)``. Isolated pixels
+    (count == 0) are always preserved.
+
+    ``max_iter`` (default ``-1``): caps the iterative pruning loop.
+    ``-1`` runs to convergence; positive values cap the depth (e.g.
+    ``max_iter=1`` gives a single peel pass).
     """
+    if mode not in ("cardinal", "total"):
+        raise ValueError(f"mode must be 'cardinal' or 'total', got {mode!r}")
     from ._backend import _impl as _b
     arr = np.ascontiguousarray(mask).astype(np.uint8, copy=False)
-    return _b.delete_spurs(arr, int(hole_threshold))
+    conn_kind = 1 if mode == "cardinal" else arr.ndim
+    thr = int(threshold) if threshold is not None else -1  # cpp picks ndim
+    return _b.delete_spurs(arr, int(hole_threshold), int(conn_kind),
+                           thr, int(max_iter))

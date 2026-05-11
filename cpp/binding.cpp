@@ -1007,13 +1007,20 @@ PYBIND11_MODULE(_impl, m) {
           "the input value of the (i+1)-th component.");
 
     m.def("delete_spurs",
-          [](py::array mask, int hole_threshold) {
-              return ncolor_cpp::delete_spurs_nd(mask, hole_threshold);
+          [](py::array mask, int hole_threshold, int conn_kind,
+             int threshold, int max_iter) {
+              return ncolor_cpp::delete_spurs_nd(
+                  mask, hole_threshold, conn_kind, threshold, max_iter);
           },
           py::arg("mask"), py::arg("hole_threshold") = 5,
-          "N-D skeleton cleanup: fill bg holes ≤ hole_threshold pixels\n"
-          "(face-connected), then iteratively strip endpoints (fg pixels\n"
-          "with exactly one fg neighbour) until convergence. Endpoint\n"
-          "connectivity is full-diagonal in every dim — face, edge, and\n"
-          "vertex contacts all count as a single connection.");
+          py::arg("conn_kind") = 1, py::arg("threshold") = -1,
+          py::arg("max_iter") = -1,
+          "N-D skeleton/boundary cleanup: fill bg holes ≤ hole_threshold\n"
+          "pixels (face-connected), then iteratively strip pixels whose\n"
+          "fg-neighbour count under the chosen connectivity is below\n"
+          "``threshold`` (default ndim). ``conn_kind`` = 1 → cardinal\n"
+          "(face only, omnipose-style external-spur rule, fewer iters);\n"
+          "ndim → full diagonal (preserves 1-voxel skeletons). Isolated\n"
+          "pixels (count == 0) are always preserved. ``max_iter`` < 0\n"
+          "runs to convergence.");
 }

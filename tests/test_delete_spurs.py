@@ -11,30 +11,38 @@ skimage_morphology = pytest.importorskip("skimage.morphology")
 scipy_ndimage = pytest.importorskip("scipy.ndimage")
 
 
-def _ref_delete_spurs(mask, hole_threshold=5):
+def _ref_delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
+                      threshold=None, max_iter=-1):
     """skimage + scipy reference for delete_spurs.
 
-    Endpoint connectivity is full-diagonal in every dim (3^ndim - 1
-    neighbours), matching the cpp implementation. A pixel is an
-    endpoint iff exactly one of its neighbours — face, edge, or
-    vertex — is fg.
+    Mirrors the cpp implementation: hole-fill via remove_small_holes,
+    then iterative pruning where a pixel is a spur when its
+    fg-neighbour count is in [1, threshold). ``mode`` selects the
+    connectivity ('cardinal' or 'total'); default ``threshold`` is
+    ``ndim``.
     """
     pad = 1
     skel = skimage_morphology.remove_small_holes(
         np.pad(mask, pad, mode="constant"), hole_threshold
     )
+    ndim = skel.ndim
+    conn_arg = 1 if mode == "cardinal" else ndim
+    thr = ndim if threshold is None else int(threshold)
+    iters = 0
     while True:
-        ndim = skel.ndim
-        connectivity = scipy_ndimage.generate_binary_structure(ndim, ndim)
+        if max_iter >= 0 and iters >= max_iter:
+            break
+        connectivity = scipy_ndimage.generate_binary_structure(ndim, conn_arg)
         kernel = connectivity.astype(np.float32)
         kernel[tuple(np.array(kernel.shape) // 2)] = 0
         nb = scipy_ndimage.convolve(
             skel.astype(np.float32), kernel, mode="constant", cval=0
         )
-        ep = (skel > 0) & (nb == 1)
+        ep = (skel > 0) & (nb > 0) & (nb < thr)
         if int(ep.sum()) == 0:
             break
         skel = skel & ~ep
+        iters += 1
     unpad = tuple([slice(pad, -pad)] * skel.ndim)
     return skel[unpad]
 
@@ -190,29 +198,98 @@ def test_delete_spurs_preserves_junction():
     assert out_fg == int(b.sum())
 
 
-def test_delete_spurs_removes_diagonal_spurs_3d():
-    """Single-voxel spurs touching a 3D ball at a face / edge / vertex
-    should ALL get pruned. The previous face-only connectivity rule
-    left edge- and vertex-touching spurs alone — this test guards
-    against regressing to that behaviour."""
+def test_delete_spurs_total_mode_removes_diagonal_spurs_3d():
+    """Under ``mode='total'``, single-voxel spurs touching a 3D ball at
+    a face / edge / vertex are all pruned (each has total=1 fg
+    neighbour). Locks in the full-diagonal rule's symmetric treatment
+    of contact types."""
     grids = np.indices((16, 16, 16))
     cz, cy, cx = 8, 8, 8
     base = ((grids[0] - cz) ** 2 + (grids[1] - cy) ** 2 + (grids[2] - cx) ** 2) <= 16
 
-    # A surface voxel of the ball; pick one and place spurs around it.
-    surface_zyx = (8, 8, 12)  # face-east tip of the ball
     spurs = {
         "face":   (8, 8, 13),    # +1 along one axis
         "edge":   (8, 9, 13),    # +1 along two axes
         "vertex": (9, 9, 13),    # +1 along three axes
     }
-    assert base[surface_zyx], "surface voxel must be on the ball"
     for kind, p in spurs.items():
         assert not base[p], f"{kind} spur must start outside the ball"
         m = base.copy()
         m[p] = True
-        out = delete_spurs(m, hole_threshold=0)
-        assert not out[p], f"{kind}-touching spur was not pruned"
+        out = delete_spurs(m, hole_threshold=0, mode="total")
+        assert not out[p], f"{kind}-touching spur was not pruned under total mode"
+
+
+def test_delete_spurs_cardinal_mode_keeps_diagonal_only_spurs():
+    """Cardinal mode keys on face neighbours, so a voxel attached only
+    via a diagonal contact has cardinal count == 0 — treated as
+    isolated and preserved. (Use ``mode='total'`` if you want diagonal
+    contacts to count as connections.)"""
+    grids = np.indices((16, 16, 16))
+    cz, cy, cx = 8, 8, 8
+    base = ((grids[0] - cz) ** 2 + (grids[1] - cy) ** 2 + (grids[2] - cx) ** 2) <= 16
+
+    # Vertex-attached spur: only touches the ball via a vertex (3-axis
+    # diagonal). face count = 0.
+    p = (9, 9, 13)
+    assert not base[p]
+    m = base.copy()
+    m[p] = True
+    out = delete_spurs(m, hole_threshold=0, mode="cardinal")
+    assert out[p], "cardinal mode should preserve diagonal-only attachments"
+    # And a face-attached spur on the same ball IS pruned, even in cardinal mode.
+    p_face = (8, 8, 13)
+    m2 = base.copy()
+    m2[p_face] = True
+    out2 = delete_spurs(m2, hole_threshold=0, mode="cardinal")
+    assert not out2[p_face], "cardinal mode should prune face-attached spurs"
+
+
+def test_delete_spurs_cardinal_catches_flat_row_protrusion():
+    """The motivating case for cardinal mode: a single pixel sticking up
+    out of a flat row has face=1 + 2 diagonals (total=3). Under total
+    mode it has 3 neighbours, not an endpoint. Under cardinal mode its
+    face count is 1 < ndim=2, so it gets pruned along with the row's
+    own endpoints."""
+    H, W = 7, 21
+    m = np.zeros((H, W), dtype=bool)
+    m[4, 2:19] = True       # flat row
+    sticky = (3, 10)
+    m[sticky] = True
+    out_total = delete_spurs(m, hole_threshold=0, mode="total")
+    out_card  = delete_spurs(m, hole_threshold=0, mode="cardinal")
+    assert out_total[sticky], "total mode preserves the sticky pixel"
+    assert not out_card[sticky], "cardinal mode prunes the sticky pixel"
+
+
+def test_delete_spurs_threshold_controls_aggressiveness():
+    """Raising ``threshold`` peels more iterations / more pixels.
+    Lowering it (≤1) effectively disables endpoint pruning."""
+    rng = np.random.default_rng(0)
+    mask = _make_2d_skeleton(rng)
+    out_default = delete_spurs(mask, hole_threshold=0)
+    out_high    = delete_spurs(mask, hole_threshold=0, threshold=4)
+    out_off     = delete_spurs(mask, hole_threshold=0, threshold=1)
+    assert int(out_high.sum()) <= int(out_default.sum())
+    # threshold=1 means "spur iff count in [1, 1)" — empty set, no pruning.
+    assert int(out_off.sum()) == int(mask.sum())
+
+
+def test_delete_spurs_max_iter_caps_loop():
+    """``max_iter=N`` runs at most N pruning passes. A long 2D row
+    needs many iterations to fully peel — capping should leave the
+    middle of the row intact."""
+    m = np.zeros((5, 41), dtype=bool)
+    m[2, 0:41] = True   # row of 41 pixels, both ends are endpoints
+    out_unbounded = delete_spurs(m, hole_threshold=0, mode="cardinal", max_iter=-1)
+    out_1step     = delete_spurs(m, hole_threshold=0, mode="cardinal", max_iter=1)
+    out_5step     = delete_spurs(m, hole_threshold=0, mode="cardinal", max_iter=5)
+    # Unbounded peels until only the (now-isolated) middle pixel remains.
+    assert int(out_unbounded.sum()) == 1
+    # One step peels both endpoints → row of 39.
+    assert int(out_1step.sum()) == 39
+    # Five steps peel 5 from each end → row of 31.
+    assert int(out_5step.sum()) == 31
 
 
 def test_delete_spurs_closed_loop_unchanged():

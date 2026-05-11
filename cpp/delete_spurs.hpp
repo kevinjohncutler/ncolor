@@ -69,13 +69,27 @@ inline bool nonzero_at(const char* base, py::ssize_t byte_off, py::ssize_t items
 
 // Returns a fresh boolean array of the input shape. Components with
 // pixel count ≤ ``hole_threshold`` are filled (face-connected).
+//
+// ``conn_kind`` selects the connectivity structure used for the
+// endpoint check: 1 → cardinal (face only, 2·ndim neighbours),
+// ndim → full diagonal (3^ndim - 1 neighbours), intermediate values
+// in between (face+edge for kind=2 in 3D, etc.). A pixel is treated
+// as a spur when its fg-neighbour count under that structure is
+// strictly less than ``threshold`` (but greater than 0 — isolated
+// pixels are always preserved). ``max_iter`` caps the iterative
+// pruning loop (-1 means run to convergence).
 inline py::array_t<bool>
-delete_spurs_nd(py::array mask, int hole_threshold) {
+delete_spurs_nd(py::array mask, int hole_threshold,
+                int conn_kind, int threshold, int max_iter) {
     py::buffer_info info = mask.request();
     const int ndim = info.ndim;
     if (ndim < 2) {
         throw std::invalid_argument("delete_spurs requires an array of ndim >= 2");
     }
+    if (conn_kind < 1) conn_kind = 1;
+    if (conn_kind > ndim) conn_kind = ndim;
+    if (threshold < 1) threshold = ndim;  // default: a pixel is a spur if it
+                                          // has fewer than ndim connections
 
     // Padded geometry: each axis grows by 2 (one cell on each side).
     std::vector<int64_t> padded_shape(ndim);
@@ -139,10 +153,10 @@ delete_spurs_nd(py::array mask, int hole_threshold) {
                 const int32_t c = bg_lbl[i];
                 if (c > 0) ++areas[c];
             }
-            const int64_t threshold = static_cast<int64_t>(hole_threshold);
+            const int64_t fill_thresh = static_cast<int64_t>(hole_threshold);
             for (int64_t i = 0; i < padded_total; ++i) {
                 const int32_t c = bg_lbl[i];
-                if (c > 0 && areas[c] <= threshold) skel[i] = 1u;
+                if (c > 0 && areas[c] <= fill_thresh) skel[i] = 1u;
             }
         }
     }
@@ -154,15 +168,16 @@ delete_spurs_nd(py::array mask, int hole_threshold) {
     // instead of O(iterations · image_pixels). Endpoints are collected
     // before any are removed so the parallel-removal semantics of the
     // naive algorithm are preserved.
+    //
+    // ``conn_kind`` picks the connectivity structure: 1 = cardinal
+    // (omnipose-style external-spur rule, more aggressive, fewer
+    // iterations to converge); ndim = full diagonal (preserves
+    // skeleton interiors). A pixel is pruned when its fg-neighbour
+    // count is strictly below ``threshold`` (but > 0, so isolated
+    // pixels survive).
     {
-        // Full-diagonal connectivity in every dim (2D: 8-conn; 3D: 26-conn;
-        // ND: 3^ndim - 1 neighbours). A pixel is an endpoint iff it has
-        // exactly one fg neighbour under "any contact" — face, edge, or
-        // vertex — so a single-pixel spur attached at any kind of corner
-        // peels off the same way regardless of how it touches the body.
-        const int neigh_kind = ndim;
         const std::vector<int64_t> offsets =
-            delete_spurs_detail::make_neighbour_offsets(pstrides, ndim, neigh_kind);
+            delete_spurs_detail::make_neighbour_offsets(pstrides, ndim, conn_kind);
         const int n_nbs = static_cast<int>(offsets.size());
 
         std::vector<int64_t> candidates;
@@ -175,7 +190,9 @@ delete_spurs_nd(py::array mask, int hole_threshold) {
             if (skel[i]) candidates.push_back(i);
         }
 
+        int iter_count = 0;
         while (!candidates.empty()) {
+            if (max_iter >= 0 && iter_count >= max_iter) break;
             ep.clear();
             // Mark endpoints among the candidate set.
             for (int64_t i : candidates) {
@@ -184,9 +201,10 @@ delete_spurs_nd(py::array mask, int hole_threshold) {
                 for (int k = 0; k < n_nbs; ++k) {
                     if (skel[static_cast<size_t>(i + offsets[k])]) ++count;
                 }
-                if (count == 1) ep.push_back(i);
+                if (count > 0 && count < threshold) ep.push_back(i);
             }
             if (ep.empty()) break;
+            ++iter_count;
 
             // Bulk subtract so the read pass above saw a consistent skel.
             for (int64_t i : ep) skel[i] = 0u;
