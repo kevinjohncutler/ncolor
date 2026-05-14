@@ -106,12 +106,26 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
       "two_hop"        Simulated annealing minimising same-colour
                        2-hop pairs (cells at graph-distance 2). All
                        moves are Kempe swaps, so the result is always
-                       a valid 4-colouring. On regular structures this
-                       reaches the all-4-colours-used configuration
-                       wherever the graph admits it; on irregular
-                       inputs it improves uniformity without affecting
-                       validity. Runtime ≈ tens of ms for ~100-cell
-                       graphs; pure Python, slows on very large graphs.
+                       a valid 4-colouring. Runtime ≈ tens of ms to a
+                       few seconds for hundreds of cells; pure Python,
+                       slows on very large graphs.
+
+    ⚠ When to use ``optimize="two_hop"``: irregular inputs (real cell
+    segmentations, blob fields). It improves "all 4 colours used
+    uniformly" without hurting validity.
+
+    ⚠ When NOT to use it: regular tilings (square grids, hex grids).
+    The 2-hop objective penalises the tight 2-period tile that those
+    inputs naturally produce — same colour repeats every 2 cells along
+    each row, which IS the visually uniform tiling but registers as
+    many 2-hop violations. ``optimize="two_hop"`` will trade that for
+    a 4-cycle-per-row that uses all 4 colours but breaks the 2-period
+    pattern. Stick with the default greedy for those inputs.
+
+    Symmetric synthetic inputs (e.g. radial spokes) are an in-between
+    case: the rasterisation breaks the geometric symmetry, so neither
+    mode produces fully symmetric output. ``optimize="two_hop"`` at
+    least guarantees all 4 colours appear wherever the graph allows.
     """
     del verbose  # accepted for back-compat; cpp pipeline doesn't trace stages
 
