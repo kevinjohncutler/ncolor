@@ -41,6 +41,36 @@ inline void build_csr_from_pairs(
     }
 }
 
+// Weighted variant: also produces a parallel weights[] array of length 2*M
+// (symmetric: weight(s, d) = weight(d, s) = w[i]). Used by the
+// boundary-weighted coloring path; the un-weighted variant above stays
+// bit-identical for the default path. Weights are real-valued to encode
+// EDT-distance-based contact strength.
+inline void build_csr_from_pairs_weighted(
+        const int32_t* src, const int32_t* dst, const double* w,
+        int32_t N, int32_t M,
+        std::vector<int32_t>& indptr, std::vector<int32_t>& indices,
+        std::vector<double>& weights) {
+    indptr.assign(static_cast<size_t>(N) + 1, 0);
+    std::vector<int32_t> degree(static_cast<size_t>(N), 0);
+    for (int32_t i = 0; i < M; ++i) {
+        degree[src[i]] += 1;
+        degree[dst[i]] += 1;
+    }
+    indptr[0] = 0;
+    for (int32_t i = 0; i < N; ++i) indptr[i + 1] = indptr[i] + degree[i];
+    indices.assign(static_cast<size_t>(2) * M, 0);
+    weights.assign(static_cast<size_t>(2) * M, 0.0);
+    std::vector<int32_t> write(indptr.begin(), indptr.begin() + N);
+    for (int32_t i = 0; i < M; ++i) {
+        const int32_t s = src[i];
+        const int32_t d = dst[i];
+        const double wi = w[i];
+        indices[write[s]] = d; weights[write[s]] = wi; ++write[s];
+        indices[write[d]] = s; weights[write[d]] = wi; ++write[d];
+    }
+}
+
 // BFS-based legacy coloring. Returns true if all nodes were assigned a
 // non-zero color before max_iter; false if the queue still had pending
 // nodes (caller should retry with bigger n or repair).
@@ -48,12 +78,54 @@ inline void build_csr_from_pairs(
 // `rand`: every `rand`-th re-visit of a node, pick a deterministic
 // pseudo-random color to break out of cycles. Match the numba LCG seed
 // exactly so results are bit-identical.
+// `weights`: optional parallel array to `indices` with per-edge boundary
+//            weight (e.g. shared-pixel-pair count). When non-null AND
+//            de_table non-null AND welsh_powell, the WP color-pick uses a
+//            weighted-ΔE objective instead of the balanced-greedy rule.
+// `de_table`: optional (n_colors+1) × (n_colors+1) row-major palette
+//             distance matrix. de_table[c1*(n_colors+1) + c2] is the
+//             ΔE between colour c1 and c2 (any units; viridis-LAB by
+//             default). Indices 0..n_colors valid; row/col 0 (bg) ignored.
+// `weight_obj`: 0 = balance (current default), +1 = maximize weighted ΔE
+//               (sharp contrast on heavy edges), -1 = minimize weighted ΔE
+//               (soft contrast). Ignored when weights or de_table is null.
 inline bool color_graph_csr_legacy(
         const int32_t* indptr, const int32_t* indices, int32_t N,
         int32_t n_colors, int32_t rand_period, int32_t offset, int64_t max_iter,
-        std::vector<uint8_t>& colors, bool welsh_powell = false) {
+        std::vector<uint8_t>& colors, bool welsh_powell = false,
+        const double* weights = nullptr,
+        const double* de_table = nullptr,
+        int weight_obj = 0) {
+    const bool use_weighted = welsh_powell && weights != nullptr &&
+                              de_table != nullptr && weight_obj != 0;
+    const int32_t de_stride = n_colors + 1;
+    // Soft balance pull: only active on LOW-DEGREE nodes (degree ≤ 2),
+    // i.e. chains and leaves. On those the local score has just 1–2
+    // neighbours of information and greedy max-ΔE otherwise locks onto
+    // the pairwise max-contrast pair forever (1D chain 2-cycles).
+    // Higher-degree nodes (grid interior with deg 8, generic 2D cells
+    // with deg 3+) already have enough multi-edge consensus for the
+    // natural max-contrast tiling to win — balance is left off so it
+    // can't disturb the periodic pattern. Pull is scaled by local edge
+    // weight, so it stays calibrated to the local score magnitude
+    // regardless of weight_mode (harmonic / mean_inv / count / …).
+    double balance_coeff = 0.0;
+    if (use_weighted) {
+        double max_de = 0.0;
+        for (int32_t c1 = 1; c1 <= n_colors; ++c1) {
+            for (int32_t c2 = 1; c2 <= n_colors; ++c2) {
+                if (de_table[c1 * de_stride + c2] > max_de)
+                    max_de = de_table[c1 * de_stride + c2];
+            }
+        }
+        balance_coeff = 0.4 * max_de;
+    }
     colors.assign(static_cast<size_t>(N), 0);
     std::vector<int32_t> counter(static_cast<size_t>(N), 0);
+    // Global slot population — balanced greedy picks the least-populated
+    // valid color instead of the lowest-numbered one. Maintained
+    // incrementally on every recolor.
+    std::vector<int32_t> color_counts(static_cast<size_t>(n_colors) + 1, 0);
 
     // Queue capacity heuristic mirrors the numba version; grows on demand.
     int64_t qcap = std::max<int64_t>({static_cast<int64_t>(indptr[N]) + N,
@@ -114,8 +186,68 @@ inline bool color_graph_csr_legacy(
 
         uint8_t csel = 0;
         if (!all_present) {
-            for (int32_t c = 1; c <= n_colors; ++c) {
-                if ((mask & (1u << c)) == 0) { csel = static_cast<uint8_t>(c); break; }
+            if (use_weighted) {
+                // Score = Σ_v weight_v·ΔE(c, color_v)  − pull·count[c]
+                // (sign flipped for weight_obj < 0). pull is non-zero
+                // ONLY on chain/leaf nodes (degree ≤ 2) — picks where
+                // greedy max-contrast otherwise locks onto a 2-cycle.
+                // pull = balance_coeff · w_local; the local-weight
+                // factor keeps balance calibrated to the local score
+                // gap regardless of weight_mode.
+                const int32_t deg = row_end - row_beg;
+                int32_t colored_count = 0;
+                double w_local = 0.0;
+                for (int32_t k = row_beg; k < row_end; ++k) {
+                    if (colors[indices[k]] != 0) {
+                        ++colored_count;
+                        if (colored_count == 1) w_local = weights[k];
+                        if (colored_count >= 2) break;
+                    }
+                }
+                const double pull = (deg <= 2 && colored_count == 1)
+                    ? balance_coeff * w_local : 0.0;
+                double best_score = (weight_obj > 0) ? -1e30 : 1e30;
+                for (int32_t c = 1; c <= n_colors; ++c) {
+                    if ((mask & (1u << c)) != 0) continue;
+                    double score = 0.0;
+                    for (int32_t k = row_beg; k < row_end; ++k) {
+                        const uint8_t cv = colors[indices[k]];
+                        if (cv == 0) continue;
+                        score += weights[k] * de_table[c * de_stride + cv];
+                    }
+                    const double penalty = pull
+                        * static_cast<double>(color_counts[c]);
+                    score = (weight_obj > 0) ? (score - penalty)
+                                              : (score + penalty);
+                    bool better = (csel == 0)
+                        || ((weight_obj > 0) ? (score > best_score)
+                                              : (score < best_score));
+                    if (better) {
+                        best_score = score;
+                        csel = static_cast<uint8_t>(c);
+                    }
+                }
+            } else if (welsh_powell) {
+                // Balanced greedy: among valid (non-conflicting) colors,
+                // pick the one with the lowest global usage. Ties resolved
+                // by lowest color index for determinism. Paired with the
+                // WP descending-degree visit order — together they balance
+                // both the *assignment moment* (rare slots get priority)
+                // and the *graph order* (high-degree nodes first), yielding
+                // a near-uniform 4-colour distribution.
+                int32_t best = 2147483647;
+                for (int32_t c = 1; c <= n_colors; ++c) {
+                    if ((mask & (1u << c)) != 0) continue;
+                    if (color_counts[c] < best) {
+                        best = color_counts[c];
+                        csel = static_cast<uint8_t>(c);
+                    }
+                }
+            } else {
+                // Lowest-numbered valid color (bit-identical with numba).
+                for (int32_t c = 1; c <= n_colors; ++c) {
+                    if ((mask & (1u << c)) == 0) { csel = static_cast<uint8_t>(c); break; }
+                }
             }
             counter[u] = 0;
         } else {
@@ -145,6 +277,11 @@ inline bool color_graph_csr_legacy(
         }
 
         if (colors[u] != csel) {
+            if (welsh_powell) {
+                const uint8_t old_c = colors[u];
+                if (old_c != 0) --color_counts[old_c];
+                if (csel != 0) ++color_counts[csel];
+            }
             colors[u] = csel;
             for (int32_t k = row_beg; k < row_end; ++k) {
                 const int32_t v = indices[k];
