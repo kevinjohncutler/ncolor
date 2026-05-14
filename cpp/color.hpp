@@ -109,6 +109,12 @@ inline bool color_graph_csr_legacy(
     // can't disturb the periodic pattern. Pull is scaled by local edge
     // weight, so it stays calibrated to the local score magnitude
     // regardless of weight_mode (harmonic / mean_inv / count / …).
+    // (An earlier anisotropy-based gate `(top2 weight)/(total) > 0.6`
+    // — meant to catch chains embedded in denser graphs like spoke
+    // patterns — was tried and reverted. It improved per-spoke colour
+    // count on the 8-spoke synthetic but destroyed the mirror symmetry
+    // across the x-axis that the degree-gate output naturally has,
+    // which is the more important structural property to preserve.)
     double balance_coeff = 0.0;
     if (use_weighted) {
         double max_de = 0.0;

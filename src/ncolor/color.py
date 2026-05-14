@@ -24,7 +24,9 @@ def _get_solver():
 def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           return_n=False, return_lut=False, verbose=False,
           check_conflicts=False, return_conflicts=False, format_input=True,
-          out=None, p=1, wrap=False, balance=True):
+          out=None, p=1, wrap=False, balance=True, first_seen=False,
+          weight_objective=0, de_table=None, weight_mode="min",
+          optimize=None):
     """4-color graph coloring of a label image.
 
     Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
@@ -37,28 +39,150 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     at boundary tie-break regions; both satisfy the 4-coloring constraint.
 
     ``wrap=True`` treats the image as a torus: opposite edges are
-    treated as adjacent. Increases constraint pressure on perimeter
-    cells and produces a more uniform colour distribution on
-    tightly-cropped images. Negligible runtime cost.
+    treated as adjacent. Useful when the cells of interest are crammed
+    near the image borders (tight crops); the wrap-around adjacency
+    adds constraint pressure on perimeter cells and tightens the colour
+    distribution. For interior-clustered inputs it can *worsen* balance
+    by over-constraining the graph, and for non-periodic data it bakes
+    in a false adjacency. Runtime cost: ~5-15% extra in 2D, ~15-35%
+    in 3D.
 
     ``balance=True`` uses the Welsh-Powell heuristic: cells are
     visited in descending-degree order so the most-constrained cells
     get coloured first. Spreads colour usage more evenly than the
     default label-ID order at ~zero runtime cost. Recommended with
     p=1, where BFS would otherwise concentrate color 4 unevenly.
+
+    ``first_seen=True`` numbers cells in raster-scan first-encounter
+    order (matching ``fastremap.renumber`` from the pre-cpp pipeline)
+    instead of the default ascending-source-ID order. Affects which
+    cell is visited first by the BFS, so it shifts the coloring even
+    though both orderings produce valid 4-colourings. Useful for
+    bit-reproducing colorings from the legacy Python implementation.
+
+    ``weight_objective`` enables boundary-weighted colour selection.
+    The BFS uses Σ_v w(u,v) × ΔE(c, colour(v)) as a soft objective and
+    picks colours that maximise or minimise this score.
+
+      0 / "off" / "balance"  (default) → ignore weights, behave as before
+      +1 / "max" / "sharp"             → maximise Σ w × ΔE on heavy edges
+      -1 / "min" / "soft"              → minimise Σ w × ΔE
+
+    ``weight_mode`` selects the per-pair reducer that defines w. All
+    reducers operate on (d_i + d_j) at boundary pixels, where d is the
+    EDT distance from expand_labels. All have ~zero overhead — computed
+    in the same parallel scan as find_pairs.
+
+      "min"      (default) w = 1 / (1 + min(d_i+d_j))
+                           closest physical approach. Corner-kiss and long
+                           seam are indistinguishable (both have min=0).
+      "mean"     w = 1 / (1 + mean(d_i+d_j))
+                           average separation along the boundary. Penalises
+                           pairs whose Voronoi seam is mostly far from cells.
+      "max"      w = 1 / (1 + max(d_i+d_j))
+                           farthest point. Only pairs with everywhere-close
+                           contact get high weight.
+      "count"    w = boundary pixel-pair count
+                           pure length, no distance info.
+      "harmonic" w = Σ 1 / (1 + d_i + d_j)
+                           combines length AND closeness in one number.
+      "mean_inv" w = (Σ 1 / (1 + d_i + d_j)) / boundary_count
+                           length-normalised harmonic. Removes the long-
+                           boundary bias of plain harmonic so peripheral
+                           cells (with much Voronoi-extended seam) aren't
+                           penalised; per-pixel inverse-distance only.
+
+    ``de_table`` lets you override the default viridis-ΔE palette table;
+    pass an ``(n+1) × (n+1)`` float array. Requires ``balance=True``.
+
+    ``optimize`` enables a post-greedy GLOBAL optimisation of the colour
+    LUT. The greedy WP picker commits cell-by-cell and can leave local
+    minima (e.g. a ring whose cells use only 3 of 4 colours even though
+    a 4-colour assignment exists). The optimiser sees the whole graph
+    and finds a near-optimum under a label-equivariant loss — no
+    colormap / ΔE information enters.
+
+      None (default)   no optimisation; pure greedy output
+      "two_hop"        Simulated annealing minimising same-colour
+                       2-hop pairs (cells at graph-distance 2). All
+                       moves are Kempe swaps, so the result is always
+                       a valid 4-colouring. On regular structures this
+                       reaches the all-4-colours-used configuration
+                       wherever the graph admits it; on irregular
+                       inputs it improves uniformity without affecting
+                       validity. Runtime ≈ tens of ms for ~100-cell
+                       graphs; pure Python, slows on very large graphs.
     """
     del verbose  # accepted for back-compat; cpp pipeline doesn't trace stages
 
     lab_arr = np.asarray(lab)
     solver = _get_solver()
 
+    # Normalize weight_objective: accept str ("max"/"min"/"off") or int (+1/-1/0).
+    if isinstance(weight_objective, str):
+        wobj = {"max": 1, "max_contrast": 1, "sharp": 1,
+                "min": -1, "min_contrast": -1, "soft": -1,
+                "off": 0, "balance": 0, "none": 0,
+                }.get(weight_objective.lower(), 0)
+    else:
+        wobj = int(weight_objective)
+
+    de_arr = None
+    if de_table is not None:
+        de_arr = np.ascontiguousarray(de_table, dtype=np.float64)
+
+    # weight_mode: which reducer over (d_i + d_j) the BFS uses as edge weight.
+    _WEIGHT_MODE = {"off": 0, "min": 1, "max": 2, "mean": 3,
+                    "count": 4, "harmonic": 5, "mean_inv": 6, "meaninv": 6}
+    if isinstance(weight_mode, str):
+        wmode_int = _WEIGHT_MODE.get(weight_mode.lower(), 1)
+    else:
+        wmode_int = int(weight_mode)
+
     out_array, n_used = solver.label(
         lab_arr,
         n_colors=int(n), max_depth=int(max_depth),
         conn=int(conn), p=int(p), format_input=bool(format_input),
         expand=bool(expand), out=out, wrap=bool(wrap),
-        balance=bool(balance))
+        balance=bool(balance), first_seen=bool(first_seen),
+        weight_objective=wobj, de_table=de_arr,
+        weight_mode=wmode_int)
     out = out_array
+
+    if optimize is not None:
+        opt_kind = str(optimize).lower()
+        if opt_kind in ("two_hop", "twohop", "2hop", "2-hop"):
+            from ._optimize import optimize_two_hop, build_adjacency_from_label
+            # Recover the per-label LUT used by the greedy picker: the
+            # value at any pixel with label L is colour LUT[L]. The
+            # input ``lab_arr`` may have non-contiguous labels (compacted
+            # by format_input=True inside the solver); reconstruct the
+            # LUT from ``solver.get_last_lut`` when available.
+            lut = solver.get_last_lut()
+            if lut is None or len(lut) == 0:
+                return out  # nothing to optimise
+            # Build the same adjacency graph the picker used.
+            adj, N, _ = build_adjacency_from_label(lab_arr, p=int(p),
+                                                    conn=int(conn))
+            new_lut, _ = optimize_two_hop(list(lut), adj, N,
+                                           n_colors=int(n_used) if n_used else int(n))
+            # Apply optimised LUT back to the output image.
+            lut_arr = np.array(new_lut, dtype=out.dtype)
+            # ``out`` was produced via the same LUT indexing pipeline,
+            # so we need to remap based on label positions. Rebuild
+            # ``out`` from the (possibly relabelled) input.
+            # The expanded image is the same one the picker used; we
+            # already build it inside build_adjacency_from_label, but
+            # we can simply remap ``lab_arr`` (or its expanded variant
+            # when expand=True).
+            if expand:
+                from .expand import expand_labels
+                expanded = expand_labels(lab_arr, p=int(p))
+                out = lut_arr[expanded].astype(out.dtype)
+            else:
+                out = lut_arr[lab_arr].astype(out.dtype)
+        else:
+            raise ValueError(f"unknown optimize mode: {optimize!r}")
 
     if return_lut or check_conflicts or return_conflicts:
         lut = solver.get_last_lut() if return_lut else None
