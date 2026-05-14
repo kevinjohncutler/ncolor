@@ -98,29 +98,38 @@ def spectral_4color(adj: Dict[int, set], N: int, n_colors: int = 4,
                      rng_seed: int = 0):
     """One-shot spectral 4-colouring.
 
+    Empirical note on 2-hop: incorporating a 2-hop term in the seed
+    Laplacian (L_W = L_1 + α·L_2) does NOT reduce 2-hop same-colour
+    pairs on irregular cell graphs in practice. With α ∈ [0.3, 1.0]
+    bacteria 2-hop count is unchanged or slightly worse (319-323 vs
+    319 baseline). Meanwhile α ≥ 0.3 breaks the tile pattern on regular
+    grids. 1-hop and 2-hop separation are mathematically incompatible
+    objectives at the eigendecomposition stage on these graphs.
+
+    Meaningful 2-hop reduction requires post-spectral optimisation
+    (Kempe-SA via ``optimize='two_hop'`` on ``ncolor.label``). The
+    spectral algorithm here delivers the principled 1-hop separation
+    (recovers the abelian quotient on regular structures); 2-hop is
+    addressed separately or accepted as the seed's limit.
+
     Parameters
     ----------
     adj : dict[int, set[int]]
-        1-indexed adjacency. ``adj[u]`` is the set of 1-hop neighbours.
+        1-indexed adjacency.
     N : int
-        Number of cells.
     n_colors : int
-        Palette size (default 4).
     rng_seed : int
-        For reproducible min-conflicts tiebreaking.
 
     Returns
     -------
     colors : list[int] of length N + 1
-        ``colors[u] ∈ {1, …, n_colors}`` is the colour of cell u.
-        ``colors[0]`` is unused (background slot).
     """
     A = _build_csr_adjacency(adj, N)
     deg = np.asarray(A.sum(axis=1)).flatten().astype(np.float64)
     D = sp.diags(deg)
     L = (D - A.astype(np.float64))
 
-    # 1. EMBED — top 2 eigenvectors of L.
+    # 1. EMBED — top 2 eigenvectors of L_W.
     n_request = min(2, max(N - 1, 1))
     if N <= 5:
         Ld = L.toarray()
