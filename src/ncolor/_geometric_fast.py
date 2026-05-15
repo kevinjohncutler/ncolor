@@ -102,44 +102,64 @@ def per_cell_geometry(m: np.ndarray, N: int):
 def approximate_iou_similarity(m: np.ndarray, N: int,
                                  max_dist_factor: float = 5.0,
                                  min_score: float = 0.02):
-    """Approximate IoU via shape descriptors (no per-pair pixel loop).
+    """Approximate IoU via shape descriptors. FULLY VECTORISED.
 
     similarity(u, v) =  ecc_u · ecc_v · |axis_u · axis_v|²
                       · min(area_u, area_v)/max(area_u, area_v)
                       · exp(-d² / (2·σ²))
 
     For elongated cells this closely tracks exact centroid-aligned IoU.
-    Computed in O(N log N + #pairs) via KDTree spatial queries.
+    Computed in O(N log N + #pairs) via KDTree spatial queries; the per-
+    pair scoring is a single batched numpy expression over the pair
+    array (no Python loop).
 
-    Returns dict {(u, v): score} for pairs with score ≥ min_score.
+    Returns (dict, geom) where dict maps (u, v) → score for pairs with
+    score ≥ min_score.
     """
     geom = per_cell_geometry(m, N)
     if N < 2: return {}, geom
-    mean_radius = float(np.sqrt(np.mean([geom[u]["area"] for u in range(1, N + 1)]) / np.pi))
+
+    # Pack per-cell arrays for vectorised pair scoring.
+    centroid_y = np.array([geom[u]["centroid"][0] for u in range(1, N + 1)])
+    centroid_x = np.array([geom[u]["centroid"][1] for u in range(1, N + 1)])
+    axis_y = np.array([geom[u]["axis"][0] for u in range(1, N + 1)])
+    axis_x = np.array([geom[u]["axis"][1] for u in range(1, N + 1)])
+    ecc = np.array([geom[u]["ecc"] for u in range(1, N + 1)])
+    area = np.array([geom[u]["area"] for u in range(1, N + 1)], dtype=np.float64)
+
+    mean_radius = float(np.sqrt(area.mean() / np.pi))
     max_dist = max_dist_factor * mean_radius
     sigma = 2.0 * mean_radius
 
-    centroids = np.array([geom[u]["centroid"] for u in range(1, N + 1)])
+    centroids = np.column_stack([centroid_y, centroid_x])
     tree = KDTree(centroids)
-    pairs_idx = tree.query_pairs(r=max_dist)  # set of (i, j) with i < j
+    pairs_idx = tree.query_pairs(r=max_dist, output_type="ndarray")
+    if len(pairs_idx) == 0:
+        return {}, geom
 
+    i = pairs_idx[:, 0]; j = pairs_idx[:, 1]
+
+    # Vectorised score over the full pair array.
+    axis_sim = np.abs(axis_y[i] * axis_y[j] + axis_x[i] * axis_x[j])
+    area_ij = np.column_stack([area[i], area[j]])
+    area_sim = area_ij.min(axis=1) / np.maximum(area_ij.max(axis=1), 1.0)
+    dy = centroid_y[i] - centroid_y[j]
+    dx = centroid_x[i] - centroid_x[j]
+    d2 = dy * dy + dx * dx
+    prox = np.exp(-d2 / (2.0 * sigma * sigma))
+    # Round-cells (low ecc) get a baseline contribution so they aren't
+    # ignored entirely.
+    ecc_term = np.where((ecc[i] < 0.3) | (ecc[j] < 0.3), 0.3, ecc[i] * ecc[j])
+    scores = ecc_term * (axis_sim * axis_sim) * area_sim * prox
+
+    keep = scores >= min_score
     pair_sim: Dict[Tuple[int, int], float] = {}
-    for (i, j) in pairs_idx:
-        u, v = i + 1, j + 1  # 1-indexed
-        g_u = geom[u]; g_v = geom[v]
-        ecc_u, ecc_v = g_u["ecc"], g_v["ecc"]
-        if ecc_u < 0.3 or ecc_v < 0.3:
-            ecc_term = 0.3  # round-ish cells contribute a baseline
-        else:
-            ecc_term = ecc_u * ecc_v
-        axis_sim = abs(float(np.dot(g_u["axis"], g_v["axis"])))
-        a_u, a_v = g_u["area"], g_v["area"]
-        area_sim = min(a_u, a_v) / max(max(a_u, a_v), 1)
-        d = float(np.linalg.norm(g_u["centroid"] - g_v["centroid"]))
-        prox = np.exp(-d * d / (2.0 * sigma * sigma))
-        score = ecc_term * (axis_sim ** 2) * area_sim * prox
-        if score >= min_score:
-            pair_sim[(u, v)] = float(score)
+    # 1-indexed cell labels.
+    ii = (i[keep] + 1).astype(int)
+    jj = (j[keep] + 1).astype(int)
+    ss = scores[keep]
+    for a, b, s in zip(ii, jj, ss):
+        pair_sim[(int(a), int(b))] = float(s)
     return pair_sim, geom
 
 
