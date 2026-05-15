@@ -37,6 +37,12 @@ import numpy as np
 from scipy.spatial import KDTree
 
 
+def per_cell_geometry_cpp(m: np.ndarray):
+    """C++ per-cell geometric features. Returns dict of arrays."""
+    from ._backend import _impl as _backend_impl
+    return _backend_impl.per_cell_geometry(np.ascontiguousarray(m))
+
+
 def per_cell_geometry(m: np.ndarray, N: int):
     """Compute per-cell (centroid, major_axis_uv, eccentricity, area).
 
@@ -97,6 +103,52 @@ def per_cell_geometry(m: np.ndarray, N: int):
                        axis=np.array([ay, ax]),
                        ecc=float(ecc), area=area)
     return geom
+
+
+def approximate_iou_similarity_cpp(m: np.ndarray,
+                                     max_dist_factor: float = 5.0,
+                                     min_score: float = 0.02):
+    """C++ per-cell geometry + vectorised pair scoring."""
+    geom = per_cell_geometry_cpp(m)
+    N = int(geom["N"])
+    if N < 2: return None, None, None, geom
+
+    # Drop the 0-index (background slot).
+    centroid_y = geom["centroid_y"][1:]
+    centroid_x = geom["centroid_x"][1:]
+    axis_y = geom["axis_y"][1:]
+    axis_x = geom["axis_x"][1:]
+    ecc = geom["ecc"][1:]
+    area = geom["area"][1:].astype(np.float64)
+
+    if area.size == 0 or area.sum() == 0:
+        return None, None, None, geom
+    mean_radius = float(np.sqrt(area.mean() / np.pi))
+    max_dist = max_dist_factor * mean_radius
+    sigma = 2.0 * mean_radius
+
+    centroids = np.column_stack([centroid_y, centroid_x])
+    tree = KDTree(centroids)
+    pairs_idx = tree.query_pairs(r=max_dist, output_type="ndarray")
+    if len(pairs_idx) == 0:
+        return None, None, None, geom
+
+    i = pairs_idx[:, 0]; j = pairs_idx[:, 1]
+    axis_sim = np.abs(axis_y[i] * axis_y[j] + axis_x[i] * axis_x[j])
+    area_ij = np.column_stack([area[i], area[j]])
+    area_sim = area_ij.min(axis=1) / np.maximum(area_ij.max(axis=1), 1.0)
+    dy = centroid_y[i] - centroid_y[j]
+    dx = centroid_x[i] - centroid_x[j]
+    d2 = dy * dy + dx * dx
+    prox = np.exp(-d2 / (2.0 * sigma * sigma))
+    ecc_term = np.where((ecc[i] < 0.3) | (ecc[j] < 0.3), 0.3, ecc[i] * ecc[j])
+    scores = ecc_term * (axis_sim * axis_sim) * area_sim * prox
+    keep = scores >= min_score
+    # Return as 0-indexed arrays for direct C++ consumption.
+    pair_u = i[keep].astype(np.int32)
+    pair_v = j[keep].astype(np.int32)
+    pair_w = scores[keep].astype(np.float64)
+    return pair_u, pair_v, pair_w, geom
 
 
 def approximate_iou_similarity(m: np.ndarray, N: int,
@@ -365,33 +417,57 @@ def label_geometric_fast(lab, p: int = 1, conn: int = 2,
         adj[int(u)].add(int(v)); adj[int(v)].add(int(u))
     if verbose: print(f"  adjacency: N={N}, edges={sum(len(s) for s in adj.values())//2}, {time.time()-t_start:.2f}s")
 
-    # Seed: greedy. Extract per-cell colour via vectorised np.unique
-    # (one pass over the label array, O(M log N) instead of O(N · M)).
+    # Seed: greedy. Extract per-cell colour via vectorised np.unique.
     nc_seed = _ncolor_label(lab_arr, expand=True, p=p, balance=True,
                               weight_objective=0)
     flat_lab = lab_arr.ravel(); flat_nc = nc_seed.ravel()
     unique_labels, first_idx = np.unique(flat_lab, return_index=True)
-    colors = [0] * (N + 1)
-    for ul, fi in zip(unique_labels, first_idx):
-        if ul > 0 and ul <= N:
-            colors[int(ul)] = int(flat_nc[fi])
+    # Build 0-indexed initial_colors array directly (skip the 1-indexed
+    # Python list and the second copy in kempe_sa_native).
+    initial_colors = np.zeros(N, dtype=np.uint8)
+    valid = (unique_labels > 0) & (unique_labels <= N)
+    initial_colors[unique_labels[valid] - 1] = flat_nc[first_idx[valid]]
     if verbose: print(f"  greedy seed: {time.time()-t_start:.2f}s")
 
-    # Approximate IoU pairs.
-    iou_pairs, _ = approximate_iou_similarity(lab_arr, N)
-    iou_pairs_by_cell = [[] for _ in range(N + 1)]
-    for (u, v), s in iou_pairs.items():
-        iou_pairs_by_cell[u].append((v, s))
-        iou_pairs_by_cell[v].append((u, s))
-    if verbose: print(f"  IoU pairs: {len(iou_pairs)}, {time.time()-t_start:.2f}s")
+    # Build 1-hop CSR (0-indexed) from adj dict.
+    adj_degrees = np.array([len(adj[u]) for u in range(1, N + 1)], dtype=np.int32)
+    adj_indptr = np.zeros(N + 1, dtype=np.int32)
+    adj_indptr[1:] = np.cumsum(adj_degrees)
+    adj_indices = np.zeros(int(adj_indptr[N]), dtype=np.int32)
+    pos = 0
+    for u in range(1, N + 1):
+        for v in adj[u]:
+            adj_indices[pos] = v - 1; pos += 1
 
-    two_hop = _two_hop_neighbors_list(adj, N)
-    if verbose: print(f"  2-hop lists: {time.time()-t_start:.2f}s")
+    # 2-hop CSR via C++.
+    from ._backend import _impl as _backend_impl
+    th_indptr, th_indices = _backend_impl.two_hop_csr(adj_indptr, adj_indices)
+    if verbose: print(f"  2-hop CSR: {th_indices.size} edges, {time.time()-t_start:.2f}s")
 
-    # Kempe-SA — C++ implementation.
-    colors, loss = kempe_sa_native(colors, adj, two_hop, iou_pairs_by_cell, N,
-                                     alpha_2hop=alpha_2hop, gamma_iou=gamma_iou,
-                                     n_iters=sa_iters)
+    # Approximate IoU pairs via C++ geometry + vectorised scoring.
+    pair_u, pair_v, pair_w, geom = approximate_iou_similarity_cpp(lab_arr)
+    if pair_u is None:
+        pair_u = np.zeros(0, dtype=np.int32)
+        pair_v = np.zeros(0, dtype=np.int32)
+        pair_w = np.zeros(0, dtype=np.float64)
+    iou_indptr, iou_indices, iou_weights = _backend_impl.symmetric_pair_csr(
+        pair_u, pair_v, pair_w, N)
+    if verbose: print(f"  IoU pairs: {len(pair_u)}, {time.time()-t_start:.2f}s")
+
+    # Kempe-SA — C++ implementation, called directly with CSR arrays.
+    out_colors, best_loss = _backend_impl.kempe_sa(
+        initial_colors=initial_colors,
+        adj_indptr=adj_indptr, adj_indices=adj_indices,
+        twohop_indptr=th_indptr, twohop_indices=th_indices,
+        iou_indptr=iou_indptr, iou_indices=iou_indices,
+        iou_weights=iou_weights,
+        n_colors=4, alpha_2hop=alpha_2hop, gamma_iou=gamma_iou,
+        n_iters=sa_iters)
+    # Back to 1-indexed for LUT.
+    colors = [0] * (N + 1)
+    for i, c in enumerate(out_colors):
+        colors[i + 1] = int(c)
+    loss = float(best_loss)
     if verbose:
         print(f"  Kempe-SA: loss={loss:.2f}, {time.time()-t_start:.2f}s")
 

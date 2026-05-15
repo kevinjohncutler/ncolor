@@ -23,6 +23,7 @@
 #include "expand_lp.hpp"
 #include "format_labels.hpp"
 #include "connect.hpp"
+#include "geometry.hpp"
 #include "kempe_sa.hpp"
 #include "dispatch.hpp"
 #include "expand.hpp"
@@ -1276,6 +1277,130 @@ PYBIND11_MODULE(_impl, m) {
           "ndim → full diagonal (preserves 1-voxel skeletons). Isolated\n"
           "pixels (count == 0) are always preserved. ``max_iter`` < 0\n"
           "runs to convergence.");
+
+    m.def("per_cell_geometry",
+          [](py::array labels) -> py::dict {
+              if (!(labels.flags() & py::array::c_style)) {
+                  labels = py::array::ensure(labels, py::array::c_style);
+              }
+              const auto buf = labels.request();
+              if (buf.ndim != 2) throw std::invalid_argument(
+                  "per_cell_geometry: requires 2-D label array");
+              const int64_t H = static_cast<int64_t>(buf.shape[0]);
+              const int64_t W = static_cast<int64_t>(buf.shape[1]);
+
+              std::vector<ncolor_cpp::CellGeom> out;
+              int32_t N = 0;
+
+              dispatch_int_dtype(buf.format, buf.itemsize, "per_cell_geometry",
+                  [&](auto* tag) {
+                      using T = std::remove_pointer_t<decltype(tag)>;
+                      const T* src = static_cast<const T*>(buf.ptr);
+                      // Find N = max(label).
+                      const int64_t HW = H * W;
+                      int64_t mx = 0;
+                      for (int64_t i = 0; i < HW; ++i) {
+                          const int64_t v = static_cast<int64_t>(src[i]);
+                          if (v > mx) mx = v;
+                      }
+                      N = static_cast<int32_t>(mx);
+                      py::gil_scoped_release release;
+                      ncolor_cpp::per_cell_geometry<T>(src, H, W, N, out);
+                  });
+              // Pack into 1-indexed numpy arrays (length N+1).
+              py::array_t<double>  cy({static_cast<py::ssize_t>(N + 1)});
+              py::array_t<double>  cx({static_cast<py::ssize_t>(N + 1)});
+              py::array_t<double>  ay({static_cast<py::ssize_t>(N + 1)});
+              py::array_t<double>  ax({static_cast<py::ssize_t>(N + 1)});
+              py::array_t<double>  ecc({static_cast<py::ssize_t>(N + 1)});
+              py::array_t<int32_t> area({static_cast<py::ssize_t>(N + 1)});
+              auto* cyp = static_cast<double*>(cy.request().ptr);
+              auto* cxp = static_cast<double*>(cx.request().ptr);
+              auto* ayp = static_cast<double*>(ay.request().ptr);
+              auto* axp = static_cast<double*>(ax.request().ptr);
+              auto* ecp = static_cast<double*>(ecc.request().ptr);
+              auto* arp = static_cast<int32_t*>(area.request().ptr);
+              for (int32_t u = 0; u <= N; ++u) {
+                  cyp[u] = out[u].cy; cxp[u] = out[u].cx;
+                  ayp[u] = out[u].axis_y; axp[u] = out[u].axis_x;
+                  ecp[u] = out[u].ecc; arp[u] = out[u].area;
+              }
+              py::dict d;
+              d["centroid_y"] = cy; d["centroid_x"] = cx;
+              d["axis_y"] = ay; d["axis_x"] = ax;
+              d["ecc"] = ecc; d["area"] = area;
+              d["N"] = N;
+              return d;
+          },
+          py::arg("labels"),
+          "Per-cell geometric features in a single image pass.\n"
+          "Returns dict of 1-indexed arrays: centroid_y/x, axis_y/x, ecc, area, N.");
+
+    m.def("two_hop_csr",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indptr,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indices)
+             -> std::pair<py::array_t<int32_t>, py::array_t<int32_t>>
+          {
+              const auto ai = adj_indptr.request();
+              const auto ax = adj_indices.request();
+              if (ai.size < 1) throw std::invalid_argument(
+                  "two_hop_csr: empty adj_indptr");
+              const int32_t N = static_cast<int32_t>(ai.size - 1);
+              std::vector<int32_t> out_indptr, out_indices;
+              {
+                  py::gil_scoped_release release;
+                  ncolor_cpp::compute_two_hop_csr(
+                      static_cast<const int32_t*>(ai.ptr),
+                      static_cast<const int32_t*>(ax.ptr),
+                      N, out_indptr, out_indices);
+              }
+              py::array_t<int32_t> indptr({static_cast<py::ssize_t>(N + 1)});
+              py::array_t<int32_t> indices({static_cast<py::ssize_t>(out_indices.size())});
+              std::memcpy(indptr.request().ptr, out_indptr.data(),
+                          (N + 1) * sizeof(int32_t));
+              std::memcpy(indices.request().ptr, out_indices.data(),
+                          out_indices.size() * sizeof(int32_t));
+              return {std::move(indptr), std::move(indices)};
+          },
+          py::arg("adj_indptr"), py::arg("adj_indices"),
+          "Build 2-hop neighbour CSR from a 1-hop adjacency CSR.\n"
+          "Both directions emitted (symmetric output). O(N · avg_deg²) time.");
+
+    m.def("symmetric_pair_csr",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> pair_u,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> pair_v,
+             py::array_t<double,  py::array::c_style | py::array::forcecast> pair_w,
+             int32_t N)
+             -> std::tuple<py::array_t<int32_t>, py::array_t<int32_t>, py::array_t<double>>
+          {
+              const auto pu = pair_u.request();
+              const auto pv = pair_v.request();
+              const auto pw = pair_w.request();
+              if (pu.size != pv.size || pu.size != pw.size)
+                  throw std::invalid_argument("symmetric_pair_csr: u/v/w size mismatch");
+              const int32_t n_pairs = static_cast<int32_t>(pu.size);
+              std::vector<int32_t> indptr; std::vector<int32_t> indices;
+              std::vector<double>  weights;
+              {
+                  py::gil_scoped_release release;
+                  ncolor_cpp::build_symmetric_pair_csr(
+                      static_cast<const int32_t*>(pu.ptr),
+                      static_cast<const int32_t*>(pv.ptr),
+                      static_cast<const double*>(pw.ptr),
+                      n_pairs, N, indptr, indices, weights);
+              }
+              py::array_t<int32_t> a({static_cast<py::ssize_t>(N + 1)});
+              py::array_t<int32_t> b({static_cast<py::ssize_t>(indices.size())});
+              py::array_t<double>  c({static_cast<py::ssize_t>(weights.size())});
+              std::memcpy(a.request().ptr, indptr.data(), (N + 1) * sizeof(int32_t));
+              std::memcpy(b.request().ptr, indices.data(), indices.size() * sizeof(int32_t));
+              std::memcpy(c.request().ptr, weights.data(), weights.size() * sizeof(double));
+              return {std::move(a), std::move(b), std::move(c)};
+          },
+          py::arg("pair_u"), py::arg("pair_v"), py::arg("pair_w"), py::arg("N"),
+          "Build a symmetric pair-weighted CSR from (u, v, w) triples.\n"
+          "Each input pair emits two CSR entries (u→v and v→u). Returns\n"
+          "(indptr, indices, weights).");
 
     m.def("kempe_sa",
           [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> initial_colors,
