@@ -75,8 +75,11 @@ def optimal_palette_permutation(labels: np.ndarray,
     for perm in permutations(range(1, n_colors + 1)):
         score = 0.0
         for (u, v), w in edges_with_weight.items():
-            cu = perm[labels[u] - 1]
-            cv = perm[labels[v] - 1]
+            lu, lv = labels[u], labels[v]
+            if lu < 1 or lu > n_colors or lv < 1 or lv > n_colors:
+                continue  # skip cells whose colour is outside the palette
+            cu = perm[lu - 1]
+            cv = perm[lv - 1]
             score += w * de_table[cu, cv]
         if score > best_score:
             best_score = score
