@@ -23,6 +23,7 @@
 #include "expand_lp.hpp"
 #include "format_labels.hpp"
 #include "connect.hpp"
+#include "kempe_sa.hpp"
 #include "dispatch.hpp"
 #include "expand.hpp"
 
@@ -301,7 +302,11 @@ public:
             int conn = 2, int p = 2, bool capture_stages = false,
             bool format_input = true, bool expand = true,
             py::object out_arg = py::none(),
-            int color_mode = -1, bool wrap = false, bool balance = false) {
+            int color_mode = -1, bool wrap = false, bool balance = false,
+            bool first_seen = false,
+            int weight_objective = 0,
+            py::object de_table_obj = py::none(),
+            int weight_mode = 1 /* ReduceMode::Min */) {
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
         // coloring path without rebuilding the extension.
@@ -381,8 +386,11 @@ public:
             // the caller is asserting labels are already 1..N.
             const int32_t* expand_input = expanded;
             if (format_input) {
-                const int n_labels = ncolor_cpp::format_labels_inplace(
-                    expanded, total, *pool_, n_threads_);
+                const int n_labels = first_seen
+                    ? ncolor_cpp::format_labels_inplace_first_seen(
+                        expanded, total, *pool_, n_threads_)
+                    : ncolor_cpp::format_labels_inplace(
+                        expanded, total, *pool_, n_threads_);
                 stage("format");
                 // Empty / all-bg input: output is all zeros, no
                 // expansion / coloring needed.
@@ -423,8 +431,47 @@ public:
             // (was a single-threaded 1.2 ms loop at 2048²).
             const int32_t max_label = parallel_max_label_(expanded, total);
             stage("max_scan");
-            std::vector<std::pair<int32_t, int32_t>> pairs =
-                find_pairs_(expanded, shape, conn, wrap, max_label);
+            const int wobj = weight_objective;
+            const int wmode = weight_mode;  // 0=Min (default), see binding kwargs
+            std::vector<std::pair<int32_t, int32_t>> pairs;
+            std::vector<double> pair_primary;
+            std::vector<int32_t> pair_counts;
+            if (wobj != 0) {
+                // Fused weighted find_pairs: same parallel scan computes
+                // a per-pair reducer over (d_i + d_j) at boundary pixels.
+                // The reducer (min/max/mean/count/harmonic) is picked by
+                // weight_mode; templated dispatch eliminates dead branches.
+                using ncolor_cpp::ReduceMode;
+                switch (static_cast<ReduceMode>(wmode)) {
+                    case ReduceMode::Max:
+                        pairs = find_pairs_weighted_<ReduceMode::Max>(
+                            expanded, expand_bufs_.dist(), shape, conn, wrap,
+                            max_label, pair_primary, pair_counts); break;
+                    case ReduceMode::Mean:
+                        pairs = find_pairs_weighted_<ReduceMode::Mean>(
+                            expanded, expand_bufs_.dist(), shape, conn, wrap,
+                            max_label, pair_primary, pair_counts); break;
+                    case ReduceMode::Count:
+                        pairs = find_pairs_weighted_<ReduceMode::Count>(
+                            expanded, expand_bufs_.dist(), shape, conn, wrap,
+                            max_label, pair_primary, pair_counts); break;
+                    case ReduceMode::Harmonic:
+                        pairs = find_pairs_weighted_<ReduceMode::Harmonic>(
+                            expanded, expand_bufs_.dist(), shape, conn, wrap,
+                            max_label, pair_primary, pair_counts); break;
+                    case ReduceMode::MeanInv:
+                        pairs = find_pairs_weighted_<ReduceMode::MeanInv>(
+                            expanded, expand_bufs_.dist(), shape, conn, wrap,
+                            max_label, pair_primary, pair_counts); break;
+                    case ReduceMode::Min:
+                    default:
+                        pairs = find_pairs_weighted_<ReduceMode::Min>(
+                            expanded, expand_bufs_.dist(), shape, conn, wrap,
+                            max_label, pair_primary, pair_counts); break;
+                }
+            } else {
+                pairs = find_pairs_(expanded, shape, conn, wrap, max_label);
+            }
             stage("find_pairs");
 
             // 3. Build CSR (labels are 1..max_label after expand → node = label-1).
@@ -436,16 +483,99 @@ public:
                 src_idx_[i] = pairs[i].first - 1;
                 dst_idx_[i] = pairs[i].second - 1;
             }
-            ncolor_cpp::build_csr_from_pairs(src_idx_.data(), dst_idx_.data(), N, M,
-                                             indptr_, indices_);
+            // Boundary-weighted opt-in path: convert per-pair reducer
+            // values (collected during find_pairs) to weights per
+            // ``weight_mode`` and build a CSR with parallel weights[].
+            //   Min/Max:  w = 1 / (1 + primary)             (inverse-distance)
+            //   Mean:     w = 1 / (1 + primary / counts)    (inverse-mean)
+            //   Count:    w = counts                        (boundary length)
+            //   Harmonic: w = primary                       (Σ 1/(1+d))
+            std::vector<double> pair_w;
+            const double* edge_weights_ptr = nullptr;
+            if (wobj != 0 && M > 0) {
+                using ncolor_cpp::ReduceMode;
+                pair_w.resize(static_cast<size_t>(M));
+                const auto mode = static_cast<ReduceMode>(wmode);
+                for (int32_t i = 0; i < M; ++i) {
+                    if (mode == ReduceMode::Mean) {
+                        const double mean = pair_counts[i] > 0
+                            ? pair_primary[i] / static_cast<double>(pair_counts[i])
+                            : 0.0;
+                        pair_w[i] = 1.0 / (1.0 + mean);
+                    } else if (mode == ReduceMode::Count) {
+                        pair_w[i] = static_cast<double>(pair_counts[i]);
+                    } else if (mode == ReduceMode::Harmonic) {
+                        pair_w[i] = pair_primary[i];
+                    } else if (mode == ReduceMode::MeanInv) {
+                        // Length-normalized harmonic: mean of 1/(1+d) over
+                        // boundary pixels. Removes the "long-boundary bias"
+                        // of plain Harmonic, so peripheral cells with much
+                        // Voronoi-extended boundary aren't penalised.
+                        pair_w[i] = pair_counts[i] > 0
+                            ? pair_primary[i] / static_cast<double>(pair_counts[i])
+                            : 0.0;
+                    } else {  // Min or Max
+                        pair_w[i] = 1.0 / (1.0 + pair_primary[i]);
+                    }
+                }
+                ncolor_cpp::build_csr_from_pairs_weighted(
+                    src_idx_.data(), dst_idx_.data(), pair_w.data(),
+                    N, M, indptr_, indices_, edge_weights_);
+                edge_weights_ptr = edge_weights_.data();
+            } else {
+                ncolor_cpp::build_csr_from_pairs(src_idx_.data(), dst_idx_.data(),
+                                                 N, M, indptr_, indices_);
+            }
             stage("build_csr");
+
+            // Resolve de_table override or fall back to the viridis default.
+            std::vector<double> de_table_vec;
+            const double* de_ptr = nullptr;
+            if (wobj != 0) {
+                if (!de_table_obj.is_none()) {
+                    auto arr = py::array_t<double,
+                        py::array::c_style | py::array::forcecast>::ensure(de_table_obj);
+                    if (arr) {
+                        const auto buf = arr.request();
+                        if (buf.ndim == 2 &&
+                            buf.shape[0] == n_colors + 1 &&
+                            buf.shape[1] == n_colors + 1) {
+                            const size_t total_de = static_cast<size_t>(n_colors + 1) * (n_colors + 1);
+                            de_table_vec.assign(static_cast<const double*>(buf.ptr),
+                                                static_cast<const double*>(buf.ptr) + total_de);
+                            de_ptr = de_table_vec.data();
+                        }
+                    }
+                }
+                if (de_ptr == nullptr) {
+                    de_table_vec.assign(static_cast<size_t>(n_colors + 1) * (n_colors + 1), 0.0);
+                    const double viridis_de4[5][5] = {
+                        {0.0,   0.0,   0.0,   0.0,   0.0},
+                        {0.0,   0.0,  52.0, 104.74, 133.36},
+                        {0.0,  52.0,   0.0,  56.28, 100.98},
+                        {0.0, 104.74, 56.28,  0.0,  62.58},
+                        {0.0, 133.36,100.98, 62.58,  0.0},
+                    };
+                    const int K = std::min(n_colors + 1, 5);
+                    for (int i = 0; i < K; ++i)
+                        for (int j = 0; j < K; ++j)
+                            de_table_vec[i * (n_colors + 1) + j] = viridis_de4[i][j];
+                    // For n_colors > 4 (3D fallback), entries beyond 4 stay 0:
+                    // those colours then contribute no contrast preference,
+                    // which is acceptable — the weight_obj only matters when
+                    // a perceptual palette is provided explicitly.
+                    de_ptr = de_table_vec.data();
+                }
+            }
 
             // 4. Coloring: BFS + repair fallback × attempts_per_n random
             // offsets, retrying with cur_n+1 if all attempts fail. See
             // ``solve_coloring_`` for full algorithm + parallel-attempt
             // dispatch.
             n_used = solve_coloring_(N, M, n_colors, max_depth, rand_period,
-                                     balance, color_mode);
+                                     balance, color_mode,
+                                     static_cast<int>(shape.size()), wrap,
+                                     edge_weights_ptr, de_ptr, wobj);
             stage("color");
 
             // 5. Build LUT (expanded[i] is in 1..N, so lut size = N+1) and
@@ -560,6 +690,30 @@ private:
             static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap);
     }
 
+    // Weighted variant: same parallel scan also computes a per-pair
+    // reducer over the boundary using the EDT distance map. ``Mode``
+    // picks the reducer (min/max/mean/count/harmonic of d_i+d_j).
+    // Out arrays ``primary``/``counts`` are parallel to the returned
+    // pair list; the caller picks the right one per mode.
+    template <ncolor_cpp::ReduceMode Mode>
+    std::vector<std::pair<int32_t, int32_t>> find_pairs_weighted_(
+            const int32_t* labels, const int32_t* dist,
+            const std::vector<int64_t>& shape,
+            int conn, bool wrap, int32_t max_label,
+            std::vector<double>& primary,
+            std::vector<int32_t>& counts) {
+        primary.clear(); counts.clear();
+        if (max_label == 0) return {};
+        const int ndim = static_cast<int>(shape.size());
+        const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbours(ndim, conn);
+        const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
+        const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE));
+        return ncolor_cpp::find_pairs_weighted_nd_unpadded<int32_t, Mode>(
+            labels, dist, shape, conn,
+            static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap,
+            primary, counts);
+    }
+
     // Coloring loop: try the user-preferred algorithm first, switch to
     // the alternate algorithm before bumping cur_n. Welsh-Powell and
     // BFS-with-random-restarts have nearly disjoint failure modes on
@@ -595,7 +749,10 @@ private:
     // ``n_used`` = max colour value in the winning coloring.
     int solve_coloring_(int32_t N, int32_t M, int n_colors,
                         int max_depth, int rand_period, bool balance,
-                        int color_mode) {
+                        int color_mode, int ndim, bool wrap,
+                        const double* edge_weights = nullptr,
+                        const double* de_table = nullptr,
+                        int weight_obj = 0) {
         constexpr int attempts_per_n = 4;
         const int64_t max_iter = std::max<int64_t>(
             static_cast<int64_t>(indices_.size()) +
@@ -631,18 +788,38 @@ private:
                         // Slot 0 = user-preferred algorithm; remaining
                         // slots = alternate algorithm with different
                         // random offsets (algorithm-switching fallback).
-                        const bool wp = balance ? (idx == 0)
-                                                : (idx == attempts_per_n - 1);
+                        // For the weighted opt-in, slots 0-(attempts-2) use
+                        // weighted-WP with different offsets; the LAST slot
+                        // is a pure-balance WP fallback. If all weighted
+                        // attempts fail at n_colors, the balance attempt
+                        // can still produce a clean 4-coloring before we
+                        // bump cur_n — keeps broad-support reducers (count,
+                        // harmonic) from over-allocating colours on graphs
+                        // that are 4-colourable under pure balance.
+                        const bool wobj_active = weight_obj != 0 && edge_weights != nullptr;
+                        const bool wp = wobj_active
+                            ? true
+                            : (balance ? (idx == 0)
+                                       : (idx == attempts_per_n - 1));
+                        const bool weighted_attempt = wobj_active &&
+                                                      (idx < attempts_per_n - 1);
+                        const double* w_ptr = weighted_attempt ? edge_weights : nullptr;
+                        const double* de_ptr = weighted_attempt ? de_table : nullptr;
+                        const int w_obj_local = weighted_attempt ? weight_obj : 0;
                         const bool finished = ncolor_cpp::color_graph_csr_legacy(
                             ip, ix, N, local_cur_n, rand_period,
-                            attempt_offset, max_iter, cv, wp);
+                            attempt_offset, max_iter, cv, wp,
+                            w_ptr, de_ptr, w_obj_local);
                         const bool conflict = !finished ||
                             ncolor_cpp::has_conflict_csr(ip, ix, N, cv.data());
                         bool a_ok = !conflict || ncolor_cpp::repair_coloring(
                             ip, ix, N, local_cur_n, std::max(4, max_depth), cv);
-                        // WP must be clean — repair pre-empting a WP attempt
-                        // would shadow the cleaner label-ID safety net.
-                        per_attempt_ok_[idx] = (a_ok && (!wp || !conflict)) ? 1 : 0;
+                        // WP must be clean for the balanced path — repair
+                        // would shadow its uniform-distribution promise.
+                        // For the weighted path the user has opted in to a
+                        // perceptual objective and accepts repair.
+                        const bool clean_wp_required = wp && !weighted_attempt;
+                        per_attempt_ok_[idx] = (a_ok && (!clean_wp_required || !conflict)) ? 1 : 0;
                     }
                 });
                 // Lowest-index successful attempt wins (deterministic
@@ -656,21 +833,56 @@ private:
                 }
             } else {
                 for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
-                    const bool wp = balance ? (attempt == 0)
-                                            : (attempt == attempts_per_n - 1);
+                    // When weight_obj != 0: slots 0..(attempts-2) run
+                    // weighted-WP (different offsets); LAST slot is a
+                    // pure-balance WP fallback so a 4-colourable graph
+                    // doesn't get bumped to 5 colours when broad-support
+                    // reducers (count, harmonic) over-constrain the BFS.
+                    const bool wobj_active = weight_obj != 0 && edge_weights != nullptr;
+                    const bool wp = wobj_active
+                        ? true
+                        : (balance ? (attempt == 0)
+                                   : (attempt == attempts_per_n - 1));
+                    const bool weighted_attempt = wobj_active &&
+                                                  (attempt < attempts_per_n - 1);
+                    const double* w_ptr = weighted_attempt ? edge_weights : nullptr;
+                    const double* de_ptr = weighted_attempt ? de_table : nullptr;
+                    const int w_obj_local = weighted_attempt ? weight_obj : 0;
                     const bool finished = ncolor_cpp::color_graph_csr_legacy(
                         indptr_.data(), indices_.data(), N,
                         cur_n, rand_period, depth + attempt, max_iter,
-                        colors_, wp);
+                        colors_, wp, w_ptr, de_ptr, w_obj_local);
                     const bool conflict = !finished || ncolor_cpp::has_conflict_csr(
                         indptr_.data(), indices_.data(), N, colors_.data());
                     bool a_ok = !conflict || ncolor_cpp::repair_coloring(
                         indptr_.data(), indices_.data(), N,
                         cur_n, std::max(4, max_depth), colors_);
-                    if (a_ok && (!wp || !conflict)) ok = true;
+                    // "WP must be clean" enforces the uniform-distribution
+                    // promise for the balanced path. For the weighted path
+                    // the user has opted into a perceptual objective and
+                    // accepts repair as part of the deal — otherwise the
+                    // WP-weighted result is silently dropped in favour of a
+                    // non-WP, non-weighted fallback (which defeats the point).
+                    const bool clean_wp_required = wp && !weighted_attempt;
+                    if (a_ok && (!clean_wp_required || !conflict)) ok = true;
                 }
             }
-            if (!ok) ++cur_n;
+            if (!ok) {
+                ++cur_n;
+                // ndim-aware floor on the FIRST failure only. Planar
+                // (ndim=2) inputs hit ≤ 4 colours by the 4-colour theorem,
+                // so the floor is a no-op there. For ndim ≥ 3 there's no
+                // such bound; empirically dense-blob inputs hit ~3·ndim − 2
+                // colours (more with wrap), so jumping directly to that
+                // floor skips 2-5 doomed sequential attempts on the
+                // fallback path. Triggered only after depth==0 fails, so
+                // user-supplied n_colors and planar workloads remain
+                // bit-identical to the pre-patch behaviour.
+                if (depth == 0 && ndim >= 3) {
+                    const int floor_n = 3 * ndim - 2 + (wrap ? 1 : 0);
+                    if (cur_n < floor_n) cur_n = floor_n;
+                }
+            }
         }
 
         int n_used = 0;
@@ -718,6 +930,10 @@ private:
     std::vector<int32_t> partials_;     // max-reduce partials, reused across calls
     std::vector<int32_t> src_idx_, dst_idx_;
     std::vector<int32_t> indptr_, indices_;
+    // Optional parallel-to-indices_ edge weights used by the boundary-
+    // weighted coloring path. Empty/unused for the default coloring.
+    // Real-valued to encode EDT-distance-based contact strength.
+    std::vector<double> edge_weights_;
     std::vector<uint8_t> colors_;
     std::vector<uint8_t> lut_;
     int last_n_conflicts_ = 0;
@@ -789,6 +1005,10 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("format_input") = true, py::arg("expand") = true,
              py::arg("out") = py::none(), py::arg("color_mode") = -1,
              py::arg("wrap") = false, py::arg("balance") = false,
+             py::arg("first_seen") = false,
+             py::arg("weight_objective") = 0,
+             py::arg("de_table") = py::none(),
+             py::arg("weight_mode") = 1,
              "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
              "Any ndim ≥ 2; conn ∈ [1, ndim].\n"
              "p selects the expand metric: p=1 (Saito-Toriwaki sweep,\n"
@@ -1056,4 +1276,88 @@ PYBIND11_MODULE(_impl, m) {
           "ndim → full diagonal (preserves 1-voxel skeletons). Isolated\n"
           "pixels (count == 0) are always preserved. ``max_iter`` < 0\n"
           "runs to convergence.");
+
+    m.def("kempe_sa",
+          [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> initial_colors,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indptr,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indices,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> twohop_indptr,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> twohop_indices,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> iou_indptr,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> iou_indices,
+             py::array_t<double,  py::array::c_style | py::array::forcecast> iou_weights,
+             int n_colors, double alpha_2hop, double gamma_iou,
+             int n_iters, double T0, double T_min, double alpha_cool,
+             uint64_t rng_seed) -> std::pair<py::array_t<uint8_t>, double>
+          {
+              const auto ic_buf = initial_colors.request();
+              const auto ai_buf = adj_indptr.request();
+              const auto ax_buf = adj_indices.request();
+              const auto ti_buf = twohop_indptr.request();
+              const auto tx_buf = twohop_indices.request();
+              const auto ii_buf = iou_indptr.request();
+              const auto ix_buf = iou_indices.request();
+              const auto iw_buf = iou_weights.request();
+              if (ai_buf.size < 1) throw std::invalid_argument(
+                  "kempe_sa: adj_indptr empty");
+              const int32_t N = static_cast<int32_t>(ai_buf.size - 1);
+              if (ic_buf.size != N) throw std::invalid_argument(
+                  "kempe_sa: initial_colors length must equal N");
+              if (ti_buf.size != N + 1) throw std::invalid_argument(
+                  "kempe_sa: twohop_indptr length must be N+1");
+              if (ii_buf.size != N + 1) throw std::invalid_argument(
+                  "kempe_sa: iou_indptr length must be N+1");
+              if (ix_buf.size != iw_buf.size) throw std::invalid_argument(
+                  "kempe_sa: iou_indices and iou_weights must have same length");
+
+              std::vector<uint8_t> colors(static_cast<size_t>(N));
+              std::memcpy(colors.data(), ic_buf.ptr,
+                          static_cast<size_t>(N) * sizeof(uint8_t));
+
+              ncolor_cpp::KempeSAParams params;
+              params.n_colors   = n_colors;
+              params.alpha_2hop = alpha_2hop;
+              params.gamma_iou  = gamma_iou;
+              params.n_iters    = n_iters;
+              params.T0         = T0;
+              params.T_min      = T_min;
+              params.alpha_cool = alpha_cool;
+              params.rng_seed   = rng_seed;
+
+              double best_loss = 0.0;
+              {
+                  py::gil_scoped_release release;
+                  best_loss = ncolor_cpp::kempe_sa(
+                      N,
+                      static_cast<const int32_t*>(ai_buf.ptr),
+                      static_cast<const int32_t*>(ax_buf.ptr),
+                      static_cast<const int32_t*>(ti_buf.ptr),
+                      static_cast<const int32_t*>(tx_buf.ptr),
+                      static_cast<const int32_t*>(ii_buf.ptr),
+                      static_cast<const int32_t*>(ix_buf.ptr),
+                      static_cast<const double*>(iw_buf.ptr),
+                      colors, params);
+              }
+
+              py::array_t<uint8_t> out({static_cast<py::ssize_t>(N)});
+              std::memcpy(out.request().ptr, colors.data(),
+                          static_cast<size_t>(N) * sizeof(uint8_t));
+              return {std::move(out), best_loss};
+          },
+          py::arg("initial_colors"),
+          py::arg("adj_indptr"), py::arg("adj_indices"),
+          py::arg("twohop_indptr"), py::arg("twohop_indices"),
+          py::arg("iou_indptr"), py::arg("iou_indices"), py::arg("iou_weights"),
+          py::arg("n_colors") = 4,
+          py::arg("alpha_2hop") = 1.0,
+          py::arg("gamma_iou") = 50.0,
+          py::arg("n_iters") = 30000,
+          py::arg("T0") = 2.0,
+          py::arg("T_min") = 0.001,
+          py::arg("alpha_cool") = 0.9998,
+          py::arg("rng_seed") = 0,
+          "Kempe-component simulated annealing for 4-coloring.\n"
+          "Loss = alpha_2hop · #2-hop_same + gamma_iou · sum(w · 1[same])\n"
+          "All CSR pair arrays must store both directions (u→v and v→u).\n"
+          "Returns (final_colors, best_loss).");
 }

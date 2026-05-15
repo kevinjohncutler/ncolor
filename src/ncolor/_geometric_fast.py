@@ -188,6 +188,81 @@ def _two_hop_neighbors_list(adj, N):
     return th
 
 
+def _csr_from_neighbors(neighbors_list, N, weights_list=None):
+    """Convert a 1-indexed adjacency-list-of-lists to a 0-indexed CSR
+    (indptr, indices [, weights]). neighbors_list[u] for u in 1..N is
+    the list of (neighbour_label) or (neighbour_label, weight) tuples."""
+    indptr = np.zeros(N + 1, dtype=np.int32)
+    for u in range(1, N + 1):
+        indptr[u] = indptr[u - 1] + len(neighbors_list[u])
+    total = indptr[N]
+    indices = np.zeros(total, dtype=np.int32)
+    if weights_list is not None:
+        weights = np.zeros(total, dtype=np.float64)
+    pos = 0
+    for u in range(1, N + 1):
+        for i, item in enumerate(neighbors_list[u]):
+            if weights_list is not None:
+                v, w = item
+                indices[pos] = v - 1  # 0-indexed
+                weights[pos] = w
+            else:
+                indices[pos] = item - 1
+            pos += 1
+    if weights_list is not None:
+        return indptr, indices, weights
+    return indptr, indices
+
+
+def kempe_sa_native(colors, adj, two_hop, iou_pairs_by_cell, N,
+                     alpha_2hop=1.0, gamma_iou=50.0,
+                     n_iters=30000, T0=2.0, T_min=0.001, alpha_cool=0.9998,
+                     rng_seed=0):
+    """C++ implementation of Kempe-SA. ~20-50x faster than the Python loop."""
+    from ._backend import _impl as _backend_impl
+    _kempe_sa_cpp = _backend_impl.kempe_sa
+
+    # Build CSR adjacency.
+    adj_list = [[] for _ in range(N + 1)]
+    for u in range(1, N + 1):
+        for v in adj[u]:
+            adj_list[u].append(v)
+    adj_indptr, adj_indices = _csr_from_neighbors(adj_list, N)
+
+    # 2-hop CSR (already in list form).
+    th_list = [[] for _ in range(N + 1)]
+    for u in range(1, N + 1):
+        for v in two_hop[u]:
+            th_list[u].append(v)
+    th_indptr, th_indices = _csr_from_neighbors(th_list, N)
+
+    # IoU CSR with weights.
+    iou_list = [[] for _ in range(N + 1)]
+    for u in range(1, N + 1):
+        for (v, s) in iou_pairs_by_cell[u]:
+            iou_list[u].append((v, s))
+    iou_indptr, iou_indices, iou_weights = _csr_from_neighbors(
+        iou_list, N, weights_list=iou_list)
+
+    # initial_colors: 0-indexed array of length N.
+    initial = np.array(colors[1:N + 1], dtype=np.uint8)
+    out_colors, best_loss = _kempe_sa_cpp(
+        initial_colors=initial,
+        adj_indptr=adj_indptr, adj_indices=adj_indices,
+        twohop_indptr=th_indptr, twohop_indices=th_indices,
+        iou_indptr=iou_indptr, iou_indices=iou_indices,
+        iou_weights=iou_weights,
+        n_colors=4, alpha_2hop=alpha_2hop, gamma_iou=gamma_iou,
+        n_iters=n_iters, T0=T0, T_min=T_min, alpha_cool=alpha_cool,
+        rng_seed=rng_seed,
+    )
+    # Back to 1-indexed list.
+    new_colors = [0] * (N + 1)
+    for i, c in enumerate(out_colors):
+        new_colors[i + 1] = int(c)
+    return new_colors, float(best_loss)
+
+
 def kempe_sa_fast(colors, adj, two_hop, iou_pairs_by_cell, N,
                    alpha_2hop=1.0, gamma_iou=50.0,
                    n_iters=30000, T0=2.0, T_min=0.001, alpha_cool=0.9998,
@@ -313,10 +388,10 @@ def label_geometric_fast(lab, p: int = 1, conn: int = 2,
     two_hop = _two_hop_neighbors_list(adj, N)
     if verbose: print(f"  2-hop lists: {time.time()-t_start:.2f}s")
 
-    # Kempe-SA with incremental loss.
-    colors, loss = kempe_sa_fast(colors, adj, two_hop, iou_pairs_by_cell, N,
-                                   alpha_2hop=alpha_2hop, gamma_iou=gamma_iou,
-                                   n_iters=sa_iters)
+    # Kempe-SA — C++ implementation.
+    colors, loss = kempe_sa_native(colors, adj, two_hop, iou_pairs_by_cell, N,
+                                     alpha_2hop=alpha_2hop, gamma_iou=gamma_iou,
+                                     n_iters=sa_iters)
     if verbose:
         print(f"  Kempe-SA: loss={loss:.2f}, {time.time()-t_start:.2f}s")
 
