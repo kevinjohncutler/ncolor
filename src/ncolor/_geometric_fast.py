@@ -105,6 +105,44 @@ def per_cell_geometry(m: np.ndarray, N: int):
     return geom
 
 
+def _approx_iou_from_geom(geom, max_dist_factor: float = 5.0,
+                            min_score: float = 0.02):
+    """Compute IoU pairs given an already-computed geometry dict (from
+    per_cell_geometry)."""
+    N = int(geom["N"])
+    if N < 2: return None, None, None
+    centroid_y = geom["centroid_y"][1:]
+    centroid_x = geom["centroid_x"][1:]
+    axis_y = geom["axis_y"][1:]
+    axis_x = geom["axis_x"][1:]
+    ecc = geom["ecc"][1:]
+    area = geom["area"][1:].astype(np.float64)
+    if area.size == 0 or area.sum() == 0:
+        return None, None, None
+    mean_radius = float(np.sqrt(area.mean() / np.pi))
+    max_dist = max_dist_factor * mean_radius
+    sigma = 2.0 * mean_radius
+
+    centroids = np.column_stack([centroid_y, centroid_x])
+    tree = KDTree(centroids)
+    pairs_idx = tree.query_pairs(r=max_dist, output_type="ndarray")
+    if len(pairs_idx) == 0: return None, None, None
+    i = pairs_idx[:, 0]; j = pairs_idx[:, 1]
+    axis_sim = np.abs(axis_y[i] * axis_y[j] + axis_x[i] * axis_x[j])
+    area_ij = np.column_stack([area[i], area[j]])
+    area_sim = area_ij.min(axis=1) / np.maximum(area_ij.max(axis=1), 1.0)
+    dy = centroid_y[i] - centroid_y[j]
+    dx = centroid_x[i] - centroid_x[j]
+    d2 = dy * dy + dx * dx
+    prox = np.exp(-d2 / (2.0 * sigma * sigma))
+    ecc_term = np.where((ecc[i] < 0.3) | (ecc[j] < 0.3), 0.3, ecc[i] * ecc[j])
+    scores = ecc_term * (axis_sim * axis_sim) * area_sim * prox
+    keep = scores >= min_score
+    return (i[keep].astype(np.int32),
+            j[keep].astype(np.int32),
+            scores[keep].astype(np.float64))
+
+
 def approximate_iou_similarity_cpp(m: np.ndarray,
                                      max_dist_factor: float = 5.0,
                                      min_score: float = 0.02):
@@ -417,16 +455,11 @@ def label_geometric_fast(lab, p: int = 1, conn: int = 2,
         adj[int(u)].add(int(v)); adj[int(v)].add(int(u))
     if verbose: print(f"  adjacency: N={N}, edges={sum(len(s) for s in adj.values())//2}, {time.time()-t_start:.2f}s")
 
-    # Seed: greedy. Extract per-cell colour via vectorised np.unique.
+    # Seed: greedy. The per-cell LUT extraction is fused into the C++
+    # geometry pass below (one image scan instead of two), so we only
+    # need the colour image itself here.
     nc_seed = _ncolor_label(lab_arr, expand=True, p=p, balance=True,
                               weight_objective=0)
-    flat_lab = lab_arr.ravel(); flat_nc = nc_seed.ravel()
-    unique_labels, first_idx = np.unique(flat_lab, return_index=True)
-    # Build 0-indexed initial_colors array directly (skip the 1-indexed
-    # Python list and the second copy in kempe_sa_native).
-    initial_colors = np.zeros(N, dtype=np.uint8)
-    valid = (unique_labels > 0) & (unique_labels <= N)
-    initial_colors[unique_labels[valid] - 1] = flat_nc[first_idx[valid]]
     if verbose: print(f"  greedy seed: {time.time()-t_start:.2f}s")
 
     # Build 1-hop CSR (0-indexed) from adj dict.
@@ -444,8 +477,12 @@ def label_geometric_fast(lab, p: int = 1, conn: int = 2,
     th_indptr, th_indices = _backend_impl.two_hop_csr(adj_indptr, adj_indices)
     if verbose: print(f"  2-hop CSR: {th_indices.size} edges, {time.time()-t_start:.2f}s")
 
-    # Approximate IoU pairs via C++ geometry + vectorised scoring.
-    pair_u, pair_v, pair_w, geom = approximate_iou_similarity_cpp(lab_arr)
+    # FUSED: C++ geometry + per-cell LUT extraction in one image pass.
+    geom = _backend_impl.per_cell_geometry(np.ascontiguousarray(lab_arr),
+                                            np.ascontiguousarray(nc_seed))
+    initial_colors = geom["lut"][1:].astype(np.uint8)
+    # Approximate IoU pairs from the geometry arrays.
+    pair_u, pair_v, pair_w = _approx_iou_from_geom(geom)
     if pair_u is None:
         pair_u = np.zeros(0, dtype=np.int32)
         pair_v = np.zeros(0, dtype=np.int32)

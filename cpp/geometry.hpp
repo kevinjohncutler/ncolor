@@ -27,13 +27,20 @@ struct CellGeom {
 template <typename L>
 inline void per_cell_geometry(
     const L* labels, int64_t H, int64_t W, int32_t N,
-    std::vector<CellGeom>& out)
+    std::vector<CellGeom>& out,
+    // Optional: extract a per-label LUT from a second label image
+    // (e.g. an existing 4-colouring) in the same pixel pass. Saves a
+    // separate np.unique on the input label image, which scales as
+    // O(M log N) and dominated geometric_fast's runtime at high N.
+    const uint8_t* second_lookup = nullptr,
+    uint8_t* second_lut_out = nullptr)
 {
     // Accumulate moments per label in one image pass.
     const size_t Nplus = static_cast<size_t>(N) + 1;
     std::vector<int64_t> n(Nplus, 0);
     std::vector<double>  sy(Nplus, 0.0), sx(Nplus, 0.0);
     std::vector<double>  syy(Nplus, 0.0), sxx(Nplus, 0.0), sxy(Nplus, 0.0);
+    if (second_lut_out) std::fill(second_lut_out, second_lut_out + Nplus, 0);
     const int64_t HW = H * W;
     for (int64_t i = 0; i < HW; ++i) {
         const int64_t lab = static_cast<int64_t>(labels[i]);
@@ -46,6 +53,11 @@ inline void per_cell_geometry(
             syy[lab] += y * y;
             sxx[lab] += x * x;
             sxy[lab] += y * x;
+            // First-pixel LUT (only writes once per label since 0 = unset
+            // and we only write when the slot is still 0).
+            if (second_lookup && second_lut_out && second_lut_out[lab] == 0) {
+                second_lut_out[lab] = second_lookup[i];
+            }
         }
     }
     out.assign(Nplus, CellGeom{0.0, 0.0, 1.0, 0.0, 0.0, 0});

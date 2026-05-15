@@ -123,11 +123,11 @@ def relabel_for_display(label_image: np.ndarray, m: np.ndarray,
         if len(ys):
             labels[u] = int(label_image[ys[0], xs[0]])
 
-    # Edge weights.
+    # Edge weights — vectorised boundary-pixel count.
     edges_w: Dict[Tuple[int, int], float] = {}
     if weight_mode == "boundary":
-        # Count shared boundary pixel-pairs in the expanded image.
         H, W = expanded.shape
+        packed_chunks = []
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):
                 if dy == 0 and dx == 0: continue
@@ -135,13 +135,20 @@ def relabel_for_display(label_image: np.ndarray, m: np.ndarray,
                 x_a = slice(max(0, dx), W + min(0, dx))
                 y_b = slice(max(0, -dy), H + min(0, -dy))
                 x_b = slice(max(0, -dx), W + min(0, -dx))
-                a = expanded[y_a, x_a]; b = expanded[y_b, x_b]
+                a = expanded[y_a, x_a].ravel()
+                b = expanded[y_b, x_b].ravel()
                 mask = (a != b) & (a > 0) & (b > 0)
-                ays, axs = np.where(mask)
-                for y, x in zip(ays, axs):
-                    u, v = int(a[y, x]), int(b[y, x])
-                    if u > v: u, v = v, u
-                    edges_w[(u, v)] = edges_w.get((u, v), 0.0) + 1.0
+                if not mask.any(): continue
+                lo = np.minimum(a[mask], b[mask]).astype(np.int64)
+                hi = np.maximum(a[mask], b[mask]).astype(np.int64)
+                packed_chunks.append((hi << 32) | lo)
+        if packed_chunks:
+            all_packed = np.concatenate(packed_chunks)
+            uniq, counts = np.unique(all_packed, return_counts=True)
+            lo_arr = (uniq & 0xFFFFFFFF).astype(np.int64)
+            hi_arr = (uniq >> 32).astype(np.int64)
+            for u, v, w in zip(lo_arr, hi_arr, counts):
+                edges_w[(int(u), int(v))] = float(w)
     else:  # uniform
         for u, v in pairs:
             u, v = int(u), int(v)

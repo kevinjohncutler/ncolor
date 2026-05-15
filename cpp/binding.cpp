@@ -1279,7 +1279,7 @@ PYBIND11_MODULE(_impl, m) {
           "runs to convergence.");
 
     m.def("per_cell_geometry",
-          [](py::array labels) -> py::dict {
+          [](py::array labels, py::object second_image) -> py::dict {
               if (!(labels.flags() & py::array::c_style)) {
                   labels = py::array::ensure(labels, py::array::c_style);
               }
@@ -1289,8 +1289,27 @@ PYBIND11_MODULE(_impl, m) {
               const int64_t H = static_cast<int64_t>(buf.shape[0]);
               const int64_t W = static_cast<int64_t>(buf.shape[1]);
 
+              // Optional second image (e.g. a precomputed 4-colouring) —
+              // its first-pixel value per input label is written into the
+              // returned ``lut`` array, fused with the geometry pass.
+              const uint8_t* second_ptr = nullptr;
+              py::buffer_info second_buf;
+              if (!second_image.is_none()) {
+                  auto arr = py::array_t<uint8_t,
+                      py::array::c_style | py::array::forcecast>::ensure(second_image);
+                  if (!arr) throw std::invalid_argument(
+                      "per_cell_geometry: second image must be uint8");
+                  second_buf = arr.request();
+                  if (second_buf.ndim != 2 || second_buf.shape[0] != H
+                      || second_buf.shape[1] != W)
+                      throw std::invalid_argument(
+                          "per_cell_geometry: second image shape mismatch");
+                  second_ptr = static_cast<const uint8_t*>(second_buf.ptr);
+              }
+
               std::vector<ncolor_cpp::CellGeom> out;
               int32_t N = 0;
+              std::vector<uint8_t> lut_vec;  // length N+1
 
               dispatch_int_dtype(buf.format, buf.itemsize, "per_cell_geometry",
                   [&](auto* tag) {
@@ -1304,8 +1323,11 @@ PYBIND11_MODULE(_impl, m) {
                           if (v > mx) mx = v;
                       }
                       N = static_cast<int32_t>(mx);
+                      lut_vec.assign(static_cast<size_t>(N) + 1, 0);
                       py::gil_scoped_release release;
-                      ncolor_cpp::per_cell_geometry<T>(src, H, W, N, out);
+                      ncolor_cpp::per_cell_geometry<T>(
+                          src, H, W, N, out,
+                          second_ptr, second_ptr ? lut_vec.data() : nullptr);
                   });
               // Pack into 1-indexed numpy arrays (length N+1).
               py::array_t<double>  cy({static_cast<py::ssize_t>(N + 1)});
@@ -1330,11 +1352,21 @@ PYBIND11_MODULE(_impl, m) {
               d["axis_y"] = ay; d["axis_x"] = ax;
               d["ecc"] = ecc; d["area"] = area;
               d["N"] = N;
+              if (second_ptr) {
+                  py::array_t<uint8_t> lut({static_cast<py::ssize_t>(N + 1)});
+                  std::memcpy(lut.request().ptr, lut_vec.data(),
+                              (N + 1) * sizeof(uint8_t));
+                  d["lut"] = lut;
+              }
               return d;
           },
-          py::arg("labels"),
+          py::arg("labels"), py::arg("second_image") = py::none(),
           "Per-cell geometric features in a single image pass.\n"
-          "Returns dict of 1-indexed arrays: centroid_y/x, axis_y/x, ecc, area, N.");
+          "Returns dict of 1-indexed arrays: centroid_y/x, axis_y/x, ecc, area, N.\n"
+          "If `second_image` (uint8, same shape) is provided, also returns\n"
+          "`lut[u]` = first-pixel value of that image at label u — fuses\n"
+          "the per-cell colour extraction into the geometry pass (replaces\n"
+          "np.unique on the label image).");
 
     m.def("two_hop_csr",
           [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indptr,
