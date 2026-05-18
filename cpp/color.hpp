@@ -167,8 +167,46 @@ inline bool color_graph_csr_legacy(
         for (int32_t i = 0; i < N; ++i) {
             q[wpos[deg[i]]++] = i;
         }
+        // Shuffle WITHIN each degree bucket — same-degree vertices were
+        // in natural ID order, which makes parallel attempts with
+        // different `offset` values produce highly correlated visit
+        // orders (degree-ties broken identically). Shuffling
+        // diversifies attempts genuinely: different `offset` ⇒
+        // different bucket permutations ⇒ different greedy outcome on
+        // adversarial graphs (heuristic 4-coloring can be order-fragile).
+        // Fisher-Yates per bucket, seeded from `offset + 1` so even
+        // offset=0 produces a non-identity shuffle (the natural-order
+        // result is what slot 0 used to give; diversifying it too
+        // increases the parallel-attempts' independent success
+        // probability).
+        {
+            int32_t bucket_start = 0;
+            const uint64_t seed_base = ((uint64_t)offset + 1)
+                * 0x9e3779b97f4a7c15ULL;
+            for (int32_t d = max_deg; d >= 0; --d) {
+                const int32_t bucket_size = bucket_head[d + 1];
+                if (bucket_size > 1) {
+                    uint64_t rs = seed_base
+                        ^ ((uint64_t)d * 0xc6a4a7935bd1e995ULL);
+                    for (int32_t i = bucket_size - 1; i > 0; --i) {
+                        rs = rs * 6364136223846793005ULL + 1442695040888963407ULL;
+                        const int32_t j = (int32_t)((rs >> 32) % (uint32_t)(i + 1));
+                        std::swap(q[bucket_start + i], q[bucket_start + j]);
+                    }
+                }
+                bucket_start += bucket_size;
+            }
+        }
     } else {
+        // BFS path: diversify the natural-ID-order queue too. Each
+        // attempt's `offset` gives a different starting permutation.
         for (int32_t i = 0; i < N; ++i) q[i] = i;
+        uint64_t rs = ((uint64_t)offset + 1) * 0x9e3779b97f4a7c15ULL;
+        for (int32_t i = N - 1; i > 0; --i) {
+            rs = rs * 6364136223846793005ULL + 1442695040888963407ULL;
+            const int32_t j = (int32_t)((rs >> 32) % (uint32_t)(i + 1));
+            std::swap(q[i], q[j]);
+        }
     }
 
     const uint32_t fullmask = (1u << (n_colors + 1)) - 2;

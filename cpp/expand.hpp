@@ -169,8 +169,14 @@ inline void envelope_pass_row_impl(
     };
 
     if constexpr (Wrap) {
-        // Pass 1a: ghost seeds at v - N (i ∈ [-N, 0), source from i + N).
-        for (int64_t i = -N; i < 0; ++i) {
+        // Pass 1a: ghost seeds at v - N (i ∈ [-N, 0), source v = i + N).
+        // A ghost-left v - N is everywhere ≥ its real counterpart v over
+        // [0, N) when v ≤ N/2 (crossover at i = v - N/2 ≤ 0), so it can
+        // never win the envelope and we skip the push. Equivalently, only
+        // ghost positions with i > -N/2 contribute. Smallest integer i
+        // satisfying i > -N/2 strictly is -((N - 1) / 2).
+        const int64_t pass1a_start = -((N - 1) / 2);
+        for (int64_t i = pass1a_start; i < 0; ++i) {
             const int32_t lv = load_lbl(i + N);
             if (lv == 0) continue;
             push_seed(i, lv, load_dist(i + N));
@@ -183,8 +189,12 @@ inline void envelope_pass_row_impl(
         push_seed(i, lv, load_dist(i));
     }
     if constexpr (Wrap) {
-        // Pass 1c: ghost seeds at v + N (i ∈ [N, 2N), source from i - N).
-        for (int64_t i = N; i < 2 * N; ++i) {
+        // Pass 1c: ghost seeds at v + N (i ∈ [N, 2N), source v = i - N).
+        // Symmetric to 1a: ghost-right is dominated by its real when
+        // v ≥ N/2. Stop at i = N + ceil(N/2) exclusive ((N + 1)/2 in
+        // integer arithmetic).
+        const int64_t pass1c_end = N + (N + 1) / 2;
+        for (int64_t i = N; i < pass1c_end; ++i) {
             const int32_t lv = load_lbl(i - N);
             if (lv == 0) continue;
             push_seed(i, lv, load_dist(i - N));

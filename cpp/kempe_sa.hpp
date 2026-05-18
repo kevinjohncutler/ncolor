@@ -32,6 +32,12 @@ struct KempeSAParams {
     double alpha_2hop  = 1.0;
     double gamma_iou   = 50.0;
     int    n_iters     = 30000;
+    // Stop early once no improvement to best_loss is seen for this many
+    // consecutive iterations. The SA loss plateaus quickly in practice
+    // (typically by 500-1000 iters), so n_iters acts as a safety cap
+    // and patience is what actually terminates most calls. Set to <=0
+    // to disable early-stop.
+    int    patience    = 1000;
     double T0          = 2.0;
     double T_min       = 0.001;
     double alpha_cool  = 0.9998;
@@ -83,9 +89,13 @@ inline double kempe_sa(
     std::vector<uint8_t> in_comp(static_cast<size_t>(N), 0);
 
     double T = params.T0;
+    int last_improvement_it = 0;
 
     // --- Main loop. ---
     for (int it = 0; it < params.n_iters; ++it) {
+        if (params.patience > 0 && (it - last_improvement_it) > params.patience) {
+            break;
+        }
         // Random cell.
         const int32_t u = static_cast<int32_t>(rand01(rng) * N);
         const uint8_t cu = colors[u];
@@ -168,6 +178,7 @@ inline double kempe_sa(
             if (cur_loss < best_loss) {
                 best_loss = cur_loss;
                 best_colors = colors;
+                last_improvement_it = it;
             }
         }
 

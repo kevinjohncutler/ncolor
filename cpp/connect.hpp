@@ -47,6 +47,28 @@ constexpr uint64_t HT_EMPTY = 0xFFFFFFFFFFFFFFFFull;
 // Knuth's golden-ratio multiplicative hash (matches ncolor's @njit constant).
 constexpr uint64_t HT_HASH_MUL = 11400714819323198485ull;
 
+// Per-pair reducer for the boundary-weighted coloring path. Picks what
+// statistic of (d_i + d_j) over the shared-boundary pixels to track.
+// "Off" disables weighting and matches the default unweighted find_pairs.
+enum class ReduceMode : int {
+    Off       = 0,
+    Min       = 1,   // min(d) — closest physical approach
+    Max       = 2,   // max(d) — farthest contact point
+    Mean      = 3,   // sum(d) + count → mean = sum/count
+    Count     = 4,   // boundary length only (ignores distance)
+    Harmonic  = 5,   // sum(1 / (1 + d)) — length AND closeness combined
+    MeanInv   = 6,   // sum(1 / (1 + d)) / count — length-normalized harmonic
+};
+constexpr bool mode_uses_primary(ReduceMode m) {
+    return m == ReduceMode::Min || m == ReduceMode::Max ||
+           m == ReduceMode::Mean || m == ReduceMode::Harmonic ||
+           m == ReduceMode::MeanInv;
+}
+constexpr bool mode_uses_count(ReduceMode m) {
+    return m == ReduceMode::Mean || m == ReduceMode::Count ||
+           m == ReduceMode::MeanInv;
+}
+
 // Realistic upper bound for ndim. Used to size stack-allocated coord
 // arrays in the scan kernels. Limits exotic >16D inputs; the public
 // dispatcher rejects ndim above this.
@@ -72,6 +94,97 @@ inline void ht_merge(const uint64_t* src, uint64_t* dst, uint64_t ht_size) {
     }
 }
 
+// Templated variants that maintain optional parallel reducer arrays
+// (``primary`` double-valued, ``counts`` int32) alongside the dedup
+// table. The Mode template parameter selects which reducer to compute;
+// branches are eliminated at compile time so the only cost is the
+// updates actually needed for that mode.
+//
+// Per slot storage layouts (only fields used by the mode are touched):
+//   Min:      primary holds min(d) seen so far. counts unused.
+//   Max:      primary holds max(d). counts unused.
+//   Mean:     primary holds sum(d). counts holds the pair-pixel count.
+//   Count:    counts holds the count. primary unused.
+//   Harmonic: primary holds sum(1 / (1 + d)). counts unused.
+template <ReduceMode Mode>
+inline void ht_insert_acc(uint64_t* ht, double* primary, int32_t* counts,
+                          uint64_t ht_mask, uint64_t key, int32_t cost) {
+    uint64_t h = (key * HT_HASH_MUL) & ht_mask;
+    while (ht[h] != HT_EMPTY && ht[h] != key) {
+        h = (h + 1) & ht_mask;
+    }
+    const bool is_new = (ht[h] == HT_EMPTY);
+    if (is_new) ht[h] = key;
+
+    if constexpr (Mode == ReduceMode::Min) {
+        if (is_new || static_cast<double>(cost) < primary[h])
+            primary[h] = static_cast<double>(cost);
+    } else if constexpr (Mode == ReduceMode::Max) {
+        if (is_new || static_cast<double>(cost) > primary[h])
+            primary[h] = static_cast<double>(cost);
+    } else if constexpr (Mode == ReduceMode::Mean) {
+        if (is_new) { primary[h] = static_cast<double>(cost); counts[h] = 1; }
+        else        { primary[h] += static_cast<double>(cost); counts[h] += 1; }
+    } else if constexpr (Mode == ReduceMode::Count) {
+        if (is_new) counts[h] = 1; else counts[h] += 1;
+    } else if constexpr (Mode == ReduceMode::Harmonic) {
+        const double contrib = 1.0 / (1.0 + static_cast<double>(cost));
+        if (is_new) primary[h] = contrib; else primary[h] += contrib;
+    } else if constexpr (Mode == ReduceMode::MeanInv) {
+        const double contrib = 1.0 / (1.0 + static_cast<double>(cost));
+        if (is_new) { primary[h] = contrib; counts[h] = 1; }
+        else        { primary[h] += contrib; counts[h] += 1; }
+    }
+    // ReduceMode::Off: nothing else to do; key already inserted above.
+}
+
+template <ReduceMode Mode>
+inline void ht_merge_acc(const uint64_t* src_ht,
+                         const double* src_primary, const int32_t* src_counts,
+                         uint64_t* dst_ht,
+                         double* dst_primary, int32_t* dst_counts,
+                         uint64_t ht_size) {
+    const uint64_t ht_mask = ht_size - 1;
+    for (uint64_t h = 0; h < ht_size; ++h) {
+        const uint64_t key = src_ht[h];
+        if (key == HT_EMPTY) continue;
+        uint64_t dh = (key * HT_HASH_MUL) & ht_mask;
+        while (dst_ht[dh] != HT_EMPTY && dst_ht[dh] != key) {
+            dh = (dh + 1) & ht_mask;
+        }
+        const bool is_new = (dst_ht[dh] == HT_EMPTY);
+        if (is_new) dst_ht[dh] = key;
+        if constexpr (Mode == ReduceMode::Min) {
+            if (is_new || src_primary[h] < dst_primary[dh]) dst_primary[dh] = src_primary[h];
+        } else if constexpr (Mode == ReduceMode::Max) {
+            if (is_new || src_primary[h] > dst_primary[dh]) dst_primary[dh] = src_primary[h];
+        } else if constexpr (Mode == ReduceMode::Mean ||
+                             Mode == ReduceMode::MeanInv) {
+            if (is_new) { dst_primary[dh] = src_primary[h]; dst_counts[dh] = src_counts[h]; }
+            else        { dst_primary[dh] += src_primary[h]; dst_counts[dh] += src_counts[h]; }
+        } else if constexpr (Mode == ReduceMode::Count) {
+            if (is_new) dst_counts[dh] = src_counts[h]; else dst_counts[dh] += src_counts[h];
+        } else if constexpr (Mode == ReduceMode::Harmonic) {
+            if (is_new) dst_primary[dh] = src_primary[h]; else dst_primary[dh] += src_primary[h];
+        }
+    }
+}
+
+// Backward-compat aliases (the old Min-only API surface).
+inline void ht_insert_min(uint64_t* ht, int32_t* mins, uint64_t ht_mask,
+                          uint64_t key, int32_t cost) {
+    uint64_t h = (key * HT_HASH_MUL) & ht_mask;
+    while (ht[h] != HT_EMPTY && ht[h] != key) {
+        h = (h + 1) & ht_mask;
+    }
+    if (ht[h] == HT_EMPTY) {
+        ht[h] = key;
+        mins[h] = cost;
+    } else if (cost < mins[h]) {
+        mins[h] = cost;
+    }
+}
+
 // =============================================================================
 // ND unpadded find_pairs.
 //
@@ -94,22 +207,26 @@ namespace detail {
 // Caller uses this to size the per-thread hashtables in Solver. The full
 // (dc, flat_offset) tuples come from build_forward_neighbours below; this
 // is a cheap wrapper that just iterates the same odometer.
-inline int64_t count_forward_neighbours(int ndim, int conn) {
-    if (ndim < 1) return 0;
+inline int64_t count_forward_neighbours(int ndim, int conn, int radius = 1) {
+    if (ndim < 1 || radius < 1) return 0;
     int64_t n_fwd = 0;
-    std::vector<int8_t> dc(ndim, -1);
+    std::vector<int8_t> dc(ndim, (int8_t)-radius);
     while (true) {
         int n_nz = 0, first_nz = -1;
         for (int d = 0; d < ndim; ++d) if (dc[d] != 0) {
             if (first_nz < 0) first_nz = d;
             ++n_nz;
         }
-        if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] == 1) ++n_fwd;
+        // Forward-only: first nonzero coord is positive. Generalises the
+        // radius=1 condition `dc[first_nz] == 1` so the predicate works
+        // for any radius (positive offset in row-major order ⇒ greater
+        // flat index ⇒ each undirected pair emitted at most once).
+        if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] > 0) ++n_fwd;
         int d = ndim - 1;
         while (d >= 0) {
             ++dc[d];
-            if (dc[d] <= 1) break;
-            dc[d] = -1;
+            if (dc[d] <= radius) break;
+            dc[d] = (int8_t)-radius;
             --d;
         }
         if (d < 0) break;
@@ -123,33 +240,56 @@ inline void build_forward_neighbours(
         const std::vector<int64_t>& shape, int conn,
         std::vector<int64_t>& strides_out,
         std::vector<int64_t>& nb_flat_out,
-        std::vector<int8_t>& nb_dc_out) {
+        std::vector<int8_t>& nb_dc_out,
+        int radius = 1) {
     const int ndim = static_cast<int>(shape.size());
     strides_out.assign(ndim, 1);
     for (int d = ndim - 2; d >= 0; --d) strides_out[d] = strides_out[d + 1] * shape[d + 1];
     nb_flat_out.clear();
     nb_dc_out.clear();
-    std::vector<int8_t> dc(ndim, -1);
+    if (radius < 1) return;
+    // First collect (cheb_distance, flat_offset, dc[]) tuples, then sort
+    // by Chebyshev distance ascending. This emits the SHORTEST (highest-
+    // confidence) edges first when iterated per pixel — radius=1 1-NN
+    // neighbours before radius=2 gap-bridging neighbours.
+    // Principle: WP greedy commits early choices firmly; let the
+    // physically-adjacent constraints drive those, and let the
+    // corrective wider-radius constraints fill in afterwards.
+    std::vector<std::tuple<int, int64_t, std::vector<int8_t>>> cands;
+    std::vector<int8_t> dc(ndim, (int8_t)-radius);
     while (true) {
-        int n_nz = 0, first_nz = -1;
-        for (int d = 0; d < ndim; ++d) if (dc[d] != 0) {
-            if (first_nz < 0) first_nz = d;
-            ++n_nz;
+        int n_nz = 0, first_nz = -1, cheb = 0;
+        for (int d = 0; d < ndim; ++d) {
+            const int a = dc[d] < 0 ? -dc[d] : dc[d];
+            if (a > cheb) cheb = a;
+            if (dc[d] != 0) {
+                if (first_nz < 0) first_nz = d;
+                ++n_nz;
+            }
         }
-        if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] == 1) {
+        // Forward-only: first nonzero coord positive. See count_forward_neighbours.
+        if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] > 0) {
             int64_t off = 0;
             for (int d = 0; d < ndim; ++d) off += static_cast<int64_t>(dc[d]) * strides_out[d];
-            nb_flat_out.push_back(off);
-            for (int d = 0; d < ndim; ++d) nb_dc_out.push_back(dc[d]);
+            cands.emplace_back(cheb, off, dc);
         }
         int d = ndim - 1;
         while (d >= 0) {
             ++dc[d];
-            if (dc[d] <= 1) break;
-            dc[d] = -1;
+            if (dc[d] <= radius) break;
+            dc[d] = (int8_t)-radius;
             --d;
         }
         if (d < 0) break;
+    }
+    // Stable sort by Chebyshev distance ascending (ties keep odometer order).
+    std::stable_sort(cands.begin(), cands.end(),
+        [](const auto& a, const auto& b) {
+            return std::get<0>(a) < std::get<0>(b);
+        });
+    for (auto& c : cands) {
+        nb_flat_out.push_back(std::get<1>(c));
+        for (int8_t v : std::get<2>(c)) nb_dc_out.push_back(v);
     }
 }
 
@@ -160,16 +300,20 @@ inline void build_forward_neighbours(
 // offsets. Templated on ``N_NBS`` so the per-pixel inner loop unrolls;
 // the offsets are hoisted into local int64s so the compiler keeps them
 // in registers across the x sweep.
-template <typename T, int N_NBS>
+template <typename T, int N_NBS, ReduceMode Mode = ReduceMode::Off>
 static inline void scan_inner_axis_fast(
         const T* row, int64_t x_start, int64_t x_end,
-        const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask) {
+        const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask,
+        const int32_t* dist_row = nullptr,
+        double* primary = nullptr, int32_t* counts = nullptr) {
     int64_t nb[N_NBS];
     for (int i = 0; i < N_NBS; ++i) nb[i] = nb_flat[i];
     for (int64_t x = x_start; x < x_end; ++x) {
         const T vi = row[x];
         if (vi == 0) continue;
         const T* p = row + x;
+        int32_t di = 0;
+        if constexpr (Mode != ReduceMode::Off) di = dist_row[x];
         // Compile-time-bounded; clang/gcc fully unroll the loop. MSVC
         // doesn't have a portable unroll pragma — its loop unroller
         // handles N_NBS ≤ 16 fine without a hint.
@@ -181,29 +325,45 @@ static inline void scan_inner_axis_fast(
             if (vj == 0 || vj == vi) continue;
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
-            ht_insert(ht, ht_mask,
-                (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+            const uint64_t key = (static_cast<uint64_t>(lo) << 32) |
+                                 static_cast<uint64_t>(hi);
+            if constexpr (Mode == ReduceMode::Off) {
+                ht_insert(ht, ht_mask, key);
+            } else {
+                const int32_t dj = dist_row[x + nb[k]];
+                ht_insert_acc<Mode>(ht, primary, counts, ht_mask, key, di + dj);
+            }
         }
     }
 }
 
 // Runtime-N_NBS fallback for cases that don't hit the dispatch table
 // (e.g. ndim ≥ 5 with custom conn). Identical body, just no unroll.
-template <typename T>
+template <typename T, ReduceMode Mode = ReduceMode::Off>
 static inline void scan_inner_axis_fast_runtime(
         const T* row, int64_t x_start, int64_t x_end,
-        int n_nbs, const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask) {
+        int n_nbs, const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask,
+        const int32_t* dist_row = nullptr,
+        double* primary = nullptr, int32_t* counts = nullptr) {
     for (int64_t x = x_start; x < x_end; ++x) {
         const T vi = row[x];
         if (vi == 0) continue;
         const T* p = row + x;
+        int32_t di = 0;
+        if constexpr (Mode != ReduceMode::Off) di = dist_row[x];
         for (int k = 0; k < n_nbs; ++k) {
             const T vj = p[nb_flat[k]];
             if (vj == 0 || vj == vi) continue;
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
-            ht_insert(ht, ht_mask,
-                (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+            const uint64_t key = (static_cast<uint64_t>(lo) << 32) |
+                                 static_cast<uint64_t>(hi);
+            if constexpr (Mode == ReduceMode::Off) {
+                ht_insert(ht, ht_mask, key);
+            } else {
+                const int32_t dj = dist_row[x + nb_flat[k]];
+                ht_insert_acc<Mode>(ht, primary, counts, ht_mask, key, di + dj);
+            }
         }
     }
 }
@@ -212,17 +372,26 @@ static inline void scan_inner_axis_fast_runtime(
 // (ndim, conn): 2D conn=1 → 2; 2D conn=2 → 4; 3D conn=1 → 3; conn=2 → 9;
 // conn=3 → 13. Other counts (5D+ or non-default conn) take the runtime
 // fallback.
-template <typename T>
+template <typename T, ReduceMode Mode = ReduceMode::Off>
 static inline void scan_inner_axis_dispatch(
         const T* row, int64_t x_start, int64_t x_end,
-        int n_nbs, const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask) {
+        int n_nbs, const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask,
+        const int32_t* dist_row = nullptr,
+        double* primary = nullptr, int32_t* counts = nullptr) {
     switch (n_nbs) {
-        case 2:  scan_inner_axis_fast<T, 2 >(row, x_start, x_end, nb_flat, ht, ht_mask); break;
-        case 3:  scan_inner_axis_fast<T, 3 >(row, x_start, x_end, nb_flat, ht, ht_mask); break;
-        case 4:  scan_inner_axis_fast<T, 4 >(row, x_start, x_end, nb_flat, ht, ht_mask); break;
-        case 9:  scan_inner_axis_fast<T, 9 >(row, x_start, x_end, nb_flat, ht, ht_mask); break;
-        case 13: scan_inner_axis_fast<T, 13>(row, x_start, x_end, nb_flat, ht, ht_mask); break;
-        default: scan_inner_axis_fast_runtime<T>(row, x_start, x_end, n_nbs, nb_flat, ht, ht_mask); break;
+        case 2:  scan_inner_axis_fast<T, 2,  Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
+        case 3:  scan_inner_axis_fast<T, 3,  Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
+        case 4:  scan_inner_axis_fast<T, 4,  Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
+        // n_nbs=6: 2D conn=1 radius=2 (cross-shape gap-bridging).
+        case 6:  scan_inner_axis_fast<T, 6,  Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
+        case 9:  scan_inner_axis_fast<T, 9,  Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
+        // n_nbs=12: 2D conn=2 radius=2 (square-shape gap-bridging) —
+        // the default `connect_radius=2` augmented-graph path. Without
+        // this case the inner-axis kernel fell into the runtime-N_NBS
+        // fallback (no unroll), which dominated find_pairs cost.
+        case 12: scan_inner_axis_fast<T, 12, Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
+        case 13: scan_inner_axis_fast<T, 13, Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
+        default: scan_inner_axis_fast_runtime<T, Mode>(row, x_start, x_end, n_nbs, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
     }
 }
 
@@ -231,19 +400,30 @@ static inline void scan_inner_axis_dispatch(
 // the pre-computed flat offsets in nb_flat; boundary pixels rebuild offsets
 // per-axis (with optional wrap). `Wrap` is templated so the boundary path
 // has no runtime cost when it's off.
-template <typename T, bool Wrap = false>
+template <typename T, bool Wrap = false, ReduceMode Mode = ReduceMode::Off>
 inline void scan_band_unpadded(
         const T* lbl, const std::vector<int64_t>& shape,
         const int64_t* strides, const int64_t* nb_flat,
         const int8_t* nb_dc, int n_nbs,
         int64_t outer_start, int64_t outer_end,
-        uint64_t* ht, uint64_t ht_mask) {
+        uint64_t* ht, uint64_t ht_mask,
+        const int32_t* dist = nullptr,
+        double* primary = nullptr, int32_t* counts = nullptr,
+        int radius = 1) {
     const int ndim = static_cast<int>(shape.size());
-    auto emit_pair = [ht_mask](uint64_t* h, T vi, T vj) {
+    auto emit_pair = [ht_mask, primary, counts](uint64_t* h, T vi, T vj,
+                                                  int32_t di, int32_t dj) {
+        (void)primary; (void)counts;  // unused when Mode == Off
         if (vj == 0 || vj == vi) return;
         const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
         const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
-        ht_insert(h, ht_mask, (lo << 32) | hi);
+        const uint64_t key = (lo << 32) | hi;
+        if constexpr (Mode == ReduceMode::Off) {
+            (void)di; (void)dj;
+            ht_insert(h, ht_mask, key);
+        } else {
+            ht_insert_acc<Mode>(h, primary, counts, ht_mask, key, di + dj);
+        }
     };
     // Boundary scan kernel.
     //   Wrap=false (default): out-of-bounds neighbours are skipped — matches
@@ -255,6 +435,8 @@ inline void scan_band_unpadded(
     auto scan_pixel_checked = [&](const int64_t* coords, uint32_t bnd_mask, int64_t flat) {
         const T vi = lbl[flat];
         if (vi == 0) return;
+        int32_t di = 0;
+        if constexpr (Mode != ReduceMode::Off) di = dist[flat];
         for (int k = 0; k < n_nbs; ++k) {
             const int8_t* dc = nb_dc + k * ndim;
             if constexpr (Wrap) {
@@ -265,7 +447,9 @@ inline void scan_band_unpadded(
                     else if (nc >= shape[d]) nc -= shape[d];
                     neigh_flat += nc * strides[d];
                 }
-                emit_pair(ht, vi, lbl[neigh_flat]);
+                int32_t dj = 0;
+                if constexpr (Mode != ReduceMode::Off) dj = dist[neigh_flat];
+                emit_pair(ht, vi, lbl[neigh_flat], di, dj);
             } else {
                 bool valid = true;
                 uint32_t m = bnd_mask;
@@ -275,7 +459,11 @@ inline void scan_band_unpadded(
                     const int64_t nc = coords[d] + dc[d];
                     if (nc < 0 || nc >= shape[d]) { valid = false; break; }
                 }
-                if (valid) emit_pair(ht, vi, lbl[flat + nb_flat[k]]);
+                if (valid) {
+                    int32_t dj = 0;
+                    if constexpr (Mode != ReduceMode::Off) dj = dist[flat + nb_flat[k]];
+                    emit_pair(ht, vi, lbl[flat + nb_flat[k]], di, dj);
+                }
             }
         }
     };
@@ -295,31 +483,41 @@ inline void scan_band_unpadded(
     coords[0] = outer_start;
     uint32_t outer_bnd = 0;                   // bnd mask for coords[0..ndim-2]
     for (int d = 0; d < inner; ++d) {
-        if (coords[d] == 0 || coords[d] >= shape[d] - 1) outer_bnd |= (1u << d);
+        if (coords[d] < radius || coords[d] >= shape[d] - radius) outer_bnd |= (1u << d);
     }
     // Compute base flat offset for (coords[0..ndim-2], inner=0).
     int64_t row_base = 0;
     for (int d = 0; d < inner; ++d) row_base += coords[d] * strides[d];
     const int64_t end_outer = outer_end;
     while (coords[0] < end_outer) {
-        if (outer_bnd != 0 || W < 3) {
+        if (outer_bnd != 0 || W < 2 * radius + 1) {
             // Full per-pixel boundary checks across the entire inner axis.
             for (int64_t x = 0; x < W; ++x) {
                 const uint32_t bnd = outer_bnd |
-                    ((x == 0 || x == W - 1) ? inner_bit : 0u);
+                    ((x < radius || x >= W - radius) ? inner_bit : 0u);
                 coords[inner] = x;
                 scan_pixel_checked(coords, bnd, row_base + x);
             }
         } else {
-            // Outer coords all interior, W ≥ 3: fast path on the
-            // open interval (0, W-1) — fully unrolled at the n_nbs the
-            // (ndim, conn) connectivity actually produces.
-            coords[inner] = 0;
-            scan_pixel_checked(coords, inner_bit, row_base);
-            scan_inner_axis_dispatch<T>(
-                lbl + row_base, 1, W - 1, n_nbs, nb_flat, ht, ht_mask);
-            coords[inner] = W - 1;
-            scan_pixel_checked(coords, inner_bit, row_base + (W - 1));
+            // Outer coords all interior, W ≥ 2*radius+1: fast path on
+            // the open interval (radius..W-radius) — pre-computed
+            // flat offsets, no per-pixel coord arithmetic.
+            for (int64_t x = 0; x < radius; ++x) {
+                coords[inner] = x;
+                scan_pixel_checked(coords, inner_bit, row_base + x);
+            }
+            if constexpr (Mode != ReduceMode::Off) {
+                scan_inner_axis_dispatch<T, Mode>(
+                    lbl + row_base, radius, W - radius, n_nbs, nb_flat, ht, ht_mask,
+                    dist + row_base, primary, counts);
+            } else {
+                scan_inner_axis_dispatch<T>(
+                    lbl + row_base, radius, W - radius, n_nbs, nb_flat, ht, ht_mask);
+            }
+            for (int64_t x = W - radius; x < W; ++x) {
+                coords[inner] = x;
+                scan_pixel_checked(coords, inner_bit, row_base + x);
+            }
         }
         // Advance the outer odometer (axes [0 .. ndim-2]).
         if (ndim == 1) break;
@@ -335,7 +533,7 @@ inline void scan_band_unpadded(
             row_base += strides[d];
         }
         if (coords[d] >= shape[d]) break;
-        const bool is_bnd = (coords[d] == 0 || coords[d] >= shape[d] - 1);
+        const bool is_bnd = (coords[d] < radius || coords[d] >= shape[d] - radius);
         if (is_bnd) outer_bnd |= (1u << d);
         else outer_bnd &= ~(1u << d);
     }
@@ -345,25 +543,51 @@ inline void scan_band_unpadded(
 // parallel-scans dim-0 strips, merges. The public dispatcher below
 // routes here. ``Wrap`` is templated so the wrap branch in
 // scan_band_unpadded is compile-time-elided when not needed.
-template <typename T, bool Wrap = false>
+// ``Mode`` selects an optional per-pair reducer (min/mean/max/count/
+// harmonic of d_i+d_j); when not Off, the per-thread HTs are paired
+// with primary (double) and counts (int32) arrays. Outputs the
+// reducer values via ``out_primary`` and ``out_counts`` (parallel to
+// the returned pair list).
+template <typename T, bool Wrap = false, ReduceMode Mode = ReduceMode::Off>
 inline std::vector<std::pair<int32_t, int32_t>>
 find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
                          int conn, uint64_t ht_size, int n_threads,
-                         ForkJoinPool& pool) {
+                         ForkJoinPool& pool,
+                         const int32_t* dist = nullptr,
+                         std::vector<double>* out_primary = nullptr,
+                         std::vector<int32_t>* out_counts = nullptr,
+                         int radius = 1) {
     if (n_threads < 1) n_threads = 1;
     std::vector<int64_t> strides;
     std::vector<int64_t> nb_flat;
     std::vector<int8_t> nb_dc;
-    detail::build_forward_neighbours(shape, conn, strides, nb_flat, nb_dc);
+    detail::build_forward_neighbours(shape, conn, strides, nb_flat, nb_dc, radius);
     const int n_nbs = static_cast<int>(nb_flat.size());
     const uint64_t ht_mask = ht_size - 1;
 
     std::unique_ptr<uint64_t[]> hts(new uint64_t[static_cast<size_t>(n_threads) * ht_size]);
+    std::unique_ptr<double[]>  primary_buf;
+    std::unique_ptr<int32_t[]> counts_buf;
+    if constexpr (mode_uses_primary(Mode)) {
+        primary_buf.reset(new double[static_cast<size_t>(n_threads) * ht_size]);
+    }
+    if constexpr (mode_uses_count(Mode)) {
+        counts_buf.reset(new int32_t[static_cast<size_t>(n_threads) * ht_size]);
+    }
+    auto thread_primary = [&](int t) -> double* {
+        return primary_buf ? primary_buf.get() + static_cast<size_t>(t) * ht_size : nullptr;
+    };
+    auto thread_counts = [&](int t) -> int32_t* {
+        return counts_buf ? counts_buf.get() + static_cast<size_t>(t) * ht_size : nullptr;
+    };
+
     if (n_threads == 1 || shape[0] < 2) {
         std::fill_n(hts.get(), ht_size, HT_EMPTY);
-        scan_band_unpadded<T, Wrap>(lbl, shape, strides.data(), nb_flat.data(),
-                                    nb_dc.data(), n_nbs, 0, shape[0],
-                                    hts.get(), ht_mask);
+        scan_band_unpadded<T, Wrap, Mode>(
+            lbl, shape, strides.data(), nb_flat.data(),
+            nb_dc.data(), n_nbs, 0, shape[0],
+            hts.get(), ht_mask, dist,
+            thread_primary(0), thread_counts(0), radius);
     } else {
         // Phase 1: per-worker scan + first-touch HT (NUCA-local).
         std::atomic<int> next{0};
@@ -373,12 +597,14 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
             while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_threads) {
                 uint64_t* ht = hts.get() + static_cast<size_t>(t) * ht_size;
                 std::fill_n(ht, ht_size, HT_EMPTY);
+                // primary/counts only valid where ht[h] != HT_EMPTY; no init needed.
                 const int64_t z0 = static_cast<int64_t>(t) * per;
                 const int64_t z1 = std::min(z0 + per, shape[0]);
                 if (z0 < z1) {
-                    scan_band_unpadded<T, Wrap>(lbl, shape, strides.data(), nb_flat.data(),
-                                                nb_dc.data(), n_nbs, z0, z1,
-                                                ht, ht_mask);
+                    scan_band_unpadded<T, Wrap, Mode>(
+                        lbl, shape, strides.data(), nb_flat.data(),
+                        nb_dc.data(), n_nbs, z0, z1, ht, ht_mask,
+                        dist, thread_primary(t), thread_counts(t), radius);
                 }
             }
         });
@@ -395,7 +621,14 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
                     if (src >= n_threads) continue;
                     uint64_t* dst_ht = hts.get() + static_cast<size_t>(dst) * ht_size;
                     const uint64_t* src_ht = hts.get() + static_cast<size_t>(src) * ht_size;
-                    ht_merge(src_ht, dst_ht, ht_size);
+                    if constexpr (Mode == ReduceMode::Off) {
+                        ht_merge(src_ht, dst_ht, ht_size);
+                    } else {
+                        ht_merge_acc<Mode>(
+                            src_ht, thread_primary(src), thread_counts(src),
+                            dst_ht, thread_primary(dst), thread_counts(dst),
+                            ht_size);
+                    }
                 }
             });
             stride *= 2;
@@ -404,11 +637,23 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
     std::vector<std::pair<int32_t, int32_t>> out;
     out.reserve(64);
     const uint64_t* root = hts.get();
+    const double*  root_p = primary_buf ? primary_buf.get() : nullptr;
+    const int32_t* root_c = counts_buf  ? counts_buf.get()  : nullptr;
+    if constexpr (Mode != ReduceMode::Off) {
+        if (out_primary) out_primary->clear();
+        if (out_counts)  out_counts->clear();
+    }
     for (uint64_t h = 0; h < ht_size; ++h) {
         const uint64_t key = root[h];
         if (key == HT_EMPTY) continue;
         out.emplace_back(static_cast<int32_t>(key >> 32),
                          static_cast<int32_t>(key & 0xFFFFFFFFull));
+        if constexpr (mode_uses_primary(Mode)) {
+            if (out_primary) out_primary->push_back(root_p[h]);
+        }
+        if constexpr (mode_uses_count(Mode)) {
+            if (out_counts) out_counts->push_back(root_c[h]);
+        }
     }
     return out;
 }
@@ -419,13 +664,44 @@ template <typename T>
 std::vector<std::pair<int32_t, int32_t>>
 find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
                        int conn, uint64_t ht_size, int n_threads,
-                       ForkJoinPool& pool, bool wrap = false) {
+                       ForkJoinPool& pool, bool wrap = false,
+                       int radius = 1) {
     const int ndim = static_cast<int>(shape.size());
     if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM || conn < 1 || conn > ndim) return {};
+    if (radius < 1) radius = 1;
     return wrap
-        ? find_pairs_unpadded_impl<T, true >(lbl, shape, conn, ht_size, n_threads, pool)
-        : find_pairs_unpadded_impl<T, false>(lbl, shape, conn, ht_size, n_threads, pool);
+        ? find_pairs_unpadded_impl<T, true >(lbl, shape, conn, ht_size, n_threads, pool,
+                                              nullptr, nullptr, nullptr, radius)
+        : find_pairs_unpadded_impl<T, false>(lbl, shape, conn, ht_size, n_threads, pool,
+                                              nullptr, nullptr, nullptr, radius);
 }
+
+// Weighted variant: returns adjacency pairs AND per-pair reducer
+// values, computed in the SAME parallel scan as find_pairs (no extra
+// traversal). ``Mode`` picks which reducer:
+//   Min/Max:  primary[i] = min/max(d_i+d_j) over the pair's boundary.
+//   Mean:     primary[i] = sum, counts[i] = N → mean = sum/N.
+//   Count:    counts[i] = boundary pixel-pair count. primary unused.
+//   Harmonic: primary[i] = Σ 1/(1+d_i+d_j) over the pair's boundary.
+template <typename T, ReduceMode Mode>
+std::vector<std::pair<int32_t, int32_t>>
+find_pairs_weighted_nd_unpadded(const T* lbl, const int32_t* dist,
+                                const std::vector<int64_t>& shape,
+                                int conn, uint64_t ht_size, int n_threads,
+                                ForkJoinPool& pool, bool wrap,
+                                std::vector<double>& out_primary,
+                                std::vector<int32_t>& out_counts) {
+    const int ndim = static_cast<int>(shape.size());
+    if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM || conn < 1 || conn > ndim) {
+        out_primary.clear();
+        out_counts.clear();
+        return {};
+    }
+    return wrap
+        ? find_pairs_unpadded_impl<T, true,  Mode>(lbl, shape, conn, ht_size, n_threads, pool, dist, &out_primary, &out_counts)
+        : find_pairs_unpadded_impl<T, false, Mode>(lbl, shape, conn, ht_size, n_threads, pool, dist, &out_primary, &out_counts);
+}
+
 
 } // namespace ncolor_cpp
 

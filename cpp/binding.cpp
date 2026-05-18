@@ -11,8 +11,11 @@
 #include <pybind11/stl.h>
 
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -25,6 +28,11 @@
 #include "connect.hpp"
 #include "geometry.hpp"
 #include "kempe_sa.hpp"
+#include "tabucol.hpp"
+#include "hea.hpp"
+#include "bb_dsatur.hpp"
+#include "chamfer_topk_nd.hpp"
+#include "topk_bfs.hpp"
 #include "dispatch.hpp"
 #include "expand.hpp"
 
@@ -147,6 +155,215 @@ public:
                 ncolor_cpp::expand_labels_lp<1>(input, out_ptr, bufs_, shape, *pool_, n_threads_, wrap);
             } else {
                 throw std::invalid_argument("expand_labels: p must be 1 or 2");
+            }
+        }
+        return out;
+    }
+
+    // Voronoi label expansion that ALSO returns the distance field.
+    // ``p=2`` returns Euclidean (not squared); ``p=1`` returns L1. The
+    // underlying Felzenszwalb / Saito-Toriwaki sweep computes the
+    // distance internally as scratch — exposing it costs one extra
+    // ``shape``-sized buffer + parallel sqrt.
+    std::pair<py::array_t<int32_t>, py::array_t<double>> expand_labels_with_dist(
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
+            int p = 2, bool wrap = false) {
+        const auto buf = labels.request();
+        std::vector<int64_t> shape(buf.ndim);
+        int64_t total = 1;
+        for (int i = 0; i < buf.ndim; ++i) {
+            shape[i] = buf.shape[i];
+            total *= buf.shape[i];
+        }
+
+        const int32_t* input = static_cast<const int32_t*>(buf.ptr);
+        py::array_t<int32_t> out_lbl(buf.shape);
+        py::array_t<double>  out_dist(buf.shape);
+        int32_t* out_lbl_ptr  = static_cast<int32_t*>(out_lbl.request().ptr);
+        double*  out_dist_ptr = static_cast<double*>(out_dist.request().ptr);
+
+        {
+            py::gil_scoped_release release;
+            if (p == 2) {
+                ncolor_cpp::expand_labels_lp<2>(input, out_lbl_ptr, bufs_, shape, *pool_, n_threads_, wrap);
+                const int32_t* d = bufs_.dist();
+                for (int64_t i = 0; i < total; ++i) {
+                    out_dist_ptr[i] = std::sqrt(static_cast<double>(d[i]));
+                }
+            } else if (p == 1) {
+                ncolor_cpp::expand_labels_lp<1>(input, out_lbl_ptr, bufs_, shape, *pool_, n_threads_, wrap);
+                const int32_t* d = bufs_.dist();
+                for (int64_t i = 0; i < total; ++i) {
+                    out_dist_ptr[i] = static_cast<double>(d[i]);
+                }
+            } else {
+                throw std::invalid_argument("expand_labels_with_dist: p must be 1 or 2");
+            }
+        }
+        return {std::move(out_lbl), std::move(out_dist)};
+    }
+
+    // Per-class minimum distance fields. ``class_of`` is a length-(N+1)
+    // array; ``class_of[u]`` is the class of cell ``u`` in 1..K (0 means
+    // cell ``u`` is excluded). For each c in 1..K, run a single-source
+    // L_p expansion with the mask {pixels whose label has class c} as
+    // seeds, and stack the resulting distance fields.
+    //
+    // Output shape: ``(K, *labels.shape)`` float64. ``out[c-1, ...]`` is
+    // the distance from each pixel to the nearest pixel of any cell with
+    // ``class_of[label] == c``. ``p=2`` returns Euclidean (sqrt-applied);
+    // ``p=1`` returns L1. Pixels in classes with no seeds get +inf.
+    py::array_t<double> per_class_min_edt(
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> class_of,
+            int n_classes, int p = 2, bool wrap = false) {
+        const auto lbuf = labels.request();
+        const auto cbuf = class_of.request();
+        std::vector<int64_t> shape(lbuf.ndim);
+        int64_t total = 1;
+        for (int i = 0; i < lbuf.ndim; ++i) {
+            shape[i] = lbuf.shape[i];
+            total *= lbuf.shape[i];
+        }
+        if (cbuf.ndim != 1) throw std::invalid_argument(
+            "per_class_min_edt: class_of must be 1-D (length N+1)");
+        if (n_classes < 1) throw std::invalid_argument(
+            "per_class_min_edt: n_classes must be >= 1");
+
+        const int32_t* lbl_in = static_cast<const int32_t*>(lbuf.ptr);
+        const int32_t* class_of_ptr = static_cast<const int32_t*>(cbuf.ptr);
+        const int64_t n_class_of = static_cast<int64_t>(cbuf.shape[0]);
+
+        std::vector<py::ssize_t> out_shape;
+        out_shape.reserve(static_cast<size_t>(lbuf.ndim) + 1);
+        out_shape.push_back(n_classes);
+        for (int i = 0; i < lbuf.ndim; ++i) out_shape.push_back(lbuf.shape[i]);
+        py::array_t<double> out(out_shape);
+        double* out_ptr = static_cast<double*>(out.request().ptr);
+
+        // Scratch: per-class masked label image (rewritten each pass).
+        std::vector<int32_t> masked(static_cast<size_t>(total));
+        std::vector<int32_t> labels_out_scratch(static_cast<size_t>(total));
+
+        {
+            py::gil_scoped_release release;
+            // Initialise output to +infinity. If a class has no seeds the
+            // expansion writes labels=0 and dist=INT_MAX/4; we replace
+            // those with +inf for safe min-aggregation downstream.
+            const double INF = std::numeric_limits<double>::infinity();
+            for (int64_t i = 0; i < static_cast<int64_t>(n_classes) * total; ++i)
+                out_ptr[i] = INF;
+
+            for (int c = 1; c <= n_classes; ++c) {
+                // Build mask: pixels whose label maps to class c stay; others zero.
+                bool any_seed = false;
+                for (int64_t i = 0; i < total; ++i) {
+                    const int32_t u = lbl_in[i];
+                    if (u > 0 && u < n_class_of && class_of_ptr[u] == c) {
+                        masked[static_cast<size_t>(i)] = u;
+                        any_seed = true;
+                    } else {
+                        masked[static_cast<size_t>(i)] = 0;
+                    }
+                }
+                if (!any_seed) continue;  // out stays +inf for this class
+
+                if (p == 2) {
+                    ncolor_cpp::expand_labels_lp<2>(masked.data(),
+                        labels_out_scratch.data(), bufs_, shape, *pool_, n_threads_, wrap);
+                    const int32_t* d = bufs_.dist();
+                    double* out_c = out_ptr + static_cast<int64_t>(c - 1) * total;
+                    for (int64_t i = 0; i < total; ++i) {
+                        out_c[i] = std::sqrt(static_cast<double>(d[i]));
+                    }
+                } else if (p == 1) {
+                    ncolor_cpp::expand_labels_lp<1>(masked.data(),
+                        labels_out_scratch.data(), bufs_, shape, *pool_, n_threads_, wrap);
+                    const int32_t* d = bufs_.dist();
+                    double* out_c = out_ptr + static_cast<int64_t>(c - 1) * total;
+                    for (int64_t i = 0; i < total; ++i) {
+                        out_c[i] = static_cast<double>(d[i]);
+                    }
+                } else {
+                    throw std::invalid_argument("per_class_min_edt: p must be 1 or 2");
+                }
+            }
+        }
+        return out;
+    }
+
+    // Pairwise N×N minimum-distance matrix. ``D[a, b]`` is the minimum
+    // distance from any pixel of cell ``a+1`` to any pixel of cell
+    // ``b+1`` (0-indexed). For each source cell u in 1..N we run a
+    // single-source expansion seeded only at u's pixels, then scan the
+    // image once to fill row u of D from the dist field. ``D[u, u] = 0``.
+    //
+    // Output shape (N, N) float64. ``p=2`` returns Euclidean, ``p=1`` L1.
+    py::array_t<double> pairwise_nearest_distance(
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
+            int n_labels, int p = 2, bool wrap = false) {
+        const auto lbuf = labels.request();
+        std::vector<int64_t> shape(lbuf.ndim);
+        int64_t total = 1;
+        for (int i = 0; i < lbuf.ndim; ++i) {
+            shape[i] = lbuf.shape[i];
+            total *= lbuf.shape[i];
+        }
+        if (n_labels < 1) throw std::invalid_argument(
+            "pairwise_nearest_distance: n_labels must be >= 1");
+
+        const int32_t* lbl_in = static_cast<const int32_t*>(lbuf.ptr);
+        py::array_t<double> out({n_labels, n_labels});
+        double* D = static_cast<double*>(out.request().ptr);
+
+        std::vector<int32_t> masked(static_cast<size_t>(total));
+        std::vector<int32_t> labels_out_scratch(static_cast<size_t>(total));
+
+        {
+            py::gil_scoped_release release;
+            const double INF = std::numeric_limits<double>::infinity();
+            for (int64_t i = 0; i < static_cast<int64_t>(n_labels) * n_labels; ++i)
+                D[i] = INF;
+            for (int i = 0; i < n_labels; ++i) D[i * n_labels + i] = 0.0;
+
+            for (int u = 1; u <= n_labels; ++u) {
+                // Mask: keep only cell u's pixels as seeds.
+                bool any_seed = false;
+                for (int64_t i = 0; i < total; ++i) {
+                    if (lbl_in[i] == u) { masked[i] = u; any_seed = true; }
+                    else masked[i] = 0;
+                }
+                if (!any_seed) continue;
+
+                if (p == 2) {
+                    ncolor_cpp::expand_labels_lp<2>(masked.data(),
+                        labels_out_scratch.data(), bufs_, shape, *pool_, n_threads_, wrap);
+                } else if (p == 1) {
+                    ncolor_cpp::expand_labels_lp<1>(masked.data(),
+                        labels_out_scratch.data(), bufs_, shape, *pool_, n_threads_, wrap);
+                } else {
+                    throw std::invalid_argument("pairwise_nearest_distance: p must be 1 or 2");
+                }
+                const int32_t* d = bufs_.dist();
+                double* D_row = D + static_cast<int64_t>(u - 1) * n_labels;
+
+                // Single pass: for each pixel, update D[u-1, label-1] = min(..., dist)
+                // for label != u. For p=2 we sqrt; for p=1 we cast.
+                if (p == 2) {
+                    for (int64_t i = 0; i < total; ++i) {
+                        const int32_t v = lbl_in[i];
+                        if (v <= 0 || v == u || v > n_labels) continue;
+                        const double dd = std::sqrt(static_cast<double>(d[i]));
+                        if (dd < D_row[v - 1]) D_row[v - 1] = dd;
+                    }
+                } else {
+                    for (int64_t i = 0; i < total; ++i) {
+                        const int32_t v = lbl_in[i];
+                        if (v <= 0 || v == u || v > n_labels) continue;
+                        const double dd = static_cast<double>(d[i]);
+                        if (dd < D_row[v - 1]) D_row[v - 1] = dd;
+                    }
+                }
             }
         }
         return out;
@@ -307,7 +524,9 @@ public:
             bool first_seen = false,
             int weight_objective = 0,
             py::object de_table_obj = py::none(),
-            int weight_mode = 1 /* ReduceMode::Min */) {
+            int weight_mode = 1 /* ReduceMode::Min */,
+            py::object extra_edges_obj = py::none(),
+            int connect_radius = 1) {
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
         // coloring path without rebuilding the extension.
@@ -353,6 +572,26 @@ public:
                 std::chrono::duration<double, std::milli>(t_now - t_start).count());
             t_start = t_now;
         };
+        // Parse `extra_edges` HERE — before the GIL release. We need
+        // the GIL to touch any Python object, including the
+        // py::array_t::ensure() conversion. After this block we hold
+        // raw pointers + ownership-keeping array_t for the duration of
+        // the GIL-released compute.
+        int32_t n_extra = 0;
+        const int32_t* extra_ptr = nullptr;
+        py::array_t<int32_t> extra_arr_holder;
+        if (!extra_edges_obj.is_none()) {
+            extra_arr_holder = py::array_t<int32_t,
+                py::array::c_style | py::array::forcecast>::ensure(extra_edges_obj);
+            if (extra_arr_holder) {
+                const auto eb = extra_arr_holder.request();
+                if (eb.ndim == 2 && eb.shape[1] == 2) {
+                    n_extra = static_cast<int32_t>(eb.shape[0]);
+                    extra_ptr = static_cast<const int32_t*>(eb.ptr);
+                }
+            }
+        }
+
         bool early_exit_empty = false;
         {
             py::gil_scoped_release release;
@@ -471,19 +710,58 @@ public:
                             max_label, pair_primary, pair_counts); break;
                 }
             } else {
-                pairs = find_pairs_(expanded, shape, conn, wrap, max_label);
+                // Unified pair-find: `connect_radius` widens the
+                // neighbour offset window (Chebyshev distance) for
+                // each pixel. radius=1 is the standard 8-connectivity
+                // path; radius>1 catches near-adjacent cells
+                // separated by a thin gap of another cell's
+                // territory. Same parallel + offset-precomputed
+                // kernel regardless of radius.
+                pairs = find_pairs_(expanded, shape, conn, wrap,
+                                     max_label, connect_radius);
             }
+            // Canonical sort: orders pairs by (src, dst). Without this,
+            // pairs come from HT iteration (slot order = hash-mixed,
+            // dependent on offset enumeration order). Same EDGE SET
+            // produces different CSR neighbour-iteration order, which
+            // TabuCol's heuristic can be sensitive to. Sorting gives
+            // determinism + matches the legacy weight-find_pairs path
+            // that emitted in canonical order via sort+unique.
+            std::sort(pairs.begin(), pairs.end());
             stage("find_pairs");
+            static bool dbg_pairs = std::getenv("NCOLOR_DEBUG_PAIRS") != nullptr;
+            if (dbg_pairs) {
+                std::fprintf(stderr, "[ncolor] find_pairs: %zu pairs "
+                              "(conn=%d, radius=%d, ndim=%d)\n",
+                              pairs.size(), conn, connect_radius,
+                              (int)shape.size());
+            }
 
             // 3. Build CSR (labels are 1..max_label after expand → node = label-1).
             const int32_t N = max_label;
-            const int32_t M = static_cast<int32_t>(pairs.size());
-            src_idx_.resize(M);
-            dst_idx_.resize(M);
+            int32_t M = static_cast<int32_t>(pairs.size());
+
+            // `extra_edges` parsed above (pre-GIL-release) into n_extra
+            // and extra_ptr. Splice the extras after the connect() pairs.
+            src_idx_.resize(static_cast<size_t>(M) + n_extra);
+            dst_idx_.resize(static_cast<size_t>(M) + n_extra);
             for (int32_t i = 0; i < M; ++i) {
                 src_idx_[i] = pairs[i].first - 1;
                 dst_idx_[i] = pairs[i].second - 1;
             }
+            for (int32_t e = 0; e < n_extra; ++e) {
+                int32_t a = extra_ptr[2 * e]     - 1;
+                int32_t b = extra_ptr[2 * e + 1] - 1;
+                if (a < 0 || b < 0 || a >= N || b >= N || a == b) {
+                    // Skip invalid entries.
+                    continue;
+                }
+                src_idx_[M] = a;
+                dst_idx_[M] = b;
+                ++M;
+            }
+            src_idx_.resize(M);
+            dst_idx_.resize(M);
             // Boundary-weighted opt-in path: convert per-pair reducer
             // values (collected during find_pairs) to weights per
             // ``weight_mode`` and build a CSR with parallel weights[].
@@ -680,15 +958,16 @@ private:
     // Returns {} for an empty input (max_label == 0).
     std::vector<std::pair<int32_t, int32_t>> find_pairs_(
             const int32_t* labels, const std::vector<int64_t>& shape,
-            int conn, bool wrap, int32_t max_label) {
+            int conn, bool wrap, int32_t max_label, int radius = 1) {
         if (max_label == 0) return {};
         const int ndim = static_cast<int>(shape.size());
-        const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbours(ndim, conn);
+        const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbours(
+            ndim, conn, radius);
         const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
         const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE));
         return ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
             labels, shape, conn,
-            static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap);
+            static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap, radius);
     }
 
     // Weighted variant: same parallel scan also computes a per-pair
@@ -754,7 +1033,7 @@ private:
                         const double* edge_weights = nullptr,
                         const double* de_table = nullptr,
                         int weight_obj = 0) {
-        constexpr int attempts_per_n = 4;
+        constexpr int attempts_per_n = 16;
         const int64_t max_iter = std::max<int64_t>(
             static_cast<int64_t>(indices_.size()) +
             static_cast<int64_t>(indptr_.size()), 512);
@@ -776,60 +1055,190 @@ private:
         bool ok = false;
         for (int depth = 0; depth < max_depth && !ok; ++depth) {
             if (color_parallel) {
-                std::atomic<int> next{0};
                 const int local_cur_n = cur_n;
                 const int local_depth = depth;
                 const int32_t* ip = indptr_.data();
                 const int32_t* ix = indices_.data();
-                pool_->parallel([&, local_cur_n, local_depth, ip, ix]() {
-                    int idx;
-                    while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < attempts_per_n) {
-                        auto& cv = per_attempt_colors_[idx];
-                        const int attempt_offset = local_depth + idx;
-                        // Slot 0 = user-preferred algorithm; remaining
-                        // slots = alternate algorithm with different
-                        // random offsets (algorithm-switching fallback).
-                        // For the weighted opt-in, slots 0-(attempts-2) use
-                        // weighted-WP with different offsets; the LAST slot
-                        // is a pure-balance WP fallback. If all weighted
-                        // attempts fail at n_colors, the balance attempt
-                        // can still produce a clean 4-coloring before we
-                        // bump cur_n — keeps broad-support reducers (count,
-                        // harmonic) from over-allocating colours on graphs
-                        // that are 4-colourable under pure balance.
-                        const bool wobj_active = weight_obj != 0 && edge_weights != nullptr;
-                        const bool wp = wobj_active
-                            ? true
-                            : (balance ? (idx == 0)
-                                       : (idx == attempts_per_n - 1));
-                        const bool weighted_attempt = wobj_active &&
-                                                      (idx < attempts_per_n - 1);
-                        const double* w_ptr = weighted_attempt ? edge_weights : nullptr;
-                        const double* de_ptr = weighted_attempt ? de_table : nullptr;
-                        const int w_obj_local = weighted_attempt ? weight_obj : 0;
-                        const bool finished = ncolor_cpp::color_graph_csr_legacy(
-                            ip, ix, N, local_cur_n, rand_period,
-                            attempt_offset, max_iter, cv, wp,
-                            w_ptr, de_ptr, w_obj_local);
-                        const bool conflict = !finished ||
-                            ncolor_cpp::has_conflict_csr(ip, ix, N, cv.data());
-                        bool a_ok = !conflict || ncolor_cpp::repair_coloring(
-                            ip, ix, N, local_cur_n, std::max(4, max_depth), cv);
-                        // WP must be clean for the balanced path — repair
-                        // would shadow its uniform-distribution promise.
-                        // For the weighted path the user has opted in to a
-                        // perceptual objective and accepts repair.
-                        const bool clean_wp_required = wp && !weighted_attempt;
-                        per_attempt_ok_[idx] = (a_ok && (!clean_wp_required || !conflict)) ? 1 : 0;
+
+                // Shared early-exit flag: as soon as any parallel
+                // attempt finds a 0-conflict colouring, other workers
+                // (a) skip subsequent slots and (b) abort any
+                // in-flight per-attempt tabucol. Without (b), race
+                // latency = slowest worker's full tabucol budget; with
+                // it, race latency = first success.
+                std::atomic<bool> winner_found{false};
+
+                // Run-one-attempt body factored out so we can call it
+                // once sequentially as a warmup before paying pool-
+                // dispatch overhead, and dispatch the rest in parallel
+                // only on warmup failure.
+                auto run_one_attempt = [&, local_cur_n, local_depth, ip, ix](
+                        int idx, const std::atomic<bool>* cancel,
+                        bool allow_tabucol) -> bool {
+                    auto& cv = per_attempt_colors_[idx];
+                    const int attempt_offset = local_depth + idx;
+                    // Special slot: branch-and-bound exact coloring
+                    // racing the BFS+tabucol slots. For K_5-free
+                    // planar-ish cell-adjacency graphs at our scale
+                    // (N ≤ few thousand), B&B+DSatur typically finds
+                    // a k-coloring in <1 ms — often faster than
+                    // BFS+tabucol convergence. When the search tree
+                    // blows up on adversarial vertex orderings, the
+                    // node budget + cancel-flag short-circuit kick in
+                    // and one of the BFS slots wins instead. Only
+                    // fires at the user's target k (no value running
+                    // exact search at cur_n > n_colors). Disabled
+                    // when the user opted into a perceptual weight
+                    // objective, since bb_dsatur doesn't honour
+                    // weights. Slot picked: the LAST one for
+                    // balance=True (free slot — slot 0 is the WP
+                    // warmup, slots 1..N-2 are BFS); not used for
+                    // balance=False (LAST slot is the WP fallback
+                    // there). Cancel propagation: bb_dsatur checks
+                    // the cancel flag every 1024 nodes.
+                    const bool wobj_active = weight_obj != 0 && edge_weights != nullptr;
+                    const bool bb_slot = balance && !wobj_active
+                                         && (idx == attempts_per_n - 1)
+                                         && local_cur_n == n_colors;
+                    if (bb_slot) {
+                        const int64_t node_budget = std::max<int64_t>(
+                            20000, (int64_t)N * 30);
+                        const bool bb_ok = ncolor_cpp::bb_dsatur(
+                            ip, ix, N, local_cur_n, cv, node_budget, cancel);
+                        per_attempt_ok_[idx] = bb_ok ? 1 : 0;
+                        return bb_ok;
                     }
-                });
-                // Lowest-index successful attempt wins (deterministic
-                // preference for the first random offset).
-                for (int a = 0; a < attempts_per_n; ++a) {
-                    if (per_attempt_ok_[a]) {
-                        colors_.swap(per_attempt_colors_[a]);
-                        ok = true;
-                        break;
+                    // Slot 0 = user-preferred algorithm; remaining
+                    // slots = alternate algorithm with different
+                    // random offsets (algorithm-switching fallback).
+                    // For the weighted opt-in, slots 0-(attempts-2)
+                    // use weighted-WP with different offsets; the
+                    // LAST slot is a pure-balance WP fallback. If
+                    // all weighted attempts fail at n_colors, the
+                    // balance attempt can still produce a clean
+                    // 4-coloring before we bump cur_n.
+                    const bool wp = wobj_active
+                        ? true
+                        : (balance ? (idx == 0)
+                                   : (idx == attempts_per_n - 1));
+                    const bool weighted_attempt = wobj_active &&
+                                                  (idx < attempts_per_n - 1);
+                    const double* w_ptr = weighted_attempt ? edge_weights : nullptr;
+                    const double* de_ptr = weighted_attempt ? de_table : nullptr;
+                    const int w_obj_local = weighted_attempt ? weight_obj : 0;
+                    const bool finished = ncolor_cpp::color_graph_csr_legacy(
+                        ip, ix, N, local_cur_n, rand_period,
+                        attempt_offset, max_iter, cv, wp,
+                        w_ptr, de_ptr, w_obj_local);
+                    const bool conflict = !finished ||
+                        ncolor_cpp::has_conflict_csr(ip, ix, N, cv.data());
+                    bool a_ok = !conflict || ncolor_cpp::repair_coloring(
+                        ip, ix, N, local_cur_n, std::max(4, max_depth), cv);
+                    // Per-attempt TabuCol fallback when greedy+repair
+                    // fail at the user's target k. Each attempt runs
+                    // its own small-budget tabucol seeded uniquely,
+                    // turning the parallel block into a true K-way
+                    // race of (greedy+repair+tabucol) jobs. Only
+                    // fires for the user's target k. The `cancel`
+                    // pointer lets the tabucol loop short-circuit
+                    // when a sibling worker has already won.
+                    // Disabled for the warmup attempt (allow_tabucol
+                    // false): the warmup is meant to be a sub-ms
+                    // fast-path; if WP+repair fails we'd rather fall
+                    // through to the parallel race (which has
+                    // sibling-cancellable tabucol) than burn up to
+                    // 5 ms of un-cancellable budget here.
+                    if (!a_ok && local_cur_n == n_colors && allow_tabucol) {
+                        for (int32_t u = 0; u < N; ++u) {
+                            if (cv[u] < 1 || cv[u] > local_cur_n) {
+                                cv[u] = (uint8_t)(1 + (u % local_cur_n));
+                            }
+                        }
+                        const int per_attempt_tabu_iters = std::min(
+                            5000, std::max(500, N * 5));
+                        const uint64_t tabu_seed =
+                            (uint64_t)(attempt_offset + 1)
+                                * 0x9e3779b97f4a7c15ULL
+                            ^ (uint64_t)(local_depth + 1)
+                                * 0x517cc1b727220a95ULL;
+                        if (ncolor_cpp::tabucol(
+                                ip, ix, N, local_cur_n,
+                                per_attempt_tabu_iters, cv, tabu_seed,
+                                /*deadline_ns=*/0, cancel)) {
+                            a_ok = true;
+                        }
+                    }
+                    // WP must be clean for the balanced path — repair
+                    // would shadow its uniform-distribution promise.
+                    // For the weighted path the user has opted in to
+                    // a perceptual objective and accepts repair.
+                    const bool clean_wp_required = wp && !weighted_attempt;
+                    const bool slot_ok = a_ok && (!clean_wp_required || !conflict);
+                    per_attempt_ok_[idx] = slot_ok ? 1 : 0;
+                    return slot_ok;
+                };
+
+                // Conditional fan-out: try slot 0 sequentially first.
+                // The vast majority of inputs (including all bact-logo
+                // shuffles at radius=1) succeed on the first attempt;
+                // skipping the pool dispatch in that case recovers
+                // ~0.5 ms of median latency that the 16-way race
+                // unconditionally pays. Only fan out when warmup fails.
+                static const bool dbg_warmup = std::getenv("NCOLOR_WARMUP_DEBUG") != nullptr;
+                const bool warmup_ok = run_one_attempt(0, nullptr, /*allow_tabucol=*/false);
+                if (dbg_warmup) {
+                    std::fprintf(stderr,
+                        "[warmup] N=%d M=%d cur_n=%d depth=%d ok=%d\n",
+                        N, M, local_cur_n, local_depth, (int)warmup_ok);
+                }
+                if (warmup_ok) {
+                    colors_.swap(per_attempt_colors_[0]);
+                    ok = true;
+                } else {
+                    std::atomic<int> next{1};
+                    static const bool dbg_slots = std::getenv("NCOLOR_SLOT_DEBUG") != nullptr;
+                    std::vector<double> slot_ms(attempts_per_n, -1.0);
+                    std::vector<int> slot_done(attempts_per_n, 0);
+                    const auto race_t0 = std::chrono::steady_clock::now();
+                    pool_->parallel([&]() {
+                        int idx;
+                        while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < attempts_per_n) {
+                            if (winner_found.load(std::memory_order_relaxed)) break;
+                            const auto t0 = std::chrono::steady_clock::now();
+                            const bool ok_slot = run_one_attempt(idx, &winner_found, /*allow_tabucol=*/true);
+                            if (dbg_slots) {
+                                const auto t1 = std::chrono::steady_clock::now();
+                                slot_ms[idx] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                                slot_done[idx] = ok_slot ? 1 : 2;
+                            }
+                            if (ok_slot) {
+                                winner_found.store(true, std::memory_order_relaxed);
+                            }
+                        }
+                    });
+                    if (dbg_slots) {
+                        const auto race_t1 = std::chrono::steady_clock::now();
+                        const double race_ms = std::chrono::duration<double, std::milli>(race_t1 - race_t0).count();
+                        std::fprintf(stderr, "[race] total=%.3fms\n", race_ms);
+                        for (int a = 1; a < attempts_per_n; ++a) {
+                            const char* st = slot_done[a] == 1 ? "OK"
+                                           : slot_done[a] == 2 ? "FAIL"
+                                           : "skip";
+                            if (slot_ms[a] >= 0) {
+                                std::fprintf(stderr, "  slot[%d] %.3fms %s\n", a, slot_ms[a], st);
+                            }
+                        }
+                    }
+                    // Lowest-index successful attempt wins
+                    // (deterministic preference for the first random
+                    // offset). Slot 0 already failed so it's skipped
+                    // by the per_attempt_ok_[a] check.
+                    for (int a = 0; a < attempts_per_n; ++a) {
+                        if (per_attempt_ok_[a]) {
+                            colors_.swap(per_attempt_colors_[a]);
+                            ok = true;
+                            break;
+                        }
                     }
                 }
             } else {
@@ -866,6 +1275,157 @@ private:
                     // non-WP, non-weighted fallback (which defeats the point).
                     const bool clean_wp_required = wp && !weighted_attempt;
                     if (a_ok && (!clean_wp_required || !conflict)) ok = true;
+                }
+            }
+            if (!ok && cur_n == n_colors) {
+                // TabuCol fallback at the user's target k. Some graphs
+                // are k-colourable (verified by SAT) but every
+                // vertex-ordering greedy hits the same local minimum
+                // (e.g. dense corner-touching cells under conn=2 with
+                // K4 substructures). Tabu search rescues these by
+                // allowing temporary conflict increases to escape.
+                // Cost is bounded to one tabucol call per ncolor.label
+                // — fast graphs never hit this branch.
+                if (color_parallel) {
+                    // Parallel path doesn't auto-update colors_ on
+                    // failure; pull in the attempt with fewest
+                    // conflicts (one of them must be sized N since
+                    // color_graph_csr_legacy was called on each).
+                    int best_idx = -1, best_conf = INT_MAX;
+                    for (int a = 0; a < attempts_per_n; ++a) {
+                        if ((int)per_attempt_colors_[a].size() < N) continue;
+                        int c = 0;
+                        for (int32_t i = 0; i < M; ++i) {
+                            if (per_attempt_colors_[a][src_idx_[i]] ==
+                                per_attempt_colors_[a][dst_idx_[i]]) ++c;
+                        }
+                        if (c < best_conf) { best_conf = c; best_idx = a; }
+                    }
+                    if (best_idx < 0) goto skip_tabucol;
+                    colors_.swap(per_attempt_colors_[best_idx]);
+                }
+                // Sanity-check colors_ before handing to TabuCol; bail
+                // out if any vertex has color 0 or > cur_n (would
+                // corrupt the conf[] accumulator). Vertices are
+                // 0-indexed (matches the rest of the C++ pipeline).
+                if ((int)colors_.size() < N) goto skip_tabucol;
+                for (int32_t u = 0; u < N; ++u) {
+                    if (colors_[u] < 1 || colors_[u] > cur_n) goto skip_tabucol;
+                }
+                {
+                    // Tabu-search restart loop. First restart uses the
+                    // conflicted-greedy colouring as a starting point
+                    // (often within a few moves of valid). Subsequent
+                    // restarts use a fresh uniform-random colouring so
+                    // they sample different basins.
+                    //
+                    // Total time is capped by a shared wall-clock budget
+                    // (default 200 ms) so dense graphs that don't
+                    // 4-colour quickly fall through to cur_n bump
+                    // instead of burning seconds. Each restart still has
+                    // its own iter cap as a secondary bound.
+                    const int per_seed_iters = std::min(
+                        50000, std::max(2000, N * 30));
+                    const int64_t budget_ns = 200LL * 1000LL * 1000LL;  // 200 ms
+                    const int64_t deadline_ns =
+                        std::chrono::steady_clock::now()
+                            .time_since_epoch().count() + budget_ns;
+                    std::vector<uint8_t> saved = colors_;
+                    uint64_t base_seed =
+                        (uint64_t)(depth + 1) * 0x9e3779b97f4a7c15ULL;
+                    for (int s = 0; s < 24 && !ok; ++s) {
+                        if (std::chrono::steady_clock::now()
+                                .time_since_epoch().count() > deadline_ns) break;
+                        uint64_t rs = base_seed + (uint64_t)s * 0xdeadbeefcafebabeULL;
+                        auto next32 = [&]() -> uint32_t {
+                            rs = rs * 6364136223846793005ULL + 1442695040888963407ULL;
+                            return (uint32_t)(rs >> 32);
+                        };
+                        if (s == 0) {
+                            colors_ = saved;
+                        } else {
+                            for (int32_t u = 0; u < N; ++u) {
+                                colors_[u] = (uint8_t)(1 + (next32() % (uint32_t)cur_n));
+                            }
+                        }
+                        if (ncolor_cpp::tabucol(
+                                indptr_.data(), indices_.data(), N,
+                                cur_n, per_seed_iters, colors_, rs,
+                                deadline_ns)) {
+                            ok = true;
+                        }
+                    }
+                }
+                skip_tabucol: ;
+                // bb_dsatur exact fallback: if every greedy×16 attempt
+                // and the TabuCol restart loop both failed at the
+                // user's target k, try branch-and-bound DSatur before
+                // bumping cur_n. For K_5-free planar-ish cell-
+                // adjacency graphs of our scale, B&B+DSatur typically
+                // resolves the hardest TabuCol-plateau-stalled inputs
+                // in well under 50 ms. Fires only when every cheaper
+                // path has failed → zero cost on the common path
+                // (default-radius inputs never reach this branch).
+                // Node budget caps total work on truly k-uncolourable
+                // inputs so we don't burn unbounded time.
+                if (!ok) {
+                    const int64_t node_budget = std::max<int64_t>(
+                        200000, (int64_t)N * 100);
+                    std::vector<uint8_t> bb_colors;
+                    static const bool dbg_bb = std::getenv("NCOLOR_BB_DEBUG") != nullptr;
+                    const auto bb_t0 = std::chrono::steady_clock::now();
+                    const bool bb_ok = ncolor_cpp::bb_dsatur(
+                            indptr_.data(), indices_.data(),
+                            N, cur_n, bb_colors, node_budget);
+                    if (dbg_bb) {
+                        const auto bb_t1 = std::chrono::steady_clock::now();
+                        const double bb_ms = std::chrono::duration<double, std::milli>(
+                            bb_t1 - bb_t0).count();
+                        std::fprintf(stderr,
+                            "[bb_dsatur] N=%d cur_n=%d budget=%lld ok=%d %.2fms\n",
+                            N, cur_n, (long long)node_budget, (int)bb_ok, bb_ms);
+                    }
+                    if (bb_ok) {
+                        colors_ = std::move(bb_colors);
+                        ok = true;
+                    }
+                }
+                // HEA last-resort: if bb_dsatur exhausted its node
+                // budget without proving infeasibility, run the
+                // Hybrid Evolutionary Algorithm. Population-based
+                // search escapes the deterministic-DSatur worst-case
+                // branching that traps bb_dsatur on adversarial
+                // vertex labellings. Cost: 50-200 ms per fire, only
+                // on the genuinely-hardest shuffles where every
+                // cheaper path failed. Still bounded — gen + pop
+                // caps guarantee no unbounded burn.
+                if (!ok) {
+                    std::vector<uint8_t> hea_colors;
+                    const uint64_t hea_seed =
+                        ((uint64_t)N * 0x9e3779b97f4a7c15ULL)
+                        ^ ((uint64_t)(depth + 1) * 0xc6a4a7935bd1e995ULL);
+                    static const bool dbg_hea = std::getenv("NCOLOR_BB_DEBUG") != nullptr;
+                    const auto hea_t0 = std::chrono::steady_clock::now();
+                    const bool hea_ok = ncolor_cpp::hea(
+                            indptr_.data(), indices_.data(),
+                            N, cur_n, hea_colors,
+                            /*max_generations=*/80,
+                            /*pop_size=*/8,
+                            /*init_tabu_iters=*/500,
+                            /*gen_tabu_iters=*/2000,
+                            hea_seed);
+                    if (dbg_hea) {
+                        const auto hea_t1 = std::chrono::steady_clock::now();
+                        const double hea_ms = std::chrono::duration<double, std::milli>(
+                            hea_t1 - hea_t0).count();
+                        std::fprintf(stderr,
+                            "[hea] N=%d cur_n=%d ok=%d %.2fms\n",
+                            N, cur_n, (int)hea_ok, hea_ms);
+                    }
+                    if (hea_ok) {
+                        colors_ = std::move(hea_colors);
+                        ok = true;
+                    }
                 }
             }
             if (!ok) {
@@ -967,6 +1527,26 @@ PYBIND11_MODULE(_impl, m) {
              "chamfer kernels (no Python-level padding): L1 ~1.1× std,\n"
              "L2 ~1.4-1.6× std. Verified bit-equal to a np.pad reference\n"
              "on standard inputs.")
+        .def("expand_labels_with_dist", &ExpandEngine::expand_labels_with_dist,
+             py::arg("labels"), py::arg("p") = 2, py::arg("wrap") = false,
+             "Same as expand_labels but also returns the distance field.\n"
+             "Returns (labels: int32, dist: float64), both shape = input shape.\n"
+             "p=2 returns Euclidean (sqrt of squared); p=1 returns L1.")
+        .def("per_class_min_edt", &ExpandEngine::per_class_min_edt,
+             py::arg("labels"), py::arg("class_of"), py::arg("n_classes"),
+             py::arg("p") = 2, py::arg("wrap") = false,
+             "Per-class minimum distance fields.\n"
+             "class_of is a length-(max_label+1) array; class_of[u] in 1..K is\n"
+             "the class of label u (0 = exclude). Returns (K, *labels.shape)\n"
+             "float64 with out[c-1, ...] = distance from each pixel to the\n"
+             "nearest pixel of any label whose class is c. Pixels for classes\n"
+             "with no seeds get +inf. Cost: K expand passes.")
+        .def("pairwise_nearest_distance", &ExpandEngine::pairwise_nearest_distance,
+             py::arg("labels"), py::arg("n_labels"),
+             py::arg("p") = 2, py::arg("wrap") = false,
+             "Pairwise N×N matrix D[a, b] = min distance from any pixel of\n"
+             "label a+1 to any pixel of label b+1. Diagonal is 0; missing\n"
+             "labels yield +inf rows/columns. Cost: N expand passes.")
         .def("format_labels", &ExpandEngine::format_labels,
              py::arg("labels"), py::arg("first_seen") = false,
              "Compact nonzero labels to 1..N. If min(labels) != 0 the\n"
@@ -1010,6 +1590,8 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("weight_objective") = 0,
              py::arg("de_table") = py::none(),
              py::arg("weight_mode") = 1,
+             py::arg("extra_edges") = py::none(),
+             py::arg("connect_radius") = 1,
              "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
              "Any ndim ≥ 2; conn ∈ [1, ndim].\n"
              "p selects the expand metric: p=1 (Saito-Toriwaki sweep,\n"
@@ -1368,6 +1950,831 @@ PYBIND11_MODULE(_impl, m) {
           "the per-cell colour extraction into the geometry pass (replaces\n"
           "np.unique on the label image).");
 
+    // ------------------------------------------------------------------
+    // topk_pairs_bfs: alternative pair-count kernel. Takes a 1-NN
+    // Voronoi map (typically from expand_labels) and BFS-expands at
+    // each pixel until K distinct cells found OR ring-budget exhausted.
+    // Much faster than chamfer-top-K on inputs with large cell
+    // interiors: those pixels exit after a few empty rings instead of
+    // paying the K-candidate-per-axis-sweep cost.
+    // ------------------------------------------------------------------
+    m.def("topk_pairs_bfs",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> l1,
+             int K, int32_t n_cells, int32_t r_max, int32_t max_margin,
+             int32_t empty_rings_exit)
+             -> py::array_t<int64_t>
+          {
+              const auto sb = l1.request();
+              if (sb.ndim != 2) throw std::invalid_argument(
+                  "topk_pairs_bfs: l1 must be 2D");
+              const int32_t H = (int32_t)sb.shape[0];
+              const int32_t W = (int32_t)sb.shape[1];
+              if (K < 1 || K > 8) throw std::invalid_argument(
+                  "topk_pairs_bfs: K must be 1..8");
+              py::array_t<int64_t> pc({(py::ssize_t)(n_cells + 1),
+                                         (py::ssize_t)(n_cells + 1)});
+              int64_t* pc_ptr = (int64_t*)pc.request().ptr;
+              std::fill(pc_ptr, pc_ptr + (int64_t)(n_cells + 1) * (n_cells + 1), 0);
+              const int32_t* l1_ptr = (const int32_t*)sb.ptr;
+              {
+                  py::gil_scoped_release release;
+                  switch (K) {
+                    case 1: ncolor_cpp::topk_pairs_bfs<1>(l1_ptr, H, W, n_cells, r_max, max_margin, empty_rings_exit, pc_ptr); break;
+                    case 2: ncolor_cpp::topk_pairs_bfs<2>(l1_ptr, H, W, n_cells, r_max, max_margin, empty_rings_exit, pc_ptr); break;
+                    case 3: ncolor_cpp::topk_pairs_bfs<3>(l1_ptr, H, W, n_cells, r_max, max_margin, empty_rings_exit, pc_ptr); break;
+                    case 4: ncolor_cpp::topk_pairs_bfs<4>(l1_ptr, H, W, n_cells, r_max, max_margin, empty_rings_exit, pc_ptr); break;
+                    case 5: ncolor_cpp::topk_pairs_bfs<5>(l1_ptr, H, W, n_cells, r_max, max_margin, empty_rings_exit, pc_ptr); break;
+                    case 6: ncolor_cpp::topk_pairs_bfs<6>(l1_ptr, H, W, n_cells, r_max, max_margin, empty_rings_exit, pc_ptr); break;
+                    case 7: ncolor_cpp::topk_pairs_bfs<7>(l1_ptr, H, W, n_cells, r_max, max_margin, empty_rings_exit, pc_ptr); break;
+                    case 8: ncolor_cpp::topk_pairs_bfs<8>(l1_ptr, H, W, n_cells, r_max, max_margin, empty_rings_exit, pc_ptr); break;
+                  }
+              }
+              return pc;
+          },
+          py::arg("l1"), py::arg("K") = 4, py::arg("n_cells") = -1,
+          py::arg("r_max") = 12, py::arg("max_margin") = 2,
+          py::arg("empty_rings_exit") = 3,
+          "BFS-based top-K pair-count kernel. Operates on a 1-NN\n"
+          "Voronoi map (l1). Per pixel: BFS Manhattan rings outward\n"
+          "until K distinct cells found OR ring-budget exhausted.\n"
+          "Emits an (N+1, N+1) symmetric pair-count matrix.");
+
+    m.def("chamfer_topk_l1_2d",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> seed_image,
+             int K, double n_threads_in)
+             -> std::pair<py::array_t<int32_t>, py::array_t<int32_t>>
+          {
+              const auto sb = seed_image.request();
+              if (sb.ndim != 2) throw std::invalid_argument(
+                  "chamfer_topk_l1_2d: seed_image must be 2D");
+              const int32_t H = static_cast<int32_t>(sb.shape[0]);
+              const int32_t W = static_cast<int32_t>(sb.shape[1]);
+              if (K < 1 || K > 8) throw std::invalid_argument(
+                  "chamfer_topk_l1_2d: K must be 1..8");
+              py::array_t<int32_t> out_labels({(py::ssize_t)H, (py::ssize_t)W, (py::ssize_t)K});
+              py::array_t<int32_t> out_dists ({(py::ssize_t)H, (py::ssize_t)W, (py::ssize_t)K});
+              int32_t* lbl_ptr = static_cast<int32_t*>(out_labels.request().ptr);
+              int32_t* dst_ptr = static_cast<int32_t*>(out_dists.request().ptr);
+              const int32_t* seed_ptr = static_cast<const int32_t*>(sb.ptr);
+              // Below ~250k pixels (≈500x500), thread pool overhead
+              // exceeds the parallel benefit. Skip the resolve_threads
+              // Python call too — it adds ~5 ms (auto-threads lookup).
+              const int64_t total_px = (int64_t)H * W;
+              int nt = (total_px < 250000) ? 1 : resolve_threads(n_threads_in);
+              std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
+              if (nt > 1) pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
+              {
+                  py::gil_scoped_release release;
+                  switch (K) {
+                    case 1: ncolor_cpp::chamfer_topk_l1_2d<1>(seed_ptr, H, W, lbl_ptr, dst_ptr, pool.get(), nt); break;
+                    case 2: ncolor_cpp::chamfer_topk_l1_2d<2>(seed_ptr, H, W, lbl_ptr, dst_ptr, pool.get(), nt); break;
+                    case 3: ncolor_cpp::chamfer_topk_l1_2d<3>(seed_ptr, H, W, lbl_ptr, dst_ptr, pool.get(), nt); break;
+                    case 4: ncolor_cpp::chamfer_topk_l1_2d<4>(seed_ptr, H, W, lbl_ptr, dst_ptr, pool.get(), nt); break;
+                    case 5: ncolor_cpp::chamfer_topk_l1_2d<5>(seed_ptr, H, W, lbl_ptr, dst_ptr, pool.get(), nt); break;
+                    case 6: ncolor_cpp::chamfer_topk_l1_2d<6>(seed_ptr, H, W, lbl_ptr, dst_ptr, pool.get(), nt); break;
+                    case 7: ncolor_cpp::chamfer_topk_l1_2d<7>(seed_ptr, H, W, lbl_ptr, dst_ptr, pool.get(), nt); break;
+                    case 8: ncolor_cpp::chamfer_topk_l1_2d<8>(seed_ptr, H, W, lbl_ptr, dst_ptr, pool.get(), nt); break;
+                  }
+              }
+              return {std::move(out_labels), std::move(out_dists)};
+          },
+          py::arg("seed_image"), py::arg("K") = 4, py::arg("n_threads") = -1.0,
+          "Top-K nearest seed labels per pixel via 2D L1 Saito-Toriwaki.\n"
+          "Returns (labels[H, W, K], dists[H, W, K]) sorted ascending\n"
+          "by dist along the K axis. n_threads: -1 = auto-calibrated.");
+
+    // ------------------------------------------------------------------
+    // top_k_label: end-to-end fused pipeline.
+    //   1. Chamfer top-K Voronoi sweep (gives both top-K cells per pixel
+    //      AND the 1-NN expanded label image for free at slot 0).
+    //   2. Aggregate margin-filtered cell-pair counts.
+    //   3. Build CSR adjacency from pair_count >= min_count.
+    //   4. Color the graph (greedy + TabuCol fallback).
+    //   5. Apply LUT to the expanded label image (slot-0 labels).
+    // Returns (output_label_image[H, W] uint8, n_used).
+    // ------------------------------------------------------------------
+    m.def("top_k_label",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> seed_image,
+             int K, int32_t max_margin, int32_t min_count,
+             int n_colors, int max_depth, double n_threads_in)
+             -> std::pair<py::array_t<uint8_t>, int>
+          {
+              const auto sb = seed_image.request();
+              if (sb.ndim < 1) throw std::invalid_argument(
+                  "top_k_label: seed_image must have at least 1 dim");
+              if (K < 1 || K > 8) throw std::invalid_argument(
+                  "top_k_label: K must be 1..8");
+              std::vector<int64_t> shape(sb.ndim);
+              std::vector<py::ssize_t> py_shape(sb.ndim);
+              int64_t M = 1;
+              for (int d = 0; d < sb.ndim; ++d) {
+                  shape[d] = sb.shape[d];
+                  py_shape[d] = sb.shape[d];
+                  M *= sb.shape[d];
+              }
+              const int32_t* seed_ptr = (const int32_t*)sb.ptr;
+
+              // Detect N (max label) via a quick pass.
+              int32_t N = 0;
+              for (int64_t i = 0; i < M; ++i) {
+                  if (seed_ptr[i] > N) N = seed_ptr[i];
+              }
+
+              const int64_t total_px = M;
+              int nt = (total_px < 250000) ? 1 : resolve_threads(n_threads_in);
+              std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
+              if (nt > 1) pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
+
+              py::array_t<uint8_t> out(py_shape);
+              uint8_t* out_ptr = (uint8_t*)out.request().ptr;
+              int n_used = 0;
+
+              static bool dbg_print = std::getenv("NCOLOR_TOPK_PROFILE") != nullptr;
+              {
+                  py::gil_scoped_release release;
+                  auto t_start = std::chrono::steady_clock::now();
+                  auto stage = [&](const char* name) {
+                      if (!dbg_print) return;
+                      auto now = std::chrono::steady_clock::now();
+                      double ms = std::chrono::duration<double, std::milli>(
+                          now - t_start).count();
+                      std::fprintf(stderr, "[topk] %-20s  %7.3f ms\n", name, ms);
+                      t_start = now;
+                  };
+
+                  // Persistent thread-local scratch — pays the heap
+                  // allocation only on first call (or when size grows).
+                  thread_local std::vector<int32_t> buf_l;
+                  thread_local std::vector<int32_t> buf_d;
+                  const size_t need = (size_t)M * K;
+                  if (buf_l.size() < need) {
+                      buf_l.resize(need);
+                      buf_d.resize(need);
+                  }
+                  stage("alloc scratch");
+
+                  // 1. Chamfer top-K sweep (ND).
+                  #define DISPATCH_SWEEP(KK)                                  \
+                      ncolor_cpp::chamfer_topk_l1_nd_sweep<KK>(               \
+                          seed_ptr, shape, buf_l.data(), buf_d.data(),        \
+                          pool.get(), nt)
+                  switch (K) {
+                    case 1: DISPATCH_SWEEP(1); break;
+                    case 2: DISPATCH_SWEEP(2); break;
+                    case 3: DISPATCH_SWEEP(3); break;
+                    case 4: DISPATCH_SWEEP(4); break;
+                    case 5: DISPATCH_SWEEP(5); break;
+                    case 6: DISPATCH_SWEEP(6); break;
+                    case 7: DISPATCH_SWEEP(7); break;
+                    case 8: DISPATCH_SWEEP(8); break;
+                  }
+                  #undef DISPATCH_SWEEP
+                  stage("chamfer top-K");
+
+                  // 2. Aggregate pair counts.
+                  std::vector<int64_t> pair_count((size_t)(N + 1) * (N + 1), 0);
+                  #define DISPATCH_AGG(KK)                                    \
+                      ncolor_cpp::aggregate_topk_pairs<KK>(                   \
+                          buf_l.data(), buf_d.data(), M, N, max_margin,       \
+                          pair_count.data())
+                  switch (K) {
+                    case 1: DISPATCH_AGG(1); break;
+                    case 2: DISPATCH_AGG(2); break;
+                    case 3: DISPATCH_AGG(3); break;
+                    case 4: DISPATCH_AGG(4); break;
+                    case 5: DISPATCH_AGG(5); break;
+                    case 6: DISPATCH_AGG(6); break;
+                    case 7: DISPATCH_AGG(7); break;
+                    case 8: DISPATCH_AGG(8); break;
+                  }
+                  #undef DISPATCH_AGG
+                  stage("aggregate pairs");
+
+                  // 2b. Inject standard 1-NN adjacency into pair_count so it
+                  // ALWAYS passes the min_count threshold, regardless of
+                  // boundary length. Without this, short-boundary 1-NN
+                  // edges (pair_count < min_count) get dropped and the
+                  // labeller assigns them the same colour → visible
+                  // "merged cells" artifact at high min_count.
+                  //
+                  // Walks the 1-NN slot (buf_l[i*K + 0]) and OR-marks every
+                  // pair of pixels-adjacent-with-different-labels by adding
+                  // a sentinel value larger than any reasonable min_count.
+                  // Only handles 2D for now (matches the chamfer kernel's
+                  // supported shapes for the per-pixel adjacency walk).
+                  if (shape.size() == 2) {
+                      const int64_t H = shape[0], W = shape[1];
+                      const int64_t BOOST = (int64_t)1 << 40;
+                      const int32_t pc_stride = N + 1;
+                      auto bump = [&](int32_t a, int32_t b) {
+                          if (a <= 0 || b <= 0 || a == b) return;
+                          int32_t lo = a < b ? a : b;
+                          int32_t hi = a < b ? b : a;
+                          int64_t idx = (int64_t)lo * pc_stride + hi;
+                          if (pair_count[idx] < BOOST) pair_count[idx] += BOOST;
+                      };
+                      // 8-connectivity: each pixel checks its right, down,
+                      // down-right, and down-left neighbours (other 4 are
+                      // duplicates from the previous pixel's perspective).
+                      // Matches what ncolor.connect(conn=2) emits.
+                      for (int64_t y = 0; y < H; ++y) {
+                          for (int64_t x = 0; x < W; ++x) {
+                              const int32_t a = buf_l[((int64_t)y * W + x) * K];
+                              if (x + 1 < W) {
+                                  bump(a, buf_l[((int64_t)y * W + x + 1) * K]);
+                              }
+                              if (y + 1 < H) {
+                                  bump(a, buf_l[((int64_t)(y + 1) * W + x) * K]);
+                                  if (x + 1 < W) {
+                                      bump(a, buf_l[((int64_t)(y + 1) * W + x + 1) * K]);
+                                  }
+                                  if (x > 0) {
+                                      bump(a, buf_l[((int64_t)(y + 1) * W + x - 1) * K]);
+                                  }
+                              }
+                          }
+                      }
+                      stage("inject 1-NN adj");
+                  }
+
+                  // 3. K5-free greedy augmentation.
+                  //   - 1-NN edges (marked with BOOST in step 2b) are
+                  //     always added — they're hard adjacency.
+                  //   - Other top-K candidate edges are tried in
+                  //     descending pair_count order; each is added iff
+                  //     adding it wouldn't create a K_5 substructure.
+                  //   - Why K_5-free: K_5 ⇒ chromatic number ≥ 5, so
+                  //     skipping these keeps the graph 4-colourable for
+                  //     planar-like adjacency patterns. K_5-free is
+                  //     NECESSARY but not SUFFICIENT for chromatic ≤ 4
+                  //     on non-planar graphs (Grötzsch etc.); the
+                  //     greedy + TabuCol stage that follows handles the
+                  //     residual hard cases.
+                  // Param `min_count` is retained in the signature for
+                  // backward compat but is unused — K_5-freeness is the
+                  // new selection rule, not a fixed pair-count threshold.
+                  (void)min_count;
+                  const int64_t BOOST = (int64_t)1 << 40;
+                  const int32_t pc_stride = N + 1;
+
+                  // Collect non-empty candidates (a < b, pair_count > 0).
+                  std::vector<std::tuple<int64_t, int32_t, int32_t>> cands;
+                  cands.reserve(2 * (size_t)N);
+                  for (int32_t a = 1; a <= N; ++a) {
+                      for (int32_t b = a + 1; b <= N; ++b) {
+                          int64_t c = pair_count[(int64_t)a * pc_stride + b];
+                          if (c > 0) cands.emplace_back(c, a - 1, b - 1);
+                      }
+                  }
+                  // Sort by count descending. 1-NN edges (count >= BOOST)
+                  // come first, so they're added before any K_5 check
+                  // could prune them.
+                  std::sort(cands.begin(), cands.end(),
+                      [](const auto& x, const auto& y) {
+                          return std::get<0>(x) > std::get<0>(y);
+                      });
+
+                  // Adjacency: per-vertex sorted vector for binary-search
+                  // membership tests during the K_5 check.
+                  std::vector<std::vector<int32_t>> adj_list((size_t)N);
+                  auto has_edge = [&](int32_t u, int32_t v) -> bool {
+                      auto& nu = adj_list[u];
+                      return std::binary_search(nu.begin(), nu.end(), v);
+                  };
+                  auto add_oneway = [&](int32_t u, int32_t v) {
+                      auto& nu = adj_list[u];
+                      auto it = std::lower_bound(nu.begin(), nu.end(), v);
+                      nu.insert(it, v);
+                  };
+                  auto would_make_k5 = [&](int32_t a, int32_t b) -> bool {
+                      // Common neighbours of a and b in the CURRENT adj.
+                      std::vector<int32_t> common;
+                      common.reserve(adj_list[a].size());
+                      for (int32_t c : adj_list[a]) {
+                          if (has_edge(b, c)) common.push_back(c);
+                      }
+                      if (common.size() < 3) return false;
+                      // Triangle search among common neighbours.
+                      const size_t M = common.size();
+                      for (size_t i = 0; i < M; ++i) {
+                          int32_t c = common[i];
+                          for (size_t j = i + 1; j < M; ++j) {
+                              int32_t d = common[j];
+                              if (!has_edge(c, d)) continue;
+                              for (size_t k = j + 1; k < M; ++k) {
+                                  int32_t e = common[k];
+                                  if (has_edge(c, e) && has_edge(d, e))
+                                      return true;
+                              }
+                          }
+                      }
+                      return false;
+                  };
+
+                  int n_added_dbg = 0, n_skipped_k5_dbg = 0;
+                  for (auto& [cnt, a, b] : cands) {
+                      if (cnt >= BOOST) {
+                          // 1-NN: always add, no K_5 check.
+                          add_oneway(a, b); add_oneway(b, a);
+                          ++n_added_dbg; continue;
+                      }
+                      if (would_make_k5(a, b)) { ++n_skipped_k5_dbg; continue; }
+                      add_oneway(a, b); add_oneway(b, a);
+                      ++n_added_dbg;
+                  }
+                  if (dbg_print) {
+                      std::fprintf(stderr,
+                          "[topk] K5-free aug:  +%d edges, %d skipped\n",
+                          n_added_dbg, n_skipped_k5_dbg);
+                  }
+
+                  // Pack adj_list → CSR.
+                  std::vector<int32_t> indptr((size_t)N + 1, 0);
+                  for (int32_t u = 0; u < N; ++u)
+                      indptr[u + 1] = indptr[u] + (int32_t)adj_list[u].size();
+                  std::vector<int32_t> indices((size_t)indptr[N], 0);
+                  for (int32_t u = 0; u < N; ++u) {
+                      std::copy(adj_list[u].begin(), adj_list[u].end(),
+                                indices.begin() + indptr[u]);
+                  }
+                  stage("K5-free CSR build");
+
+                  // 4. Color the graph (multi-attempt greedy + TabuCol
+                  //    fallback). Mirrors Solver::solve_coloring_:
+                  //    at each depth, try 4 attempts (WP + 3 BFS variants)
+                  //    before falling through to TabuCol.
+                  std::vector<uint8_t> colors((size_t)N, 0);
+                  std::vector<uint8_t> best_attempt;
+                  const int64_t max_iter = std::max<int64_t>(
+                      (int64_t)indices.size() + N, 512);
+                  int cur_n = n_colors;
+                  bool ok = false;
+                  int dbg_tabu_fired = 0;
+                  const int attempts_per_n = 4;
+                  for (int depth = 0; depth < max_depth && !ok; ++depth) {
+                      for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
+                          // Slot 0 = WP; remaining slots = BFS with
+                          // different offsets.
+                          bool wp = (attempt == 0);
+                          bool finished = ncolor_cpp::color_graph_csr_legacy(
+                              indptr.data(), indices.data(), N, cur_n, 10,
+                              depth + attempt, max_iter, colors, wp,
+                              nullptr, nullptr, 0);
+                          bool conflict = !finished || ncolor_cpp::has_conflict_csr(
+                              indptr.data(), indices.data(), N, colors.data());
+                          if (conflict) {
+                              ncolor_cpp::repair_coloring(
+                                  indptr.data(), indices.data(), N, cur_n,
+                                  std::max(4, max_depth), colors);
+                              conflict = ncolor_cpp::has_conflict_csr(
+                                  indptr.data(), indices.data(), N, colors.data());
+                          }
+                          if (!conflict) { ok = true; break; }
+                          // Save the conflicted result for TabuCol seed.
+                          if (best_attempt.empty()) best_attempt = colors;
+                      }
+                      if (ok) break;
+                      ++dbg_tabu_fired;
+                      colors = best_attempt;
+                      if (cur_n == n_colors) {
+                          for (int32_t u = 0; u < N; ++u)
+                              if (colors[u] < 1 || colors[u] > cur_n)
+                                  colors[u] = 1;
+                          const int64_t budget_ns = 200LL * 1000LL * 1000LL;
+                          const int64_t deadline_ns =
+                              std::chrono::steady_clock::now()
+                                  .time_since_epoch().count() + budget_ns;
+                          const int per_seed_iters = std::min(
+                              50000, std::max(2000, N * 30));
+                          std::vector<uint8_t> saved = colors;
+                          uint64_t base_seed =
+                              (uint64_t)(depth + 1) * 0x9e3779b97f4a7c15ULL;
+                          for (int s = 0; s < 24 && !ok; ++s) {
+                              if (std::chrono::steady_clock::now()
+                                      .time_since_epoch().count() > deadline_ns) break;
+                              uint64_t rs = base_seed + (uint64_t)s * 0xdeadbeefcafebabeULL;
+                              if (s == 0) {
+                                  colors = saved;
+                              } else {
+                                  uint64_t rng = rs;
+                                  for (int32_t u = 0; u < N; ++u) {
+                                      rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                                      colors[u] = (uint8_t)(1 + ((rng >> 32) % (uint32_t)cur_n));
+                                  }
+                              }
+                              if (ncolor_cpp::tabucol(
+                                      indptr.data(), indices.data(), N, cur_n,
+                                      per_seed_iters, colors, rs, deadline_ns)) {
+                                  ok = true;
+                              }
+                          }
+                      }
+                      if (!ok) ++cur_n;
+                  }
+                  for (uint8_t c : colors) if (c > n_used) n_used = c;
+                  if (dbg_print) std::fprintf(stderr,
+                      "[topk]    tabucol fallback fired: %d times, "
+                      "cur_n=%d, n_used=%d\n", dbg_tabu_fired, cur_n, n_used);
+                  stage("color graph");
+
+                  // 5. Apply LUT to slot-0 (= 1-NN expansion).
+                  std::vector<uint8_t> lut((size_t)N + 1, 0);
+                  for (int32_t i = 0; i < N; ++i) lut[i + 1] = colors[i];
+                  for (int64_t i = 0; i < M; ++i) {
+                      out_ptr[i] = lut[buf_l[i * K]];
+                  }
+                  stage("apply LUT");
+              }
+              return {std::move(out), n_used};
+          },
+          py::arg("seed_image"), py::arg("K") = 4,
+          py::arg("max_margin") = 2, py::arg("min_count") = 1,
+          py::arg("n_colors") = 4, py::arg("max_depth") = 30,
+          py::arg("n_threads") = -1.0,
+          "Fully-fused top-K colour-labelling. ND-aware single C++ entry\n"
+          "point: chamfer top-K -> pair count aggregation -> CSR build\n"
+          "-> color (greedy + TabuCol) -> apply LUT to expanded image.\n"
+          "Returns (output_image[same shape as seed_image] uint8, n_used).");
+
+    // topk_k5free_extras: returns the K5-free augmentation pairs as an
+    // (E, 2) int32 array of 1-indexed (a, b) cell pairs that are NOT
+    // already 1-NN adjacent but should be constrained to differ. Use
+    // this output as the `extra_edges=` arg to ncolor.label().
+    //   Pipeline (fully C++, no Python overhead):
+    //     1. chamfer top-K sweep over the image
+    //     2. aggregate margin-filtered pair counts
+    //     3. walk slot-0 of the chamfer output to find 1-NN edges (8-conn)
+    //     4. mark 1-NN edges with a BOOST so they sort first
+    //     5. K5-free greedy: sort candidates by count desc, skip K5
+    //     6. emit only the NON-1-NN edges that survived greedy
+    // For a 2D bacterial input (~160 cells, 250x250) this should be
+    // ~3-5 ms total (chamfer dominates).
+    m.def("topk_k5free_extras",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> seed_image,
+             int K, int32_t max_margin, int32_t max_extras, double n_threads_in)
+             -> py::array_t<int32_t>
+          {
+              const auto sb = seed_image.request();
+              if (sb.ndim != 2) throw std::invalid_argument(
+                  "topk_k5free_extras: seed_image must be 2D");
+              if (K < 1 || K > 8) throw std::invalid_argument(
+                  "topk_k5free_extras: K must be 1..8");
+              const int64_t H = sb.shape[0], W = sb.shape[1];
+              const int64_t M_px = H * W;
+              const int32_t* seed_ptr = (const int32_t*)sb.ptr;
+
+              int32_t N = 0;
+              for (int64_t i = 0; i < M_px; ++i)
+                  if (seed_ptr[i] > N) N = seed_ptr[i];
+
+              int nt = (M_px < 250000) ? 1 : resolve_threads(n_threads_in);
+              std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
+              if (nt > 1) pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
+
+              std::vector<int32_t> buf_l((size_t)M_px * K);
+              std::vector<int32_t> buf_d((size_t)M_px * K);
+              std::vector<int64_t> pair_count((size_t)(N + 1) * (N + 1), 0);
+              std::vector<std::tuple<int64_t, int32_t, int32_t>> emitted;
+
+              {
+                  py::gil_scoped_release release;
+                  const std::vector<int64_t> shape{H, W};
+
+                  // 1. Chamfer top-K.
+                  #define DISP_SWEEP(KK) \
+                      ncolor_cpp::chamfer_topk_l1_nd_sweep<KK>(seed_ptr, shape, \
+                          buf_l.data(), buf_d.data(), pool.get(), nt)
+                  switch (K) {
+                    case 1: DISP_SWEEP(1); break; case 2: DISP_SWEEP(2); break;
+                    case 3: DISP_SWEEP(3); break; case 4: DISP_SWEEP(4); break;
+                    case 5: DISP_SWEEP(5); break; case 6: DISP_SWEEP(6); break;
+                    case 7: DISP_SWEEP(7); break; case 8: DISP_SWEEP(8); break;
+                  }
+                  #undef DISP_SWEEP
+
+                  // 2. Aggregate pair counts.
+                  #define DISP_AGG(KK) \
+                      ncolor_cpp::aggregate_topk_pairs<KK>(buf_l.data(), \
+                          buf_d.data(), M_px, N, max_margin, pair_count.data())
+                  switch (K) {
+                    case 1: DISP_AGG(1); break; case 2: DISP_AGG(2); break;
+                    case 3: DISP_AGG(3); break; case 4: DISP_AGG(4); break;
+                    case 5: DISP_AGG(5); break; case 6: DISP_AGG(6); break;
+                    case 7: DISP_AGG(7); break; case 8: DISP_AGG(8); break;
+                  }
+                  #undef DISP_AGG
+
+                  // 3. Inject 1-NN adj from slot-0 via 8-conn pixel walk.
+                  // BOOST puts 1-NN pairs at the front of the sort, so
+                  // the K5-free greedy adds them first (without K5 check).
+                  const int64_t BOOST = (int64_t)1 << 40;
+                  const int32_t stride = N + 1;
+                  auto bump = [&](int32_t a, int32_t b) {
+                      if (a <= 0 || b <= 0 || a == b) return;
+                      int32_t lo = a < b ? a : b;
+                      int32_t hi = a < b ? b : a;
+                      int64_t idx = (int64_t)lo * stride + hi;
+                      if (pair_count[idx] < BOOST) pair_count[idx] += BOOST;
+                  };
+                  for (int64_t y = 0; y < H; ++y) {
+                      for (int64_t x = 0; x < W; ++x) {
+                          const int32_t a = buf_l[((int64_t)y * W + x) * K];
+                          if (x + 1 < W)
+                              bump(a, buf_l[((int64_t)y * W + x + 1) * K]);
+                          if (y + 1 < H) {
+                              bump(a, buf_l[((int64_t)(y + 1) * W + x) * K]);
+                              if (x + 1 < W)
+                                  bump(a, buf_l[((int64_t)(y + 1) * W + x + 1) * K]);
+                              if (x > 0)
+                                  bump(a, buf_l[((int64_t)(y + 1) * W + x - 1) * K]);
+                          }
+                      }
+                  }
+
+                  // 4. K5-free greedy.
+                  std::vector<std::tuple<int64_t, int32_t, int32_t>> cands;
+                  cands.reserve(2 * (size_t)N);
+                  for (int32_t a = 1; a <= N; ++a) {
+                      for (int32_t b = a + 1; b <= N; ++b) {
+                          int64_t c = pair_count[(int64_t)a * stride + b];
+                          if (c > 0) cands.emplace_back(c, a, b);
+                      }
+                  }
+                  std::sort(cands.begin(), cands.end(),
+                      [](const auto& x, const auto& y) {
+                          return std::get<0>(x) > std::get<0>(y);
+                      });
+
+                  std::vector<std::vector<int32_t>> adj_list((size_t)(N + 1));
+                  auto has_edge = [&](int32_t u, int32_t v) -> bool {
+                      auto& nu = adj_list[u];
+                      return std::binary_search(nu.begin(), nu.end(), v);
+                  };
+                  auto add_oneway = [&](int32_t u, int32_t v) {
+                      auto& nu = adj_list[u];
+                      auto it = std::lower_bound(nu.begin(), nu.end(), v);
+                      nu.insert(it, v);
+                  };
+                  auto would_make_k5 = [&](int32_t a, int32_t b) -> bool {
+                      std::vector<int32_t> common;
+                      common.reserve(adj_list[a].size());
+                      for (int32_t c : adj_list[a])
+                          if (has_edge(b, c)) common.push_back(c);
+                      if (common.size() < 3) return false;
+                      for (size_t i = 0; i < common.size(); ++i) {
+                          int32_t c = common[i];
+                          for (size_t j = i + 1; j < common.size(); ++j) {
+                              int32_t d = common[j];
+                              if (!has_edge(c, d)) continue;
+                              for (size_t k = j + 1; k < common.size(); ++k) {
+                                  int32_t e = common[k];
+                                  if (has_edge(c, e) && has_edge(d, e))
+                                      return true;
+                              }
+                          }
+                      }
+                      return false;
+                  };
+
+                  for (auto& [cnt, a, b] : cands) {
+                      if (cnt >= BOOST) {
+                          // 1-NN: add unconditionally, but DON'T emit
+                          // as extra (the labeller's connect() will
+                          // find it on its own).
+                          add_oneway(a, b); add_oneway(b, a);
+                          continue;
+                      }
+                      // Cap: stop emitting once we have max_extras
+                      // (highest-count extras come first since sorted
+                      // desc). max_extras <= 0 means no cap.
+                      if (max_extras > 0 &&
+                          (int32_t)emitted.size() >= max_extras) break;
+                      if (would_make_k5(a, b)) continue;
+                      add_oneway(a, b); add_oneway(b, a);
+                      emitted.emplace_back(cnt, a, b);
+                  }
+              }  // GIL re-acquired here
+
+              // Pack output: (E, 2) int32 array of 1-indexed (a, b).
+              const int32_t E = (int32_t)emitted.size();
+              py::array_t<int32_t> out({(py::ssize_t)E, (py::ssize_t)2});
+              int32_t* op = (int32_t*)out.request().ptr;
+              for (int32_t i = 0; i < E; ++i) {
+                  op[2 * i]     = std::get<1>(emitted[i]);
+                  op[2 * i + 1] = std::get<2>(emitted[i]);
+              }
+              return out;
+          },
+          py::arg("seed_image"), py::arg("K") = 4,
+          py::arg("max_margin") = 2, py::arg("max_extras") = 50,
+          py::arg("n_threads") = -1.0,
+          "K5-free top-K augmentation pairs. Returns an (E, 2) int32\n"
+          "array of 1-indexed cell pairs to inject as extra_edges into\n"
+          "ncolor.label, providing must-differ-color constraints that\n"
+          "the standard 1-NN connect() misses due to pixel-level gaps.\n"
+          "max_extras caps emitted pairs (sorted by pair_count desc, so\n"
+          "the cap drops the weakest constraints first). Default 50 is\n"
+          "empirically safe — beyond ~50-75 extras the augmented graph\n"
+          "can exceed TabuCol's heuristic 4-coloring reach. Pass 0 to\n"
+          "disable the cap.");
+
+    m.def("chamfer_topk_pair_counts",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> seed_image,
+             int K, int32_t n_cells, int32_t max_margin, double n_threads_in)
+             -> py::array_t<int64_t>
+          {
+              const auto sb = seed_image.request();
+              if (sb.ndim != 2) throw std::invalid_argument(
+                  "chamfer_topk_pair_counts: seed_image must be 2D");
+              const int32_t H = static_cast<int32_t>(sb.shape[0]);
+              const int32_t W = static_cast<int32_t>(sb.shape[1]);
+              if (K < 1 || K > 8) throw std::invalid_argument(
+                  "chamfer_topk_pair_counts: K must be 1..8");
+              py::array_t<int64_t> pc({(py::ssize_t)(n_cells + 1), (py::ssize_t)(n_cells + 1)});
+              int64_t* pc_ptr = static_cast<int64_t*>(pc.request().ptr);
+              std::fill(pc_ptr, pc_ptr + (int64_t)(n_cells + 1) * (n_cells + 1), 0);
+              const int32_t* seed_ptr = static_cast<const int32_t*>(sb.ptr);
+              // Skip the auto-threads Python call for small images:
+              // they always serialise anyway.
+              const int64_t total_px = (int64_t)H * W;
+              int nt = (total_px < 250000) ? 1 : resolve_threads(n_threads_in);
+              std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
+              if (nt > 1) pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
+              {
+                  py::gil_scoped_release release;
+                  switch (K) {
+                    case 1: ncolor_cpp::chamfer_topk_pair_counts<1>(seed_ptr, H, W, n_cells, max_margin, pc_ptr, pool.get(), nt); break;
+                    case 2: ncolor_cpp::chamfer_topk_pair_counts<2>(seed_ptr, H, W, n_cells, max_margin, pc_ptr, pool.get(), nt); break;
+                    case 3: ncolor_cpp::chamfer_topk_pair_counts<3>(seed_ptr, H, W, n_cells, max_margin, pc_ptr, pool.get(), nt); break;
+                    case 4: ncolor_cpp::chamfer_topk_pair_counts<4>(seed_ptr, H, W, n_cells, max_margin, pc_ptr, pool.get(), nt); break;
+                    case 5: ncolor_cpp::chamfer_topk_pair_counts<5>(seed_ptr, H, W, n_cells, max_margin, pc_ptr, pool.get(), nt); break;
+                    case 6: ncolor_cpp::chamfer_topk_pair_counts<6>(seed_ptr, H, W, n_cells, max_margin, pc_ptr, pool.get(), nt); break;
+                    case 7: ncolor_cpp::chamfer_topk_pair_counts<7>(seed_ptr, H, W, n_cells, max_margin, pc_ptr, pool.get(), nt); break;
+                    case 8: ncolor_cpp::chamfer_topk_pair_counts<8>(seed_ptr, H, W, n_cells, max_margin, pc_ptr, pool.get(), nt); break;
+                  }
+              }
+              return pc;
+          },
+          py::arg("seed_image"), py::arg("K") = 4, py::arg("n_cells") = -1,
+          py::arg("max_margin") = 2, py::arg("n_threads") = -1.0,
+          "Fused top-K chamfer + pair-count aggregation. Returns the\n"
+          "(n_cells+1)x(n_cells+1) symmetric pair-count matrix (upper\n"
+          "triangle only). Skips the intermediate label/dist arrays —\n"
+          "saves ~5ms numpy overhead vs calling chamfer_topk_l1_2d and\n"
+          "aggregate_topk_pairs separately.");
+
+    m.def("aggregate_topk_pairs",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> topk_labels,
+             int32_t N,
+             py::object topk_dists_obj,
+             int32_t max_margin)
+             -> py::array_t<int64_t>
+          {
+              const auto tb = topk_labels.request();
+              if (tb.ndim < 1) throw std::invalid_argument(
+                  "aggregate_topk_pairs: expects shape (..., K)");
+              const int64_t K = tb.shape[tb.ndim - 1];
+              int64_t M = 1;
+              for (ssize_t d = 0; d < tb.ndim - 1; ++d) M *= tb.shape[d];
+              py::array_t<int64_t> pc({(py::ssize_t)(N + 1), (py::ssize_t)(N + 1)});
+              int64_t* pc_ptr = static_cast<int64_t*>(pc.request().ptr);
+              std::fill(pc_ptr, pc_ptr + (int64_t)(N + 1) * (N + 1), 0);
+              const int32_t* lbl_ptr = static_cast<const int32_t*>(tb.ptr);
+              const int32_t* dst_ptr = nullptr;
+              py::buffer_info db;
+              if (!topk_dists_obj.is_none()) {
+                  auto dist_arr = topk_dists_obj.cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+                  db = dist_arr.request();
+                  dst_ptr = static_cast<const int32_t*>(db.ptr);
+              }
+              {
+                  py::gil_scoped_release release;
+                  switch (K) {
+                    case 1: ncolor_cpp::aggregate_topk_pairs<1>(lbl_ptr, dst_ptr, M, N, max_margin, pc_ptr); break;
+                    case 2: ncolor_cpp::aggregate_topk_pairs<2>(lbl_ptr, dst_ptr, M, N, max_margin, pc_ptr); break;
+                    case 3: ncolor_cpp::aggregate_topk_pairs<3>(lbl_ptr, dst_ptr, M, N, max_margin, pc_ptr); break;
+                    case 4: ncolor_cpp::aggregate_topk_pairs<4>(lbl_ptr, dst_ptr, M, N, max_margin, pc_ptr); break;
+                    case 5: ncolor_cpp::aggregate_topk_pairs<5>(lbl_ptr, dst_ptr, M, N, max_margin, pc_ptr); break;
+                    case 6: ncolor_cpp::aggregate_topk_pairs<6>(lbl_ptr, dst_ptr, M, N, max_margin, pc_ptr); break;
+                    case 7: ncolor_cpp::aggregate_topk_pairs<7>(lbl_ptr, dst_ptr, M, N, max_margin, pc_ptr); break;
+                    case 8: ncolor_cpp::aggregate_topk_pairs<8>(lbl_ptr, dst_ptr, M, N, max_margin, pc_ptr); break;
+                    default: throw std::invalid_argument(
+                        "aggregate_topk_pairs: K must be 1..8");
+                  }
+              }
+              return pc;
+          },
+          py::arg("topk_labels"), py::arg("n_cells"),
+          py::arg("topk_dists") = py::none(),
+          py::arg("max_margin") = std::numeric_limits<int32_t>::max(),
+          "Aggregate per-pixel top-K labels into a (N+1)x(N+1) symmetric\n"
+          "pair count matrix (upper triangle only). pair_count[a, b] = number\n"
+          "of pixels where a and b both appear in the top-K (any positions).\n"
+          "If topk_dists is provided, only count cells whose dist is within\n"
+          "max_margin of the closest cell's dist at each pixel.");
+
+    // ------------------------------------------------------------------
+    // color_csr: run the labeller's greedy + repair + TabuCol pipeline
+    // on a caller-provided CSR adjacency. Same algorithm as inside
+    // Solver::label, but operating on an arbitrary input graph (not the
+    // expand_labels+connect graph). Useful for colouring graphs built
+    // by alternate constructions (e.g. top-K pair counts).
+    //
+    // Returns (colors[N] uint8 in 1..n_used, n_used). cur_n bumps up
+    // from `n_colors` if greedy + TabuCol can't find a valid colouring
+    // at that count within the time budget (200 ms TabuCol cap).
+    // ------------------------------------------------------------------
+    m.def("color_csr",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> indptr,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> indices,
+             int n_colors, int max_depth, int rand_period)
+             -> std::pair<py::array_t<uint8_t>, int>
+          {
+              const auto ip = indptr.request();
+              const auto ix = indices.request();
+              if (ip.size < 1) throw std::invalid_argument(
+                  "color_csr: empty indptr");
+              const int32_t N = static_cast<int32_t>(ip.size - 1);
+              const int32_t* ip_ptr = static_cast<const int32_t*>(ip.ptr);
+              const int32_t* ix_ptr = static_cast<const int32_t*>(ix.ptr);
+              std::vector<uint8_t> colors(static_cast<size_t>(N), 0);
+              int n_used = 0;
+              {
+                  py::gil_scoped_release release;
+                  const int64_t max_iter = std::max<int64_t>(
+                      static_cast<int64_t>(ix.size) + N, 512);
+                  int cur_n = n_colors;
+                  bool ok = false;
+                  for (int depth = 0; depth < max_depth && !ok; ++depth) {
+                      bool wp = (depth == 0);  // Welsh-Powell first
+                      bool finished = ncolor_cpp::color_graph_csr_legacy(
+                          ip_ptr, ix_ptr, N, cur_n, rand_period,
+                          depth, max_iter, colors, wp,
+                          nullptr, nullptr, 0);
+                      bool conflict = !finished || ncolor_cpp::has_conflict_csr(
+                          ip_ptr, ix_ptr, N, colors.data());
+                      if (conflict) {
+                          ncolor_cpp::repair_coloring(
+                              ip_ptr, ix_ptr, N, cur_n,
+                              std::max(4, max_depth), colors);
+                          conflict = ncolor_cpp::has_conflict_csr(
+                              ip_ptr, ix_ptr, N, colors.data());
+                      }
+                      if (!conflict) { ok = true; break; }
+
+                      // TabuCol fallback at user target k only.
+                      if (cur_n == n_colors) {
+                          for (int32_t u = 0; u < N; ++u)
+                              if (colors[u] < 1 || colors[u] > cur_n)
+                                  colors[u] = 1;
+                          const int64_t budget_ns =
+                              200LL * 1000LL * 1000LL;
+                          const int64_t deadline_ns =
+                              std::chrono::steady_clock::now()
+                                  .time_since_epoch().count() + budget_ns;
+                          const int per_seed_iters = std::min(
+                              50000, std::max(2000, N * 30));
+                          std::vector<uint8_t> saved = colors;
+                          uint64_t base_seed =
+                              (uint64_t)(depth + 1) * 0x9e3779b97f4a7c15ULL;
+                          for (int s = 0; s < 24 && !ok; ++s) {
+                              if (std::chrono::steady_clock::now()
+                                      .time_since_epoch().count() > deadline_ns) break;
+                              uint64_t rs = base_seed + (uint64_t)s * 0xdeadbeefcafebabeULL;
+                              if (s == 0) {
+                                  colors = saved;
+                              } else {
+                                  uint64_t rng = rs;
+                                  for (int32_t u = 0; u < N; ++u) {
+                                      rng = rng * 6364136223846793005ULL + 1442695040888963407ULL;
+                                      colors[u] = (uint8_t)(1 + ((rng >> 32) % (uint32_t)cur_n));
+                                  }
+                              }
+                              if (ncolor_cpp::tabucol(
+                                      ip_ptr, ix_ptr, N, cur_n,
+                                      per_seed_iters, colors, rs,
+                                      deadline_ns)) {
+                                  ok = true;
+                              }
+                          }
+                      }
+                      if (!ok) ++cur_n;
+                  }
+                  n_used = 0;
+                  for (uint8_t c : colors) if (c > n_used) n_used = c;
+              }
+              py::array_t<uint8_t> out({(py::ssize_t)N});
+              std::memcpy(out.request().ptr, colors.data(), N * sizeof(uint8_t));
+              return {std::move(out), n_used};
+          },
+          py::arg("indptr"), py::arg("indices"),
+          py::arg("n_colors") = 4, py::arg("max_depth") = 30,
+          py::arg("rand_period") = 10,
+          "Color a CSR-encoded graph using the labeller's greedy + repair "
+          "+ TabuCol pipeline. Returns (colors[N] in 1..n_used, n_used). "
+          "cur_n bumps if 4-coloring can't be found within ~200 ms TabuCol "
+          "budget.");
+
     m.def("two_hop_csr",
           [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indptr,
              py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indices)
@@ -1434,6 +2841,82 @@ PYBIND11_MODULE(_impl, m) {
           "Each input pair emits two CSR entries (u→v and v→u). Returns\n"
           "(indptr, indices, weights).");
 
+    // bb_dsatur: branch-and-bound k-coloring with DSatur ordering.
+    // Exact, deterministic. Returns (colors[N] uint8, ok bool).
+    m.def("bb_dsatur",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> indptr,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> indices,
+             int32_t k, int64_t node_budget)
+             -> std::pair<py::array_t<uint8_t>, bool>
+          {
+              const auto ib = indptr.request();
+              const auto xb = indices.request();
+              if (ib.size < 1) throw std::invalid_argument("bb_dsatur: indptr empty");
+              const int32_t N = static_cast<int32_t>(ib.size - 1);
+              std::vector<uint8_t> colors;
+              bool ok;
+              {
+                  py::gil_scoped_release release;
+                  ok = ncolor_cpp::bb_dsatur(
+                      (const int32_t*)ib.ptr, (const int32_t*)xb.ptr,
+                      N, k, colors, node_budget);
+              }
+              py::array_t<uint8_t> out({(py::ssize_t)N});
+              if (ok) {
+                  std::memcpy(out.request().ptr, colors.data(),
+                              (size_t)N * sizeof(uint8_t));
+              } else {
+                  std::memset(out.request().ptr, 0, (size_t)N);
+              }
+              return {std::move(out), ok};
+          },
+          py::arg("indptr"), py::arg("indices"),
+          py::arg("k") = 4, py::arg("node_budget") = (int64_t)0,
+          "Branch-and-bound k-coloring with DSatur ordering. Exact;\n"
+          "returns (colors[N] uint8 in 1..k if ok, ok bool). For\n"
+          "K_5-free graphs of a few thousand vertices that ARE\n"
+          "k-colourable, runs in a few ms. node_budget caps recursion;\n"
+          "0 = unbounded.");
+
+    // hea: Hybrid Evolutionary Algorithm for k-coloring. Standalone
+    // entry point for testing on arbitrary CSR graphs. Returns the best
+    // colouring found (uint8 [N]) and the residual conflict count.
+    m.def("hea",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> indptr,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> indices,
+             int32_t k, int max_generations, int pop_size,
+             int init_tabu_iters, int gen_tabu_iters, uint64_t seed)
+             -> std::pair<py::array_t<uint8_t>, int>
+          {
+              const auto ib = indptr.request();
+              const auto xb = indices.request();
+              if (ib.size < 1) throw std::invalid_argument("hea: indptr empty");
+              const int32_t N = static_cast<int32_t>(ib.size - 1);
+              std::vector<uint8_t> colors((size_t)N, 1);
+              {
+                  py::gil_scoped_release release;
+                  ncolor_cpp::hea(
+                      (const int32_t*)ib.ptr, (const int32_t*)xb.ptr,
+                      N, k, colors,
+                      max_generations, pop_size, init_tabu_iters,
+                      gen_tabu_iters, seed);
+              }
+              const int conf = ncolor_cpp::count_conflicts_csr(
+                  (const int32_t*)ib.ptr, (const int32_t*)xb.ptr,
+                  N, colors.data());
+              py::array_t<uint8_t> out({(py::ssize_t)N});
+              std::memcpy(out.request().ptr, colors.data(),
+                          (size_t)N * sizeof(uint8_t));
+              return {std::move(out), conf};
+          },
+          py::arg("indptr"), py::arg("indices"),
+          py::arg("k") = 4, py::arg("max_generations") = 50,
+          py::arg("pop_size") = 5,
+          py::arg("init_tabu_iters") = 200, py::arg("gen_tabu_iters") = 1000,
+          py::arg("seed") = 0,
+          "Hybrid Evolutionary Algorithm for k-coloring. Returns\n"
+          "(colors [N] uint8 in 1..k, residual_conflicts int).");
+
     m.def("kempe_sa",
           [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> initial_colors,
              py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indptr,
@@ -1444,7 +2927,8 @@ PYBIND11_MODULE(_impl, m) {
              py::array_t<int32_t, py::array::c_style | py::array::forcecast> iou_indices,
              py::array_t<double,  py::array::c_style | py::array::forcecast> iou_weights,
              int n_colors, double alpha_2hop, double gamma_iou,
-             int n_iters, double T0, double T_min, double alpha_cool,
+             int n_iters, int patience,
+             double T0, double T_min, double alpha_cool,
              uint64_t rng_seed) -> std::pair<py::array_t<uint8_t>, double>
           {
               const auto ic_buf = initial_colors.request();
@@ -1476,6 +2960,7 @@ PYBIND11_MODULE(_impl, m) {
               params.alpha_2hop = alpha_2hop;
               params.gamma_iou  = gamma_iou;
               params.n_iters    = n_iters;
+              params.patience   = patience;
               params.T0         = T0;
               params.T_min      = T_min;
               params.alpha_cool = alpha_cool;
@@ -1509,6 +2994,7 @@ PYBIND11_MODULE(_impl, m) {
           py::arg("alpha_2hop") = 1.0,
           py::arg("gamma_iou") = 50.0,
           py::arg("n_iters") = 30000,
+          py::arg("patience") = 1000,
           py::arg("T0") = 2.0,
           py::arg("T_min") = 0.001,
           py::arg("alpha_cool") = 0.9998,

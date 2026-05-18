@@ -26,7 +26,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           check_conflicts=False, return_conflicts=False, format_input=True,
           out=None, p=1, wrap=False, balance=True, first_seen=False,
           weight_objective=0, de_table=None, weight_mode="min",
-          optimize=None):
+          optimize=None, extra_edges=None, connect_radius=1):
     """4-color graph coloring of a label image.
 
     Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
@@ -153,6 +153,14 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     else:
         wmode_int = int(weight_mode)
 
+    extra_arr = None
+    if extra_edges is not None:
+        extra_arr = np.ascontiguousarray(extra_edges, dtype=np.int32)
+        if extra_arr.ndim != 2 or extra_arr.shape[1] != 2:
+            raise ValueError(
+                f"extra_edges must be an (E, 2) int array of 1-indexed "
+                f"cell-pair constraints; got shape {extra_arr.shape}")
+
     out_array, n_used = solver.label(
         lab_arr,
         n_colors=int(n), max_depth=int(max_depth),
@@ -160,7 +168,8 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
         expand=bool(expand), out=out, wrap=bool(wrap),
         balance=bool(balance), first_seen=bool(first_seen),
         weight_objective=wobj, de_table=de_arr,
-        weight_mode=wmode_int)
+        weight_mode=wmode_int, extra_edges=extra_arr,
+        connect_radius=int(connect_radius))
     out = out_array
 
     if optimize is not None:
