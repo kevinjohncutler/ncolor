@@ -710,7 +710,18 @@ public:
             // is empirically enough to break K_5 cascades on real
             // microscopy data; 20 = full convergence (more aggressive,
             // ~5× slower).
+            // ``lut_lbl_ptr`` is the buffer apply_color_lut_ reads at the
+            // end: by default that's the post-expand ``expanded`` buffer.
+            // When despur runs we want to keep colouring the spur pixels
+            // with their parent cell's colour rather than turning them
+            // into bg, so we save the pre-despur labels into ``lut_lbl_``
+            // and use that for the final LUT application. Despur still
+            // modifies ``expanded`` in place so find_pairs / coloring
+            // operate on the despurred graph.
+            const int32_t* lut_lbl_ptr = expanded;
             if (despur_iters > 0 && expand) {
+                lut_lbl_.assign(expanded, expanded + total);
+                lut_lbl_ptr = lut_lbl_.data();
                 ncolor_cpp::delete_spurs_labels_nd_inplace<int32_t>(
                     expanded, shape, /*threshold=*/1,
                     despur_iters, pool_.get(), n_threads_);
@@ -908,10 +919,13 @@ public:
             stage("color");
 
             // 5. Build LUT (expanded[i] is in 1..N, so lut size = N+1) and
-            // apply it to the expanded-label buffer.
+            // apply it to the expanded-label buffer. When despur ran,
+            // ``lut_lbl_ptr`` points at the pre-despur copy so spur pixels
+            // get their parent cell's colour (they only need to be hidden
+            // from the adjacency graph, not from the final image).
             lut_.assign(static_cast<size_t>(N) + 1, 0);
             for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
-            apply_color_lut_(expanded, out_ptr, total);
+            apply_color_lut_(lut_lbl_ptr, out_ptr, total);
             stage("apply_lut");
         }  // close: if (!early_exit_empty)
         }  // close: gil_scoped_release scope
@@ -1632,6 +1646,11 @@ private:
     std::vector<double> edge_weights_;
     std::vector<uint8_t> colors_;
     std::vector<uint8_t> lut_;
+    // Pre-despur copy of the expanded-label buffer, used by apply_lut so
+    // spur pixels (zeroed out of the despurred working buffer) still get
+    // their parent cell's colour in the final image. Only populated when
+    // ``despur_iters > 0``; otherwise apply_lut reads ``expanded`` directly.
+    std::vector<int32_t> lut_lbl_;
     // Persistent per-thread hashtable buffer for find_pairs (n_threads_ *
     // ht_size entries). Reused across calls so we don't pay malloc/free
     // for ~tens of MB on every label() invocation. find_pairs itself
