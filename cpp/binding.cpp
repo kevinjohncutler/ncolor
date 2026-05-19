@@ -1017,7 +1017,8 @@ private:
         const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE));
         return ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
             labels, shape, conn,
-            static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap, radius);
+            static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap, radius,
+            &fp_ht_buf_);
     }
 
     // Weighted variant: same parallel scan also computes a per-pair
@@ -1041,7 +1042,8 @@ private:
         return ncolor_cpp::find_pairs_weighted_nd_unpadded<int32_t, Mode>(
             labels, dist, shape, conn,
             static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap,
-            primary, counts);
+            primary, counts, 1,
+            &fp_ht_buf_, &fp_primary_buf_, &fp_counts_buf_);
     }
 
     // Coloring loop: try the user-preferred algorithm first, switch to
@@ -1630,6 +1632,14 @@ private:
     std::vector<double> edge_weights_;
     std::vector<uint8_t> colors_;
     std::vector<uint8_t> lut_;
+    // Persistent per-thread hashtable buffer for find_pairs (n_threads_ *
+    // ht_size entries). Reused across calls so we don't pay malloc/free
+    // for ~tens of MB on every label() invocation. find_pairs itself
+    // re-initialises per-thread slots to HT_EMPTY at the start of each
+    // scan, so leaving stale data here between calls is safe.
+    std::vector<uint64_t> fp_ht_buf_;
+    std::vector<double>   fp_primary_buf_;
+    std::vector<int32_t>  fp_counts_buf_;
     int last_n_conflicts_ = 0;
     std::vector<std::pair<std::string, double>> last_stages_;
     // Per-attempt scratch for parallel coloring (one colors vector per

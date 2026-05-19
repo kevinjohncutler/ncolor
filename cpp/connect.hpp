@@ -556,7 +556,10 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
                          const int32_t* dist = nullptr,
                          std::vector<double>* out_primary = nullptr,
                          std::vector<int32_t>* out_counts = nullptr,
-                         int radius = 1) {
+                         int radius = 1,
+                         std::vector<uint64_t>* ht_scratch = nullptr,
+                         std::vector<double>*  primary_scratch = nullptr,
+                         std::vector<int32_t>* counts_scratch = nullptr) {
     if (n_threads < 1) n_threads = 1;
     std::vector<int64_t> strides;
     std::vector<int64_t> nb_flat;
@@ -565,28 +568,58 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
     const int n_nbs = static_cast<int>(nb_flat.size());
     const uint64_t ht_mask = ht_size - 1;
 
-    std::unique_ptr<uint64_t[]> hts(new uint64_t[static_cast<size_t>(n_threads) * ht_size]);
-    std::unique_ptr<double[]>  primary_buf;
-    std::unique_ptr<int32_t[]> counts_buf;
+    // Allocate (or reuse caller-provided scratch) for the per-thread
+    // hashtables. delete[]/new[] of tens of MB on every call is a
+    // measurable cost at high thread counts (~5 ms at 64 threads for
+    // ht_size=65536), so callers running many find_pairs back-to-back
+    // can pass persistent vectors to amortise it. The scan kernel
+    // re-fills each thread's slice with HT_EMPTY before use, so
+    // stale data between calls is safe.
+    const size_t ht_total = static_cast<size_t>(n_threads) * ht_size;
+    std::vector<uint64_t> ht_local;
+    uint64_t* hts_ptr;
+    if (ht_scratch) {
+        if (ht_scratch->size() < ht_total) ht_scratch->resize(ht_total);
+        hts_ptr = ht_scratch->data();
+    } else {
+        ht_local.resize(ht_total);
+        hts_ptr = ht_local.data();
+    }
+    double*  primary_ptr = nullptr;
+    int32_t* counts_ptr  = nullptr;
+    std::vector<double>  primary_local;
+    std::vector<int32_t> counts_local;
     if constexpr (mode_uses_primary(Mode)) {
-        primary_buf.reset(new double[static_cast<size_t>(n_threads) * ht_size]);
+        if (primary_scratch) {
+            if (primary_scratch->size() < ht_total) primary_scratch->resize(ht_total);
+            primary_ptr = primary_scratch->data();
+        } else {
+            primary_local.resize(ht_total);
+            primary_ptr = primary_local.data();
+        }
     }
     if constexpr (mode_uses_count(Mode)) {
-        counts_buf.reset(new int32_t[static_cast<size_t>(n_threads) * ht_size]);
+        if (counts_scratch) {
+            if (counts_scratch->size() < ht_total) counts_scratch->resize(ht_total);
+            counts_ptr = counts_scratch->data();
+        } else {
+            counts_local.resize(ht_total);
+            counts_ptr = counts_local.data();
+        }
     }
     auto thread_primary = [&](int t) -> double* {
-        return primary_buf ? primary_buf.get() + static_cast<size_t>(t) * ht_size : nullptr;
+        return primary_ptr ? primary_ptr + static_cast<size_t>(t) * ht_size : nullptr;
     };
     auto thread_counts = [&](int t) -> int32_t* {
-        return counts_buf ? counts_buf.get() + static_cast<size_t>(t) * ht_size : nullptr;
+        return counts_ptr ? counts_ptr + static_cast<size_t>(t) * ht_size : nullptr;
     };
 
     if (n_threads == 1 || shape[0] < 2) {
-        std::fill_n(hts.get(), ht_size, HT_EMPTY);
+        std::fill_n(hts_ptr, ht_size, HT_EMPTY);
         scan_band_unpadded<T, Wrap, Mode>(
             lbl, shape, strides.data(), nb_flat.data(),
             nb_dc.data(), n_nbs, 0, shape[0],
-            hts.get(), ht_mask, dist,
+            hts_ptr, ht_mask, dist,
             thread_primary(0), thread_counts(0), radius);
     } else {
         // Phase 1: per-worker scan + first-touch HT (NUCA-local).
@@ -595,7 +628,7 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
         pool.parallel([&]() {
             int t;
             while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_threads) {
-                uint64_t* ht = hts.get() + static_cast<size_t>(t) * ht_size;
+                uint64_t* ht = hts_ptr + static_cast<size_t>(t) * ht_size;
                 std::fill_n(ht, ht_size, HT_EMPTY);
                 // primary/counts only valid where ht[h] != HT_EMPTY; no init needed.
                 const int64_t z0 = static_cast<int64_t>(t) * per;
@@ -619,8 +652,8 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
                     const int dst = p * 2 * stride;
                     const int src = dst + stride;
                     if (src >= n_threads) continue;
-                    uint64_t* dst_ht = hts.get() + static_cast<size_t>(dst) * ht_size;
-                    const uint64_t* src_ht = hts.get() + static_cast<size_t>(src) * ht_size;
+                    uint64_t* dst_ht = hts_ptr + static_cast<size_t>(dst) * ht_size;
+                    const uint64_t* src_ht = hts_ptr + static_cast<size_t>(src) * ht_size;
                     if constexpr (Mode == ReduceMode::Off) {
                         ht_merge(src_ht, dst_ht, ht_size);
                     } else {
@@ -636,9 +669,9 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
     }
     std::vector<std::pair<int32_t, int32_t>> out;
     out.reserve(64);
-    const uint64_t* root = hts.get();
-    const double*  root_p = primary_buf ? primary_buf.get() : nullptr;
-    const int32_t* root_c = counts_buf  ? counts_buf.get()  : nullptr;
+    const uint64_t* root = hts_ptr;
+    const double*  root_p = primary_ptr;
+    const int32_t* root_c = counts_ptr;
     if constexpr (Mode != ReduceMode::Off) {
         if (out_primary) out_primary->clear();
         if (out_counts)  out_counts->clear();
@@ -665,15 +698,16 @@ std::vector<std::pair<int32_t, int32_t>>
 find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
                        int conn, uint64_t ht_size, int n_threads,
                        ForkJoinPool& pool, bool wrap = false,
-                       int radius = 1) {
+                       int radius = 1,
+                       std::vector<uint64_t>* ht_scratch = nullptr) {
     const int ndim = static_cast<int>(shape.size());
     if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM || conn < 1 || conn > ndim) return {};
     if (radius < 1) radius = 1;
     return wrap
         ? find_pairs_unpadded_impl<T, true >(lbl, shape, conn, ht_size, n_threads, pool,
-                                              nullptr, nullptr, nullptr, radius)
+                                              nullptr, nullptr, nullptr, radius, ht_scratch)
         : find_pairs_unpadded_impl<T, false>(lbl, shape, conn, ht_size, n_threads, pool,
-                                              nullptr, nullptr, nullptr, radius);
+                                              nullptr, nullptr, nullptr, radius, ht_scratch);
 }
 
 // Weighted variant: returns adjacency pairs AND per-pair reducer
@@ -690,7 +724,11 @@ find_pairs_weighted_nd_unpadded(const T* lbl, const int32_t* dist,
                                 int conn, uint64_t ht_size, int n_threads,
                                 ForkJoinPool& pool, bool wrap,
                                 std::vector<double>& out_primary,
-                                std::vector<int32_t>& out_counts) {
+                                std::vector<int32_t>& out_counts,
+                                int radius = 1,
+                                std::vector<uint64_t>* ht_scratch = nullptr,
+                                std::vector<double>*  primary_scratch = nullptr,
+                                std::vector<int32_t>* counts_scratch = nullptr) {
     const int ndim = static_cast<int>(shape.size());
     if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM || conn < 1 || conn > ndim) {
         out_primary.clear();
@@ -698,8 +736,14 @@ find_pairs_weighted_nd_unpadded(const T* lbl, const int32_t* dist,
         return {};
     }
     return wrap
-        ? find_pairs_unpadded_impl<T, true,  Mode>(lbl, shape, conn, ht_size, n_threads, pool, dist, &out_primary, &out_counts)
-        : find_pairs_unpadded_impl<T, false, Mode>(lbl, shape, conn, ht_size, n_threads, pool, dist, &out_primary, &out_counts);
+        ? find_pairs_unpadded_impl<T, true,  Mode>(
+              lbl, shape, conn, ht_size, n_threads, pool, dist,
+              &out_primary, &out_counts, radius,
+              ht_scratch, primary_scratch, counts_scratch)
+        : find_pairs_unpadded_impl<T, false, Mode>(
+              lbl, shape, conn, ht_size, n_threads, pool, dist,
+              &out_primary, &out_counts, radius,
+              ht_scratch, primary_scratch, counts_scratch);
 }
 
 
