@@ -225,49 +225,68 @@ inline int64_t expand_spur_free_2d_inplace(
             for (auto& [i, lab] : claims) labels[i] = lab;
         }
 
-        // Build next frontier: bg neighbours of just-claimed pixels.
+        // Phase C: build next frontier — parallel.
+        // Insight: a pixel needs re-evaluation ONLY if one of its
+        // face-neighbours just changed state (got claimed this round).
+        // So next_frontier = { bg face-neighbours of pixels just
+        // claimed }. The earlier version's "also keep old frontier"
+        // pass was redundant — any old-frontier pixel that wasn't
+        // claimed AND doesn't have a newly-claimed neighbour has
+        // unchanged state and will not become claimable later.
+        // Dropping it halves Phase C work AND makes it parallelisable
+        // (no dedup-by-bitmap required — duplicates are tolerated and
+        // removed at the end via sort+unique).
         next_frontier.clear();
-        for (int64_t i : frontier) in_frontier[i] = 0;  // reset current
-        for (auto& [i, lab] : claims) {
-            (void)lab;
-            const int64_t y = i / W;
-            const int64_t x = i - y * W;
-            int64_t neighbours[4];
-            int n_nb = 0;
-            if (y > 0)     neighbours[n_nb++] = i - W;
-            if (y + 1 < H) neighbours[n_nb++] = i + W;
-            if (x > 0)     neighbours[n_nb++] = i - 1;
-            if (x + 1 < W) neighbours[n_nb++] = i + 1;
-            for (int k = 0; k < n_nb; ++k) {
-                const int64_t j = neighbours[k];
-                if (labels[j] == 0 && !in_frontier[j]) {
-                    in_frontier[j] = 1;
-                    next_frontier.push_back(j);
+        if (nt > 1 && claims.size() >= 1024) {
+            std::vector<std::vector<int64_t>> per_thread_next(nt);
+            std::atomic<int> tid_c{0};
+            std::atomic<size_t> idx_c{0};
+            const size_t chunk_c = std::max<size_t>(64, claims.size() / (nt * 8));
+            pool->parallel([&]() {
+                int my_tid = tid_c.fetch_add(1);
+                if (my_tid >= nt) return;
+                auto& local = per_thread_next[my_tid];
+                while (true) {
+                    size_t lo = idx_c.fetch_add(chunk_c);
+                    if (lo >= claims.size()) break;
+                    size_t hi = std::min(claims.size(), lo + chunk_c);
+                    for (size_t k = lo; k < hi; ++k) {
+                        const int64_t i = claims[k].first;
+                        const int64_t y = i / W;
+                        const int64_t x = i - y * W;
+                        if (y > 0     && labels[i - W] == 0) local.push_back(i - W);
+                        if (y + 1 < H && labels[i + W] == 0) local.push_back(i + W);
+                        if (x > 0     && labels[i - 1] == 0) local.push_back(i - 1);
+                        if (x + 1 < W && labels[i + 1] == 0) local.push_back(i + 1);
+                    }
                 }
+            });
+            size_t total_size = 0;
+            for (auto& v : per_thread_next) total_size += v.size();
+            next_frontier.reserve(total_size);
+            for (auto& v : per_thread_next) next_frontier.insert(next_frontier.end(), v.begin(), v.end());
+        } else {
+            for (auto& [i, lab] : claims) {
+                (void)lab;
+                const int64_t y = i / W;
+                const int64_t x = i - y * W;
+                if (y > 0     && labels[i - W] == 0) next_frontier.push_back(i - W);
+                if (y + 1 < H && labels[i + W] == 0) next_frontier.push_back(i + W);
+                if (x > 0     && labels[i - 1] == 0) next_frontier.push_back(i - 1);
+                if (x + 1 < W && labels[i + 1] == 0) next_frontier.push_back(i + 1);
             }
         }
-        // Keep any old frontier pixels that still have at least one
-        // labelled neighbour and weren't claimed. (They could be claimed
-        // in a later round once their other neighbours fill in.)
-        for (int64_t i : frontier) {
-            if (labels[i] != 0) continue;  // was claimed
-            // Re-check: still has a labelled neighbour?
-            const int64_t y = i / W;
-            const int64_t x = i - y * W;
-            bool has_lab = false;
-            if (y > 0     && labels[i - W] != 0) has_lab = true;
-            if (!has_lab && y + 1 < H && labels[i + W] != 0) has_lab = true;
-            if (!has_lab && x > 0     && labels[i - 1] != 0) has_lab = true;
-            if (!has_lab && x + 1 < W && labels[i + 1] != 0) has_lab = true;
-            if (has_lab && !in_frontier[i]) {
-                in_frontier[i] = 1;
-                next_frontier.push_back(i);
-            }
-        }
+        // Dedup: sort + unique. O(N log N) — fast for typical
+        // frontier sizes of 10-100K.
+        std::sort(next_frontier.begin(), next_frontier.end());
+        next_frontier.erase(
+            std::unique(next_frontier.begin(), next_frontier.end()),
+            next_frontier.end());
 
         total_claimed += (int64_t)claims.size();
         std::swap(frontier, next_frontier);
     }
+    (void)in_frontier;  // legacy buffer, no longer used after simplification
     return total_claimed;
 }
 

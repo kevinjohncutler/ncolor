@@ -532,7 +532,7 @@ public:
             int connect_radius = 1,
             int despur_iters = 2,
             bool expand_spur_free = false,
-            int spur_free_max_rounds = 3) {
+            int spur_free_max_rounds = 1) {
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
         // coloring path without rebuilding the extension.
@@ -1727,7 +1727,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("connect_radius") = 1,
              py::arg("despur_iters") = 2,
              py::arg("expand_spur_free") = false,
-             py::arg("spur_free_max_rounds") = 3,
+             py::arg("spur_free_max_rounds") = 1,
              "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
              "Any ndim ≥ 2; conn ∈ [1, ndim].\n"
              "p selects the expand metric: p=1 (Saito-Toriwaki sweep,\n"
