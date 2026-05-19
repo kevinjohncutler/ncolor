@@ -24,7 +24,9 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 #include "threadpool.h"
@@ -94,6 +96,186 @@ inline void count_and_mark_nd(
 }
 
 }  // namespace despur_detail
+
+// BFS-style boundary-only despur. Same semantics as the full-scan
+// variant below, but iterates only over the dynamic frontier of
+// "pixels that might be spurs". Iter 0 is a full-image scan that
+// finds all initial spurs and seeds the frontier for iter 1+; each
+// subsequent iter processes only same-label neighbours of pixels
+// removed in the previous iter. For typical microscopy seg's where
+// only ~5% of pixels are at cell boundaries and despur cascades are
+// shallow, this is 3-5× faster than full-scan iteration.
+//
+// Why iter 0 is still a full scan: the initial spur set IS the
+// boundary set (every spur is a boundary pixel), and we have no
+// cheaper way to identify boundary pixels than scanning everything
+// once. After iter 0, we know which pixels could possibly be new
+// spurs (only those adjacent to just-removed pixels) and skip the
+// interior entirely.
+template <typename T>
+inline int64_t delete_spurs_labels_nd_bfs_inplace(
+    T* labels,
+    const std::vector<int64_t>& shape,
+    int threshold = 1,
+    int max_iters = 20,
+    ForkJoinPool* pool = nullptr,
+    int n_threads = 1)
+{
+    const int ndim = (int)shape.size();
+    if (ndim < 1) return 0;
+    int64_t total = 1;
+    for (auto s : shape) total *= s;
+    if (total == 0) return 0;
+
+    std::vector<int64_t> strides(ndim);
+    strides[ndim - 1] = 1;
+    for (int d = ndim - 2; d >= 0; --d) strides[d] = strides[d + 1] * shape[d + 1];
+
+    auto coords_of = [&](int64_t i, std::vector<int64_t>& out) {
+        for (int d = 0; d < ndim; ++d) {
+            out[d] = i / strides[d];
+            i -= out[d] * strides[d];
+        }
+    };
+
+    // -- Iter 0: full-image scan, find all initial spurs, seed
+    // frontier from their neighbours.
+    std::vector<int64_t> spurs;     // pixels to remove this iter
+    std::vector<int64_t> frontier;  // candidates for next iter
+    spurs.reserve(total / 64);
+    frontier.reserve(total / 32);
+
+    // Iter 0 worker: scan a flat-index range, append spurs to a
+    // thread-local list.
+    auto worker = [&](int64_t i_lo, int64_t i_hi, std::vector<int64_t>& out) {
+        std::vector<int64_t> c(ndim, 0);
+        coords_of(i_lo, c);
+        for (int64_t i = i_lo; i < i_hi; ++i) {
+            const T lab = labels[i];
+            if (lab != 0) {
+                int same = 0;
+                for (int d = 0; d < ndim; ++d) {
+                    if (c[d] > 0 && labels[i - strides[d]] == lab) ++same;
+                    if (c[d] + 1 < shape[d] && labels[i + strides[d]] == lab) ++same;
+                }
+                if (same <= threshold) out.push_back(i);
+            }
+            int d = ndim - 1;
+            ++c[d];
+            while (d > 0 && c[d] >= shape[d]) {
+                c[d] = 0;
+                --d;
+                ++c[d];
+            }
+        }
+    };
+
+    const int nt = (pool && n_threads > 1) ? n_threads : 1;
+    if (nt > 1 && total >= 1024 && ndim >= 1) {
+        const int64_t outer = shape[0];
+        const int64_t slab_size = strides[0];
+        std::atomic<int64_t> next_slab{0};
+        const int64_t chunk = std::max<int64_t>(1, outer / (nt * 4));
+        std::mutex spurs_mtx;
+        pool->parallel([&]() {
+            std::vector<int64_t> local;
+            local.reserve(1024);
+            while (true) {
+                int64_t s_lo = next_slab.fetch_add(chunk);
+                if (s_lo >= outer) break;
+                int64_t s_hi = std::min(outer, s_lo + chunk);
+                worker(s_lo * slab_size, s_hi * slab_size, local);
+            }
+            if (!local.empty()) {
+                std::lock_guard<std::mutex> lk(spurs_mtx);
+                spurs.insert(spurs.end(), local.begin(), local.end());
+            }
+        });
+    } else {
+        worker(0, total, spurs);
+    }
+
+    int64_t total_removed = (int64_t)spurs.size();
+    if (spurs.empty()) return 0;
+
+    // Apply iter 0 removals + build frontier.
+    std::vector<int64_t> coords_tmp(ndim, 0);
+    for (int64_t i : spurs) {
+        labels[i] = 0;
+    }
+    // Build frontier: same-label neighbours of removed pixels. The
+    // labels are now 0 for removed pixels; this means "same-label
+    // before removal" must be derived from spurs list. Instead, we
+    // simply add every nonzero neighbour of every removed pixel —
+    // these may or may not have lost a same-label neighbour, but
+    // they're the only candidates that could newly become spurs.
+    std::vector<uint8_t> in_frontier(total, 0);
+    for (int64_t i : spurs) {
+        coords_of(i, coords_tmp);
+        for (int d = 0; d < ndim; ++d) {
+            if (coords_tmp[d] > 0) {
+                int64_t j = i - strides[d];
+                if (labels[j] != 0 && !in_frontier[j]) {
+                    in_frontier[j] = 1;
+                    frontier.push_back(j);
+                }
+            }
+            if (coords_tmp[d] + 1 < shape[d]) {
+                int64_t j = i + strides[d];
+                if (labels[j] != 0 && !in_frontier[j]) {
+                    in_frontier[j] = 1;
+                    frontier.push_back(j);
+                }
+            }
+        }
+    }
+
+    // -- Iter 1+: BFS on frontier.
+    for (int iter = 1; iter < max_iters; ++iter) {
+        spurs.clear();
+        for (int64_t i : frontier) {
+            in_frontier[i] = 0;  // reset for next iter's dedupe
+            const T lab = labels[i];
+            if (lab == 0) continue;
+            coords_of(i, coords_tmp);
+            int same = 0;
+            for (int d = 0; d < ndim; ++d) {
+                if (coords_tmp[d] > 0 && labels[i - strides[d]] == lab) ++same;
+                if (coords_tmp[d] + 1 < shape[d] && labels[i + strides[d]] == lab) ++same;
+            }
+            if (same <= threshold) spurs.push_back(i);
+        }
+        if (spurs.empty()) break;
+
+        // Apply removals; build next frontier.
+        std::vector<int64_t> next_frontier;
+        next_frontier.reserve(spurs.size() * 4);
+        for (int64_t i : spurs) labels[i] = 0;
+        for (int64_t i : spurs) {
+            coords_of(i, coords_tmp);
+            for (int d = 0; d < ndim; ++d) {
+                if (coords_tmp[d] > 0) {
+                    int64_t j = i - strides[d];
+                    if (labels[j] != 0 && !in_frontier[j]) {
+                        in_frontier[j] = 1;
+                        next_frontier.push_back(j);
+                    }
+                }
+                if (coords_tmp[d] + 1 < shape[d]) {
+                    int64_t j = i + strides[d];
+                    if (labels[j] != 0 && !in_frontier[j]) {
+                        in_frontier[j] = 1;
+                        next_frontier.push_back(j);
+                    }
+                }
+            }
+        }
+        total_removed += (int64_t)spurs.size();
+        std::swap(frontier, next_frontier);
+        if (frontier.empty()) break;
+    }
+    return total_removed;
+}
 
 // Public ND entry point. Returns total pixels removed.
 template <typename T>

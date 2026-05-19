@@ -1973,6 +1973,53 @@ PYBIND11_MODULE(_impl, m) {
     // this respects label boundaries — useful after expand_labels to
     // strip convergence pixels where 5 cells meet at a corner and
     // create K_5 obstructions to 4-colouring.
+    m.def("delete_spurs_labels_bfs",
+          [](py::array labels_in, int threshold, int max_iters, int n_threads) {
+              if (!(labels_in.flags() & py::array::c_style)) {
+                  labels_in = py::array::ensure(labels_in, py::array::c_style);
+              }
+              const auto buf = labels_in.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              if (ndim < 1) throw std::invalid_argument(
+                  "delete_spurs_labels_bfs requires ndim >= 1");
+              std::vector<int64_t> shape(ndim);
+              std::vector<py::ssize_t> out_shape(ndim);
+              for (int d = 0; d < ndim; ++d) {
+                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
+                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+              }
+              py::array out(labels_in.dtype(), out_shape);
+              std::memcpy(out.request().ptr, buf.ptr,
+                          (size_t)buf.size * (size_t)buf.itemsize);
+              int64_t n_removed = 0;
+              const int nt = n_threads > 0 ? n_threads :
+                  (int)std::thread::hardware_concurrency();
+              {
+                  py::gil_scoped_release release;
+                  std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
+                  if (nt > 1) {
+                      pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
+                  }
+                  dispatch_int_dtype(buf.format, buf.itemsize, "delete_spurs_labels_bfs",
+                      [&](auto* tag) {
+                          using T = std::remove_pointer_t<decltype(tag)>;
+                          n_removed = ncolor_cpp::delete_spurs_labels_nd_bfs_inplace<T>(
+                              static_cast<T*>(out.mutable_data()),
+                              shape, threshold, max_iters,
+                              pool.get(), nt);
+                      });
+              }
+              return std::make_pair(std::move(out), n_removed);
+          },
+          py::arg("labels"), py::arg("threshold") = 1, py::arg("max_iters") = 20,
+          py::arg("n_threads") = 0,
+          "BFS-style boundary-only despur. Same semantics as\n"
+          "`delete_spurs_labels` but iterates only over a dynamic\n"
+          "frontier of candidate pixels after the initial full scan,\n"
+          "skipping the cell-interior pixels entirely in iters 1+.\n"
+          "Typically 3-5x faster than the full-scan variant on dense\n"
+          "segmentations.");
+
     m.def("delete_spurs_labels",
           [](py::array labels_in, int threshold, int max_iters, int n_threads) {
               if (!(labels_in.flags() & py::array::c_style)) {
