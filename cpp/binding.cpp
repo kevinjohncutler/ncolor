@@ -24,6 +24,7 @@
 #include "color.hpp"
 #include "delete_spurs.hpp"
 #include "delete_spurs_labels.hpp"
+#include "expand_spur_free.hpp"
 #include "expand_lp.hpp"
 #include "format_labels.hpp"
 #include "connect.hpp"
@@ -529,7 +530,9 @@ public:
             int weight_mode = 1 /* ReduceMode::Min */,
             py::object extra_edges_obj = py::none(),
             int connect_radius = 1,
-            int despur_iters = 2) {
+            int despur_iters = 2,
+            bool expand_spur_free = false,
+            int spur_free_max_rounds = 3) {
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
         // coloring path without rebuilding the extension.
@@ -659,7 +662,31 @@ public:
             // ``input == output`` self-copy guards inside LpExpand
             // variants make this a no-op when expand_input == expanded.
             if (expand) {
-                if (p == 2) {
+                if (expand_spur_free) {
+                    // Spur-free expand: BFS dilation with connectivity
+                    // check. Naturally avoids K_5-creating "starfish"
+                    // convergence patterns by refusing to claim bg
+                    // pixels that would have ≤1 same-label face-
+                    // neighbour. Equivalent to (expand_labels +
+                    // delete_spurs_labels) at the result level, but
+                    // computed in a single pass that bounds growth
+                    // at the connectivity check rather than fixing
+                    // up afterwards. Slower than Voronoi expand for
+                    // small/medium inputs (3-4× on bact/synth) but
+                    // same speed as expand+despur on large dense
+                    // inputs where the K_5 prevention matters most.
+                    // max_rounds=spur_free_max_rounds bounds the BFS;
+                    // 3 is empirically enough to prevent all K_5
+                    // formations on real microscopy data.
+                    if (expand_input != expanded) {
+                        std::memcpy(expanded, expand_input,
+                                    (size_t)total * sizeof(int32_t));
+                    }
+                    ncolor_cpp::expand_spur_free_nd_inplace<int32_t>(
+                        expanded, shape, spur_free_max_rounds,
+                        /*connectivity_threshold=*/1,
+                        pool_.get(), n_threads_);
+                } else if (p == 2) {
                     ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
                 } else {
                     ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
@@ -1699,6 +1726,8 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("extra_edges") = py::none(),
              py::arg("connect_radius") = 1,
              py::arg("despur_iters") = 2,
+             py::arg("expand_spur_free") = false,
+             py::arg("spur_free_max_rounds") = 3,
              "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
              "Any ndim ≥ 2; conn ∈ [1, ndim].\n"
              "p selects the expand metric: p=1 (Saito-Toriwaki sweep,\n"
@@ -1973,6 +2002,56 @@ PYBIND11_MODULE(_impl, m) {
     // this respects label boundaries — useful after expand_labels to
     // strip convergence pixels where 5 cells meet at a corner and
     // create K_5 obstructions to 4-colouring.
+    m.def("expand_spur_free",
+          [](py::array labels_in, int max_rounds, int connectivity_threshold,
+             int n_threads) {
+              if (!(labels_in.flags() & py::array::c_style)) {
+                  labels_in = py::array::ensure(labels_in, py::array::c_style);
+              }
+              const auto buf = labels_in.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              if (ndim < 1) throw std::invalid_argument(
+                  "expand_spur_free requires ndim >= 1");
+              std::vector<int64_t> shape(ndim);
+              std::vector<py::ssize_t> out_shape(ndim);
+              for (int d = 0; d < ndim; ++d) {
+                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
+                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+              }
+              py::array out(labels_in.dtype(), out_shape);
+              std::memcpy(out.request().ptr, buf.ptr,
+                          (size_t)buf.size * (size_t)buf.itemsize);
+              int64_t n_claimed = 0;
+              const int nt = n_threads > 0 ? n_threads :
+                  (int)std::thread::hardware_concurrency();
+              {
+                  py::gil_scoped_release release;
+                  std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
+                  if (nt > 1) {
+                      pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
+                  }
+                  dispatch_int_dtype(buf.format, buf.itemsize, "expand_spur_free",
+                      [&](auto* tag) {
+                          using T = std::remove_pointer_t<decltype(tag)>;
+                          n_claimed = ncolor_cpp::expand_spur_free_nd_inplace<T>(
+                              static_cast<T*>(out.mutable_data()),
+                              shape, max_rounds, connectivity_threshold,
+                              pool.get(), nt);
+                      });
+              }
+              return std::make_pair(std::move(out), n_claimed);
+          },
+          py::arg("labels"), py::arg("max_rounds") = 100,
+          py::arg("connectivity_threshold") = 1,
+          py::arg("n_threads") = 0,
+          "Spur-free expand: BFS dilation with connectivity check.\n"
+          "Returns (expanded_labels, n_claimed). Bg pixels are claimed\n"
+          "by a cell only if at least connectivity_threshold+1 of their\n"
+          "face-neighbours share that label (so the claimed pixel won't\n"
+          "be a spur). Pixels that never accumulate enough same-label\n"
+          "neighbours stay bg, naturally avoiding K_5-creating starfish\n"
+          "convergence points.");
+
     m.def("delete_spurs_labels_bfs",
           [](py::array labels_in, int threshold, int max_iters, int n_threads) {
               if (!(labels_in.flags() & py::array::c_style)) {
