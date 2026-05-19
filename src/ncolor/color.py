@@ -26,7 +26,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           check_conflicts=False, return_conflicts=False, format_input=True,
           out=None, p=1, wrap=False, balance=True, first_seen=False,
           weight_objective=0, de_table=None, weight_mode="min",
-          optimize=None, extra_edges=None, connect_radius=1):
+          optimize=None, extra_edges=None, connect_radius=1, despur_iters=2):
     """4-color graph coloring of a label image.
 
     Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
@@ -169,7 +169,8 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
         balance=bool(balance), first_seen=bool(first_seen),
         weight_objective=wobj, de_table=de_arr,
         weight_mode=wmode_int, extra_edges=extra_arr,
-        connect_radius=int(connect_radius))
+        connect_radius=int(connect_radius),
+        despur_iters=int(despur_iters))
     out = out_array
 
     if optimize is not None:

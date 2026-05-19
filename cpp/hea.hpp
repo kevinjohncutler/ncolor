@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <vector>
 #include <cstdint>
 #include <climits>
@@ -111,7 +112,8 @@ inline bool hea(
     int pop_size = 5,
     int init_tabu_iters = 200,
     int gen_tabu_iters = 1000,
-    uint64_t seed = 0)
+    uint64_t seed = 0,
+    int64_t deadline_ns = 0)
 {
     if (k <= 0 || N <= 0) return false;
 
@@ -131,17 +133,32 @@ inline bool hea(
             return true;
     }
 
-    // Build initial population: random colorings + brief TabuCol.
+    // Helper: has the wall-clock deadline expired?
+    auto past_deadline = [&]() -> bool {
+        return deadline_ns > 0 &&
+               std::chrono::steady_clock::now()
+                   .time_since_epoch().count() > deadline_ns;
+    };
+
+    // Build initial population: random colorings + brief TabuCol. Each
+    // init-TabuCol call passes the deadline so its inner loop bails on
+    // expiry — without this, a single deadline-blown call would burn
+    // its full iter budget regardless.
     std::vector<std::vector<uint8_t>> pop((size_t)pop_size,
                                           std::vector<uint8_t>((size_t)N, 1));
     std::vector<int> pop_conf((size_t)pop_size, 0);
     int best_idx = 0; int best_conf = INT_MAX;
     for (int p = 0; p < pop_size; ++p) {
+        if (past_deadline()) {
+            pop_conf[p] = INT_MAX;
+            continue;
+        }
         for (int32_t v = 0; v < N; ++v) {
             pop[p][v] = (uint8_t)(1 + (next32() % (uint32_t)k));
         }
         ncolor_cpp::tabucol(indptr, indices, N, k, init_tabu_iters,
-                             pop[p], rs + (uint64_t)p * 0xc6a4a7935bd1e995ULL);
+                             pop[p], rs + (uint64_t)p * 0xc6a4a7935bd1e995ULL,
+                             deadline_ns);
         pop_conf[p] = count_conflicts_csr(indptr, indices, N, pop[p].data());
         if (pop_conf[p] < best_conf) {
             best_conf = pop_conf[p];
@@ -157,6 +174,7 @@ inline bool hea(
     std::vector<uint8_t> child;
     child.reserve((size_t)N);
     for (int gen = 0; gen < max_generations; ++gen) {
+        if (past_deadline()) break;
         // Select two distinct parents at random.
         int i1 = (int)(next32() % (uint32_t)pop_size);
         int i2 = (int)(next32() % (uint32_t)(pop_size - 1));
@@ -165,9 +183,12 @@ inline bool hea(
         // Crossover.
         gpx_crossover(pop[i1], pop[i2], N, k, child, rs);
 
-        // Refine.
+        // Refine — the generation-tabucol also takes the same
+        // deadline so a deadline that elapses mid-refine doesn't
+        // waste the full per-gen iter budget.
         if (ncolor_cpp::tabucol(indptr, indices, N, k, gen_tabu_iters,
-                                 child, rs + (uint64_t)gen * 0xbf58476d1ce4e5b9ULL)) {
+                                 child, rs + (uint64_t)gen * 0xbf58476d1ce4e5b9ULL,
+                                 deadline_ns)) {
             colors = child;
             return true;
         }

@@ -23,6 +23,7 @@
 #include "chamfer.hpp"
 #include "color.hpp"
 #include "delete_spurs.hpp"
+#include "delete_spurs_labels.hpp"
 #include "expand_lp.hpp"
 #include "format_labels.hpp"
 #include "connect.hpp"
@@ -31,6 +32,7 @@
 #include "tabucol.hpp"
 #include "hea.hpp"
 #include "bb_dsatur.hpp"
+#include "clique_lb.hpp"
 #include "chamfer_topk_nd.hpp"
 #include "topk_bfs.hpp"
 #include "dispatch.hpp"
@@ -526,7 +528,8 @@ public:
             py::object de_table_obj = py::none(),
             int weight_mode = 1 /* ReduceMode::Min */,
             py::object extra_edges_obj = py::none(),
-            int connect_radius = 1) {
+            int connect_radius = 1,
+            int despur_iters = 2) {
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
         // coloring path without rebuilding the extension.
@@ -666,6 +669,26 @@ public:
             // already equals expand_input == expand_bufs_.lbl().)
             (void)expand_input;
             stage("expand");
+
+            // 1b. Optional label-aware despur. After expand_labels
+            // fills the gaps between adjacent cells, two cells that
+            // originally touched only at a single point may now share
+            // a 1-pixel-wide "convergence pixel" — one cell narrows
+            // to a single-same-label-neighbour pixel inside another's
+            // territory. These convergence points create K_5
+            // obstructions in densely-packed segmentations (5 cells
+            // meeting at a corner) that prevent 4-colouring at conn=1
+            // r=1. Iterative despur strips them: pixels with ≤
+            // threshold same-label face-neighbours become bg. 2 iters
+            // is empirically enough to break K_5 cascades on real
+            // microscopy data; 20 = full convergence (more aggressive,
+            // ~5× slower).
+            if (despur_iters > 0 && expand) {
+                ncolor_cpp::delete_spurs_labels_nd_inplace<int32_t>(
+                    expanded, shape, /*threshold=*/1,
+                    despur_iters, pool_.get(), n_threads_);
+                stage("despur");
+            }
 
             // 2. Find adjacency pairs. Parallel max-reduce first
             // (was a single-threaded 1.2 ms loop at 2048²).
@@ -1053,7 +1076,36 @@ private:
 
         int cur_n = n_colors;
         bool ok = false;
+        static const bool dbg_solve = std::getenv("NCOLOR_SOLVE_DEBUG") != nullptr;
+        // ω(G) lower bound: χ(G) ≥ ω(G). If a clique larger than the
+        // user's target k exists, the graph requires ≥ ω colours and
+        // we'd otherwise burn ~200 ms per (race+tabu-restart+
+        // bb_dsatur+HEA) round each time we increment cur_n on the
+        // way up to ω. Bron-Kerbosch with a tight deadline (10 ms)
+        // returns a valid lower bound even on partial searches —
+        // worst case: no time saved when ω ≤ n_colors (the common
+        // case). Skipped for N > 20000 (memory) and for the weighted
+        // path (perceptual objective is orthogonal to clique
+        // structure).
+        const bool wobj_active_for_clique = weight_obj != 0 && edge_weights != nullptr;
+        if (!wobj_active_for_clique && N >= 5) {
+            const auto clb_t0 = std::chrono::steady_clock::now();
+            const int64_t clb_deadline_ns =
+                clb_t0.time_since_epoch().count() + 10LL * 1000LL * 1000LL;
+            const int omega = ncolor_cpp::clique_lower_bound(
+                N, indptr_.data(), indices_.data(),
+                /*target=*/n_colors + 1, clb_deadline_ns);
+            if (dbg_solve) {
+                const double clb_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - clb_t0).count();
+                std::fprintf(stderr,
+                    "[clique-lb] N=%d ω≥%d (target=%d) %.1fms\n",
+                    N, omega, n_colors + 1, clb_ms);
+            }
+            if (omega > cur_n) cur_n = omega;
+        }
         for (int depth = 0; depth < max_depth && !ok; ++depth) {
+            const auto depth_t0 = std::chrono::steady_clock::now();
             if (color_parallel) {
                 const int local_cur_n = cur_n;
                 const int local_depth = depth;
@@ -1074,7 +1126,7 @@ private:
                 // only on warmup failure.
                 auto run_one_attempt = [&, local_cur_n, local_depth, ip, ix](
                         int idx, const std::atomic<bool>* cancel,
-                        bool allow_tabucol) -> bool {
+                        bool allow_tabucol, int64_t race_deadline_ns) -> bool {
                     auto& cv = per_attempt_colors_[idx];
                     const int attempt_offset = local_depth + idx;
                     // Special slot: branch-and-bound exact coloring
@@ -1104,7 +1156,8 @@ private:
                         const int64_t node_budget = std::max<int64_t>(
                             20000, (int64_t)N * 30);
                         const bool bb_ok = ncolor_cpp::bb_dsatur(
-                            ip, ix, N, local_cur_n, cv, node_budget, cancel);
+                            ip, ix, N, local_cur_n, cv, node_budget,
+                            cancel, race_deadline_ns);
                         per_attempt_ok_[idx] = bb_ok ? 1 : 0;
                         return bb_ok;
                     }
@@ -1164,7 +1217,7 @@ private:
                         if (ncolor_cpp::tabucol(
                                 ip, ix, N, local_cur_n,
                                 per_attempt_tabu_iters, cv, tabu_seed,
-                                /*deadline_ns=*/0, cancel)) {
+                                race_deadline_ns, cancel)) {
                             a_ok = true;
                         }
                     }
@@ -1185,7 +1238,14 @@ private:
                 // ~0.5 ms of median latency that the 16-way race
                 // unconditionally pays. Only fan out when warmup fails.
                 static const bool dbg_warmup = std::getenv("NCOLOR_WARMUP_DEBUG") != nullptr;
-                const bool warmup_ok = run_one_attempt(0, nullptr, /*allow_tabucol=*/false);
+                const auto warmup_t0 = std::chrono::steady_clock::now();
+                const bool warmup_ok = run_one_attempt(
+                    0, nullptr, /*allow_tabucol=*/false, /*race_deadline_ns=*/0);
+                if (dbg_solve) {
+                    const double warmup_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - warmup_t0).count();
+                    std::fprintf(stderr, "  [warmup] %.1fms ok=%d\n", warmup_ms, (int)warmup_ok);
+                }
                 if (dbg_warmup) {
                     std::fprintf(stderr,
                         "[warmup] N=%d M=%d cur_n=%d depth=%d ok=%d\n",
@@ -1200,12 +1260,24 @@ private:
                     std::vector<double> slot_ms(attempts_per_n, -1.0);
                     std::vector<int> slot_done(attempts_per_n, 0);
                     const auto race_t0 = std::chrono::steady_clock::now();
+                    // Race wall-clock deadline shared across all slots:
+                    // bounds time wasted on infeasible-at-cur_n graphs.
+                    // Without this, the 16 per-attempt tabucols all run
+                    // their full iter budget (up to several seconds on
+                    // N≥few-thousand) trying to escape a non-k-colourable
+                    // graph. 50 ms is plenty for any feasible case at
+                    // our scale — successes typically converge in <5 ms.
+                    const int64_t race_deadline_ns =
+                        race_t0.time_since_epoch().count()
+                        + 50LL * 1000LL * 1000LL;
                     pool_->parallel([&]() {
                         int idx;
                         while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < attempts_per_n) {
                             if (winner_found.load(std::memory_order_relaxed)) break;
                             const auto t0 = std::chrono::steady_clock::now();
-                            const bool ok_slot = run_one_attempt(idx, &winner_found, /*allow_tabucol=*/true);
+                            const bool ok_slot = run_one_attempt(
+                                idx, &winner_found, /*allow_tabucol=*/true,
+                                race_deadline_ns);
                             if (dbg_slots) {
                                 const auto t1 = std::chrono::steady_clock::now();
                                 slot_ms[idx] = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1216,6 +1288,11 @@ private:
                             }
                         }
                     });
+                    if (dbg_solve) {
+                        const double race_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - race_t0).count();
+                        std::fprintf(stderr, "  [race] %.1fms\n", race_ms);
+                    }
                     if (dbg_slots) {
                         const auto race_t1 = std::chrono::steady_clock::now();
                         const double race_ms = std::chrono::duration<double, std::milli>(race_t1 - race_t0).count();
@@ -1278,6 +1355,7 @@ private:
                 }
             }
             if (!ok && cur_n == n_colors) {
+                const auto tabu_restart_t0 = std::chrono::steady_clock::now();
                 // TabuCol fallback at the user's target k. Some graphs
                 // are k-colourable (verified by SAT) but every
                 // vertex-ordering greedy hits the same local minimum
@@ -1326,7 +1404,16 @@ private:
                     // its own iter cap as a secondary bound.
                     const int per_seed_iters = std::min(
                         50000, std::max(2000, N * 30));
-                    const int64_t budget_ns = 200LL * 1000LL * 1000LL;  // 200 ms
+                    // 0 ms wall budget — bb_dsatur + HEA fallbacks
+                    // cover the same role at lower cost (HEA's
+                    // built-in init-population calls tabucol per
+                    // member, replicating the restart-loop effect
+                    // with crossover diversity on top). Skipping this
+                    // loop saves 50 ms on infeasible-at-k graphs. If
+                    // a regression on feasible-but-hard cases is
+                    // observed in stress testing, bump back to ~10 ms
+                    // for a cheap safety net.
+                    const int64_t budget_ns = 0LL;
                     const int64_t deadline_ns =
                         std::chrono::steady_clock::now()
                             .time_since_epoch().count() + budget_ns;
@@ -1357,26 +1444,45 @@ private:
                     }
                 }
                 skip_tabucol: ;
-                // bb_dsatur exact fallback: if every greedy×16 attempt
-                // and the TabuCol restart loop both failed at the
-                // user's target k, try branch-and-bound DSatur before
-                // bumping cur_n. For K_5-free planar-ish cell-
-                // adjacency graphs of our scale, B&B+DSatur typically
-                // resolves the hardest TabuCol-plateau-stalled inputs
-                // in well under 50 ms. Fires only when every cheaper
-                // path has failed → zero cost on the common path
-                // (default-radius inputs never reach this branch).
-                // Node budget caps total work on truly k-uncolourable
-                // inputs so we don't burn unbounded time.
+                if (dbg_solve) {
+                    const double tabu_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - tabu_restart_t0).count();
+                    std::fprintf(stderr, "  [tabu-restart] %.1fms ok=%d\n", tabu_ms, (int)ok);
+                }
+                // bb_dsatur + HEA fallback chain. Wall-clock deadlines
+                // bound both: bb_dsatur's per-node cost is O(N) (pick_
+                // next is a linear scan), so a fixed node budget
+                // translates to multi-second wall time on graphs with
+                // N in the thousands. A graph that is genuinely NOT
+                // k-colourable would otherwise burn the entire
+                // bb_dsatur node budget AND HEA's generation budget
+                // proving infeasibility before cur_n bumps to k+1.
+                // The 50 ms-each deadlines cap the wasted time per
+                // cur_n bump at ~100 ms; the feasible-but-hard cases
+                // (e.g. the 2 adversarial shuffles in our stress test
+                // where HEA solves in 25-37 ms) still finish well
+                // within budget. Fires only when every cheaper path
+                // has failed → zero cost on the common path.
+                const int64_t bb_budget_ns =
+                    50LL * 1000LL * 1000LL;  // 50 ms
+                // HEA gets 100 ms — empirically the trickiest
+                // adversarial shuffles (which bb_dsatur exhausts its
+                // budget on) need 25-90 ms of HEA to converge; 50 ms
+                // dropped a previously-passing shuffle.
+                const int64_t hea_budget_ns =
+                    100LL * 1000LL * 1000LL;
                 if (!ok) {
                     const int64_t node_budget = std::max<int64_t>(
                         200000, (int64_t)N * 100);
                     std::vector<uint8_t> bb_colors;
                     static const bool dbg_bb = std::getenv("NCOLOR_BB_DEBUG") != nullptr;
                     const auto bb_t0 = std::chrono::steady_clock::now();
+                    const int64_t bb_deadline_ns =
+                        bb_t0.time_since_epoch().count() + bb_budget_ns;
                     const bool bb_ok = ncolor_cpp::bb_dsatur(
                             indptr_.data(), indices_.data(),
-                            N, cur_n, bb_colors, node_budget);
+                            N, cur_n, bb_colors, node_budget,
+                            /*cancel=*/nullptr, bb_deadline_ns);
                     if (dbg_bb) {
                         const auto bb_t1 = std::chrono::steady_clock::now();
                         const double bb_ms = std::chrono::duration<double, std::milli>(
@@ -1390,15 +1496,6 @@ private:
                         ok = true;
                     }
                 }
-                // HEA last-resort: if bb_dsatur exhausted its node
-                // budget without proving infeasibility, run the
-                // Hybrid Evolutionary Algorithm. Population-based
-                // search escapes the deterministic-DSatur worst-case
-                // branching that traps bb_dsatur on adversarial
-                // vertex labellings. Cost: 50-200 ms per fire, only
-                // on the genuinely-hardest shuffles where every
-                // cheaper path failed. Still bounded — gen + pop
-                // caps guarantee no unbounded burn.
                 if (!ok) {
                     std::vector<uint8_t> hea_colors;
                     const uint64_t hea_seed =
@@ -1406,6 +1503,8 @@ private:
                         ^ ((uint64_t)(depth + 1) * 0xc6a4a7935bd1e995ULL);
                     static const bool dbg_hea = std::getenv("NCOLOR_BB_DEBUG") != nullptr;
                     const auto hea_t0 = std::chrono::steady_clock::now();
+                    const int64_t hea_deadline_ns =
+                        hea_t0.time_since_epoch().count() + hea_budget_ns;
                     const bool hea_ok = ncolor_cpp::hea(
                             indptr_.data(), indices_.data(),
                             N, cur_n, hea_colors,
@@ -1413,7 +1512,7 @@ private:
                             /*pop_size=*/8,
                             /*init_tabu_iters=*/500,
                             /*gen_tabu_iters=*/2000,
-                            hea_seed);
+                            hea_seed, hea_deadline_ns);
                     if (dbg_hea) {
                         const auto hea_t1 = std::chrono::steady_clock::now();
                         const double hea_ms = std::chrono::duration<double, std::milli>(
@@ -1427,6 +1526,13 @@ private:
                         ok = true;
                     }
                 }
+            }
+            if (dbg_solve) {
+                const double depth_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - depth_t0).count();
+                std::fprintf(stderr,
+                    "[solve] depth=%d cur_n=%d ok=%d total=%.1fms\n",
+                    depth, cur_n, (int)ok, depth_ms);
             }
             if (!ok) {
                 ++cur_n;
@@ -1592,6 +1698,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("weight_mode") = 1,
              py::arg("extra_edges") = py::none(),
              py::arg("connect_radius") = 1,
+             py::arg("despur_iters") = 2,
              "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
              "Any ndim ≥ 2; conn ∈ [1, ndim].\n"
              "p selects the expand metric: p=1 (Saito-Toriwaki sweep,\n"
@@ -1859,6 +1966,59 @@ PYBIND11_MODULE(_impl, m) {
           "ndim → full diagonal (preserves 1-voxel skeletons). Isolated\n"
           "pixels (count == 0) are always preserved. ``max_iter`` < 0\n"
           "runs to convergence.");
+
+    // delete_spurs_labels: LABEL-AWARE despur. Removes pixels whose
+    // face-adjacent SAME-LABEL neighbour count is ≤ threshold. Unlike
+    // the binary delete_spurs above (which treats any nonzero as fg),
+    // this respects label boundaries — useful after expand_labels to
+    // strip convergence pixels where 5 cells meet at a corner and
+    // create K_5 obstructions to 4-colouring.
+    m.def("delete_spurs_labels",
+          [](py::array labels_in, int threshold, int max_iters, int n_threads) {
+              if (!(labels_in.flags() & py::array::c_style)) {
+                  labels_in = py::array::ensure(labels_in, py::array::c_style);
+              }
+              const auto buf = labels_in.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              if (ndim < 1) throw std::invalid_argument(
+                  "delete_spurs_labels requires ndim >= 1");
+              std::vector<int64_t> shape(ndim);
+              std::vector<py::ssize_t> out_shape(ndim);
+              for (int d = 0; d < ndim; ++d) {
+                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
+                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+              }
+              py::array out(labels_in.dtype(), out_shape);
+              std::memcpy(out.request().ptr, buf.ptr,
+                          (size_t)buf.size * (size_t)buf.itemsize);
+              int64_t n_removed = 0;
+              const int nt = n_threads > 0 ? n_threads :
+                  (int)std::thread::hardware_concurrency();
+              {
+                  py::gil_scoped_release release;
+                  std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
+                  if (nt > 1) {
+                      pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
+                  }
+                  dispatch_int_dtype(buf.format, buf.itemsize, "delete_spurs_labels",
+                      [&](auto* tag) {
+                          using T = std::remove_pointer_t<decltype(tag)>;
+                          n_removed = ncolor_cpp::delete_spurs_labels_nd_inplace<T>(
+                              static_cast<T*>(out.mutable_data()),
+                              shape, threshold, max_iters,
+                              pool.get(), nt);
+                      });
+              }
+              return std::make_pair(std::move(out), n_removed);
+          },
+          py::arg("labels"), py::arg("threshold") = 1, py::arg("max_iters") = 20,
+          py::arg("n_threads") = 0,
+          "Label-aware despur: returns (cleaned_labels, n_removed).\n"
+          "Iteratively zeros pixels whose count of face-adjacent SAME-\n"
+          "LABEL neighbours is ≤ threshold. threshold=1 removes pixels\n"
+          "with only 1 same-label neighbour AND isolated pixels (count\n"
+          "0). n_threads=0 → use hardware_concurrency. Iteration stops\n"
+          "when no further removals or after max_iters.");
 
     m.def("per_cell_geometry",
           [](py::array labels, py::object second_image) -> py::dict {
@@ -2877,6 +3037,105 @@ PYBIND11_MODULE(_impl, m) {
           "K_5-free graphs of a few thousand vertices that ARE\n"
           "k-colourable, runs in a few ms. node_budget caps recursion;\n"
           "0 = unbounded.");
+
+    // clique_lower_bound: Bron-Kerbosch max-clique lower bound.
+    // Returns the size of the largest clique found within deadline_ms.
+    // χ(G) ≥ ω(G), so this gives a hard lower bound on the chromatic
+    // number — useful to skip directly to the right cur_n on graphs
+    // with dense clique structure (e.g. 3D packings with K_6+ cliques).
+    m.def("clique_lower_bound",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> indptr,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> indices,
+             int target, double deadline_ms) -> int
+          {
+              const auto ib = indptr.request();
+              const auto xb = indices.request();
+              if (ib.size < 1) throw std::invalid_argument(
+                  "clique_lower_bound: indptr empty");
+              const int32_t N = static_cast<int32_t>(ib.size - 1);
+              int64_t deadline_ns = 0;
+              if (deadline_ms > 0) {
+                  deadline_ns = std::chrono::steady_clock::now()
+                                  .time_since_epoch().count()
+                                + (int64_t)(deadline_ms * 1e6);
+              }
+              int omega;
+              {
+                  py::gil_scoped_release release;
+                  omega = ncolor_cpp::clique_lower_bound(
+                      N, (const int32_t*)ib.ptr, (const int32_t*)xb.ptr,
+                      target, deadline_ns);
+              }
+              return omega;
+          },
+          py::arg("indptr"), py::arg("indices"),
+          py::arg("target") = 0, py::arg("deadline_ms") = 20.0,
+          "Largest clique size found within deadline. Provides a lower\n"
+          "bound on the chromatic number: χ(G) ≥ ω(G). Set `target`\n"
+          "to abort early once ω ≥ target is proven (e.g. target=5 to\n"
+          "answer \"does the graph contain K_5?\"). N capped internally\n"
+          "at 20000 to keep the adjacency bit-matrix from blowing memory.");
+
+    // prune_breakable_cliques: iteratively find K_{target_omega} in
+    // the r=2 graph and remove one r=2-only edge per K_5 until ω drops
+    // below `target_omega` or no more breakable cliques remain.
+    // Returns (pruned_edges_array, final_omega).
+    m.def("prune_breakable_cliques",
+          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> indptr,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> indices,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> r1_indptr,
+             py::array_t<int32_t, py::array::c_style | py::array::forcecast> r1_indices,
+             int target_omega, int max_iters, double deadline_ms)
+            -> std::pair<py::array_t<int32_t>, int>
+          {
+              const auto ib = indptr.request();
+              const auto xb = indices.request();
+              const auto rib = r1_indptr.request();
+              const auto rxb = r1_indices.request();
+              if (ib.size < 1) throw std::invalid_argument("prune: indptr empty");
+              const int32_t N = static_cast<int32_t>(ib.size - 1);
+              const int32_t* r1_ip = (const int32_t*)rib.ptr;
+              const int32_t* r1_ix = (const int32_t*)rxb.ptr;
+              auto r1_lookup = [&](int32_t a, int32_t b) -> bool {
+                  if (a < 0 || a >= N) return false;
+                  const int32_t end = r1_ip[a + 1];
+                  for (int32_t k = r1_ip[a]; k < end; ++k) {
+                      if (r1_ix[k] == b) return true;
+                  }
+                  return false;
+              };
+              int64_t deadline_ns = 0;
+              if (deadline_ms > 0) {
+                  deadline_ns = std::chrono::steady_clock::now()
+                                  .time_since_epoch().count()
+                                + (int64_t)(deadline_ms * 1e6);
+              }
+              std::vector<std::pair<int32_t, int32_t>> pruned;
+              int final_omega;
+              {
+                  py::gil_scoped_release release;
+                  final_omega = ncolor_cpp::prune_breakable_cliques(
+                      N, (const int32_t*)ib.ptr, (const int32_t*)xb.ptr,
+                      r1_lookup, target_omega, max_iters, deadline_ns,
+                      pruned);
+              }
+              const auto m = (py::ssize_t)pruned.size();
+              py::array_t<int32_t> arr({m, (py::ssize_t)2});
+              auto buf = arr.mutable_unchecked<2>();
+              for (py::ssize_t i = 0; i < m; ++i) {
+                  buf(i, 0) = pruned[(size_t)i].first;
+                  buf(i, 1) = pruned[(size_t)i].second;
+              }
+              return {std::move(arr), final_omega};
+          },
+          py::arg("indptr"), py::arg("indices"),
+          py::arg("r1_indptr"), py::arg("r1_indices"),
+          py::arg("target_omega") = 5,
+          py::arg("max_iters") = 50,
+          py::arg("deadline_ms") = 50.0,
+          "Iteratively find K_{target_omega} cliques in the augmented\n"
+          "graph and remove an r=2-only edge per clique. Returns\n"
+          "(pruned_edges (M,2) int32 array, final_omega int).");
 
     // hea: Hybrid Evolutionary Algorithm for k-coloring. Standalone
     // entry point for testing on arbitrary CSR graphs. Returns the best

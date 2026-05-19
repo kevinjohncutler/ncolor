@@ -21,6 +21,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <vector>
 #include <cstdint>
 #include <climits>
@@ -38,6 +39,7 @@ struct BBDSatur {
     std::vector<int32_t> sat_deg;    // [N] cached saturation (popcount of forbidden)
     int64_t node_count = 0;
     int64_t node_budget = 0;         // 0 = unbounded
+    int64_t deadline_ns = 0;         // 0 = no wall-clock cap
     const std::atomic<bool>* cancel = nullptr;  // sibling-cancel flag
 
     // Pick the uncoloured vertex with the highest saturation degree.
@@ -98,7 +100,17 @@ struct BBDSatur {
         // take O(depth × k) extra mod-N intervals (~10 ms for our
         // graphs). Relaxed-load on x86 is essentially free with
         // branch prediction once the flag flips.
+        // Wall-clock deadline: same logic — per-node cost is O(N)
+        // (pick_next is a linear scan), so even checking every 1024
+        // nodes is too rare when N is in the thousands (a fixed node
+        // budget at large N translates to seconds). Check every
+        // recurse() when a deadline is set. Steady-clock cost is
+        // ~50-100 ns per call vs ~5 µs per recurse at N=5000 —
+        // negligible overhead in the regime where deadlines matter.
         if (cancel && cancel->load(std::memory_order_relaxed)) return false;
+        if (deadline_ns > 0 &&
+            std::chrono::steady_clock::now()
+                .time_since_epoch().count() > deadline_ns) return false;
         ++node_count;
         if (node_budget > 0 && node_count > node_budget) return false;
         const int32_t u = pick_next();
@@ -129,7 +141,8 @@ inline bool bb_dsatur(
     const int32_t* indptr, const int32_t* indices, int32_t N, int32_t k,
     std::vector<uint8_t>& colors,
     int64_t node_budget = 0,
-    const std::atomic<bool>* cancel = nullptr)
+    const std::atomic<bool>* cancel = nullptr,
+    int64_t deadline_ns = 0)
 {
     if (N <= 0) { colors.clear(); return true; }
     if (k <= 0 || k > 7) return false;  // bitmask is uint8, supports up to k=7
@@ -141,6 +154,7 @@ inline bool bb_dsatur(
     s.forbidden.assign((size_t)N, 0);
     s.sat_deg.assign((size_t)N, 0);
     s.node_budget = node_budget;
+    s.deadline_ns = deadline_ns;
     s.cancel = cancel;
     if (s.recurse()) {
         colors = std::move(s.colors);

@@ -86,8 +86,9 @@ inline bool tabucol(
     int best_total = total_conf;
     int iters_since_best = 0;
     if (dbg_traj) {
-        std::fprintf(stderr, "[tabu seed=%llu] start total_conf=%d\n",
-                      (unsigned long long)seed, total_conf);
+        std::fprintf(stderr,
+            "[tabu seed=%llu] start total_conf=%d max_iters=%d deadline_ns=%lld\n",
+            (unsigned long long)seed, total_conf, max_iters, (long long)deadline_ns);
     }
     for (int it = 0; it < max_iters; ++it) {
         if (total_conf == 0) {
@@ -96,22 +97,26 @@ inline bool tabucol(
                 (unsigned long long)seed, it);
             return true;
         }
-        if ((it & 0xff) == 0) {
-            if (cancel && cancel->load(std::memory_order_relaxed)) {
+        // Check sibling-cancel and wall-clock deadline. Cancel is a
+        // simple atomic load (essentially free with branch
+        // prediction); checking every iter lets us short-circuit
+        // immediately when a sibling worker wins. Deadline check is
+        // gated to every 32 iters so the chrono call (~50-100 ns)
+        // doesn't dominate inner-loop cost on small N.
+        if (cancel && cancel->load(std::memory_order_relaxed)) {
+            if (dbg_traj) std::fprintf(stderr,
+                "[tabu seed=%llu] CANCELLED it=%d final=%d best=%d\n",
+                (unsigned long long)seed, it, total_conf, best_total);
+            return false;
+        }
+        if (deadline_ns > 0 && (it & 0x1f) == 0) {
+            const auto now = std::chrono::steady_clock::now()
+                              .time_since_epoch().count();
+            if (now > deadline_ns) {
                 if (dbg_traj) std::fprintf(stderr,
-                    "[tabu seed=%llu] CANCELLED it=%d final=%d best=%d\n",
+                    "[tabu seed=%llu] DEADLINE it=%d final=%d best=%d\n",
                     (unsigned long long)seed, it, total_conf, best_total);
                 return false;
-            }
-            if (deadline_ns > 0) {
-                const auto now = std::chrono::steady_clock::now()
-                                  .time_since_epoch().count();
-                if (now > deadline_ns) {
-                    if (dbg_traj) std::fprintf(stderr,
-                        "[tabu seed=%llu] DEADLINE it=%d final=%d best=%d\n",
-                        (unsigned long long)seed, it, total_conf, best_total);
-                    return false;
-                }
             }
         }
         if (dbg_traj && (it % 500 == 0)) {
