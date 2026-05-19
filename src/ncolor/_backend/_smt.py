@@ -240,16 +240,25 @@ def calibrate(force: bool = False, verbose: bool = False) -> int:
 
 
 def auto_threads() -> int:
-    """Return the optimal thread count for ``Solver``, using the cache.
+    """Return the optimal thread count for ``Solver``, capped at physical
+    cores.
 
-    If no cache entry exists for this machine, returns ``_physical_cores()``
-    as a safe default. Call :func:`calibrate` once to populate the cache.
+    Reads the calibrated value from cache if present, else returns
+    ``_physical_cores()``. The result is clamped to ``[1, physical]`` —
+    SMT-doubled thread counts hurt on the memory-bandwidth-bound find_pairs
+    scan and on real workloads (2000² segmentations, spur-free expand) we
+    routinely see 5× slowdowns at logical-thread counts compared to
+    physical. The calibration mask (1024² synthetic) doesn't capture this,
+    so the cap protects against stale or workload-mismatched calibrations.
+    Callers who want SMT can pass an explicit ``n_threads`` to
+    ``Solver`` / ``ExpandEngine``.
     """
+    phys = _physical_cores()
     cache = _load_cache()
     key = _cache_key()
     if key in cache:
-        return int(cache[key])
-    return _physical_cores()
+        return max(1, min(int(cache[key]), phys))
+    return phys
 
 
 if __name__ == "__main__":
