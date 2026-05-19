@@ -73,6 +73,14 @@ inline std::pair<T, int> dominant_label(const T* nbrs, int n) {
 }  // namespace expand_sf_detail
 
 // 2D fast-path implementation. Returns number of bg pixels claimed.
+//
+// Round 0 is fused with the initial-frontier scan: we do a single
+// full-image pass that BOTH finds the candidate pixels (bg with ≥1
+// labelled face-neighbour) AND computes their round-0 claim in one
+// go. For the common `max_rounds=1` case this is the only pass
+// needed — no separate frontier-building step. For larger
+// max_rounds, the BFS loop continues on round-0's claim-neighbours
+// as before.
 template <typename T>
 inline int64_t expand_spur_free_2d_inplace(
     T* labels, int64_t H, int64_t W,
@@ -83,69 +91,131 @@ inline int64_t expand_spur_free_2d_inplace(
     const int64_t total = H * W;
     if (total == 0) return 0;
 
-    // 1. Initial frontier: bg pixels with ≥1 labelled face-neighbour.
-    std::vector<int64_t> frontier;
-    std::vector<uint8_t> in_frontier(total, 0);
+    const int nt = (pool && n_threads > 1) ? n_threads : 1;
 
-    auto build_initial = [&]() {
-        for (int64_t y = 0; y < H; ++y) {
+    // Round 0 = fused initial-scan + claim computation. Single pass
+    // over the full image; for each bg pixel, count same-label face-
+    // neighbours and emit a claim if the count exceeds the threshold.
+    // No separate "is this pixel a frontier candidate?" pass needed.
+    std::vector<std::pair<int64_t, T>> claims;
+    auto scan_chunk_2d = [&](int64_t y_lo, int64_t y_hi,
+                              std::vector<std::pair<int64_t, T>>& out) {
+        for (int64_t y = y_lo; y < y_hi; ++y) {
             for (int64_t x = 0; x < W; ++x) {
                 const int64_t i = y * W + x;
                 if (labels[i] != 0) continue;
-                bool has_labelled = false;
-                if (y > 0     && labels[i - W] != 0) has_labelled = true;
-                if (!has_labelled && y + 1 < H && labels[i + W] != 0) has_labelled = true;
-                if (!has_labelled && x > 0     && labels[i - 1] != 0) has_labelled = true;
-                if (!has_labelled && x + 1 < W && labels[i + 1] != 0) has_labelled = true;
-                if (has_labelled) {
-                    frontier.push_back(i);
-                    in_frontier[i] = 1;
+                T nbrs[4];
+                int n = 0;
+                if (y > 0)     nbrs[n++] = labels[i - W];
+                if (y + 1 < H) nbrs[n++] = labels[i + W];
+                if (x > 0)     nbrs[n++] = labels[i - 1];
+                if (x + 1 < W) nbrs[n++] = labels[i + 1];
+                auto [lab, cnt] = expand_sf_detail::dominant_label(nbrs, n);
+                if (cnt > connectivity_threshold) {
+                    out.emplace_back(i, lab);
                 }
             }
         }
     };
 
-    const int nt = (pool && n_threads > 1) ? n_threads : 1;
     if (nt > 1 && total >= 1024) {
+        std::vector<std::vector<std::pair<int64_t, T>>> per_thread(nt);
+        std::atomic<int> tid_counter{0};
         std::atomic<int64_t> next_row{0};
         const int64_t chunk = std::max<int64_t>(1, H / (nt * 4));
-        std::mutex mtx;
         pool->parallel([&]() {
-            std::vector<int64_t> local;
+            int my_tid = tid_counter.fetch_add(1);
+            if (my_tid >= nt) return;
+            auto& local = per_thread[my_tid];
             while (true) {
                 int64_t y_lo = next_row.fetch_add(chunk);
                 if (y_lo >= H) break;
                 int64_t y_hi = std::min(H, y_lo + chunk);
-                for (int64_t y = y_lo; y < y_hi; ++y) {
-                    for (int64_t x = 0; x < W; ++x) {
-                        const int64_t i = y * W + x;
-                        if (labels[i] != 0) continue;
-                        bool has_lab = false;
-                        if (y > 0     && labels[i - W] != 0) has_lab = true;
-                        if (!has_lab && y + 1 < H && labels[i + W] != 0) has_lab = true;
-                        if (!has_lab && x > 0     && labels[i - 1] != 0) has_lab = true;
-                        if (!has_lab && x + 1 < W && labels[i + 1] != 0) has_lab = true;
-                        if (has_lab) local.push_back(i);
-                    }
-                }
-            }
-            if (!local.empty()) {
-                std::lock_guard<std::mutex> lk(mtx);
-                frontier.insert(frontier.end(), local.begin(), local.end());
+                scan_chunk_2d(y_lo, y_hi, local);
             }
         });
-        // Set in_frontier for all collected.
-        for (int64_t i : frontier) in_frontier[i] = 1;
+        size_t sz = 0;
+        for (auto& v : per_thread) sz += v.size();
+        claims.reserve(sz);
+        for (auto& v : per_thread) claims.insert(claims.end(), v.begin(), v.end());
     } else {
-        build_initial();
+        scan_chunk_2d(0, H, claims);
     }
 
-    int64_t total_claimed = 0;
+    if (claims.empty()) return 0;
+
+    // Apply round-0 claims.
+    if (nt > 1 && claims.size() >= 2048) {
+        std::atomic<size_t> idx{0};
+        const size_t cs = 1024;
+        pool->parallel([&]() {
+            while (true) {
+                size_t lo = idx.fetch_add(cs);
+                if (lo >= claims.size()) break;
+                size_t hi = std::min(claims.size(), lo + cs);
+                for (size_t k = lo; k < hi; ++k) {
+                    labels[claims[k].first] = claims[k].second;
+                }
+            }
+        });
+    } else {
+        for (auto& [i, lab] : claims) labels[i] = lab;
+    }
+
+    int64_t total_claimed = (int64_t)claims.size();
+
+    // For max_rounds == 1 (the default) we're done — no further
+    // frontier work needed.
+    if (max_rounds <= 1) return total_claimed;
+
+    // Build next_frontier from round-0 claims' bg neighbours.
+    std::vector<int64_t> frontier;
+    if (nt > 1 && claims.size() >= 1024) {
+        std::vector<std::vector<int64_t>> per_thread_next(nt);
+        std::atomic<int> tid_c{0};
+        std::atomic<size_t> idx_c{0};
+        const size_t chunk_c = std::max<size_t>(64, claims.size() / (nt * 8));
+        pool->parallel([&]() {
+            int my_tid = tid_c.fetch_add(1);
+            if (my_tid >= nt) return;
+            auto& local = per_thread_next[my_tid];
+            while (true) {
+                size_t lo = idx_c.fetch_add(chunk_c);
+                if (lo >= claims.size()) break;
+                size_t hi = std::min(claims.size(), lo + chunk_c);
+                for (size_t k = lo; k < hi; ++k) {
+                    const int64_t i = claims[k].first;
+                    const int64_t y = i / W;
+                    const int64_t x = i - y * W;
+                    if (y > 0     && labels[i - W] == 0) local.push_back(i - W);
+                    if (y + 1 < H && labels[i + W] == 0) local.push_back(i + W);
+                    if (x > 0     && labels[i - 1] == 0) local.push_back(i - 1);
+                    if (x + 1 < W && labels[i + 1] == 0) local.push_back(i + 1);
+                }
+            }
+        });
+        size_t sz = 0;
+        for (auto& v : per_thread_next) sz += v.size();
+        frontier.reserve(sz);
+        for (auto& v : per_thread_next) frontier.insert(frontier.end(), v.begin(), v.end());
+    } else {
+        for (auto& [i, lab] : claims) {
+            (void)lab;
+            const int64_t y = i / W;
+            const int64_t x = i - y * W;
+            if (y > 0     && labels[i - W] == 0) frontier.push_back(i - W);
+            if (y + 1 < H && labels[i + W] == 0) frontier.push_back(i + W);
+            if (x > 0     && labels[i - 1] == 0) frontier.push_back(i - 1);
+            if (x + 1 < W && labels[i + 1] == 0) frontier.push_back(i + 1);
+        }
+    }
+    std::sort(frontier.begin(), frontier.end());
+    frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
 
     // 2. Iterative growth (parallelised within each round).
-    std::vector<std::pair<int64_t, T>> claims;
     std::vector<int64_t> next_frontier;
-    for (int round = 0; round < max_rounds; ++round) {
+    std::vector<uint8_t> in_frontier;  // legacy, unused
+    for (int round = 1; round < max_rounds; ++round) {
         if (frontier.empty()) break;
 
         claims.clear();
@@ -202,8 +272,6 @@ inline int64_t expand_spur_free_2d_inplace(
         }
 
         if (claims.empty()) {
-            // No further growth possible.
-            for (int64_t i : frontier) in_frontier[i] = 0;
             break;
         }
 
