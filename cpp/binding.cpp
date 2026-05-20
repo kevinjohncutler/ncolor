@@ -1532,15 +1532,20 @@ private:
                 // has failed → zero cost on the common path.
                 const int64_t bb_budget_ns =
                     50LL * 1000LL * 1000LL;  // 50 ms
-                // HEA gets 1 s — empirically the trickiest adversarial
-                // shuffles need 25-90 ms, but the despur-cliff cases on
-                // MM r=1 (despur_iters=30 no_thin, despur_iters=2
-                // remove_thin=True) need significantly longer. Both
-                // graphs are subgraphs of an already-4-colored graph
-                // so χ ≤ 4 is provable; the picker just needs a wider
-                // window. Fires only when bb_dsatur didn't succeed.
+                // HEA gets 100 ms — empirically the trickiest
+                // adversarial shuffles (which bb_dsatur exhausts its
+                // budget on) need 25-90 ms of HEA to converge. The
+                // despur-cliff cases (where χ ≤ 4 is provable as a
+                // subgraph of an already-coloured input) need much
+                // longer than this — but throwing wall-time at them
+                // is the wrong fix; the right fix is warm-starting
+                // the picker from the previous iteration's coloring
+                // instead of re-searching from scratch on each
+                // despur step. Until that lands, the cliff cases
+                // fall back to n_used=5; users hit them only with
+                // expand_spur_free=False on dense MM-class data.
                 const int64_t hea_budget_ns =
-                    1000LL * 1000LL * 1000LL;
+                    100LL * 1000LL * 1000LL;
                 if (!ok) {
                     const int64_t node_budget = std::max<int64_t>(
                         200000, (int64_t)N * 100);
