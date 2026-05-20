@@ -1459,16 +1459,28 @@ private:
                     // its own iter cap as a secondary bound.
                     const int per_seed_iters = std::min(
                         50000, std::max(2000, N * 30));
-                    // 0 ms wall budget — bb_dsatur + HEA fallbacks
-                    // cover the same role at lower cost (HEA's
-                    // built-in init-population calls tabucol per
-                    // member, replicating the restart-loop effect
-                    // with crossover diversity on top). Skipping this
-                    // loop saves 50 ms on infeasible-at-k graphs. If
-                    // a regression on feasible-but-hard cases is
-                    // observed in stress testing, bump back to ~10 ms
-                    // for a cheap safety net.
-                    const int64_t budget_ns = 0LL;
+                    // 50 ms wall budget. Tabucol with restart from the
+                    // race's best partial coloring rescues feasible-
+                    // but-hard graphs that the race + bb_dsatur + HEA
+                    // chain can otherwise miss. Two real cases this
+                    // catches on MM r=1:
+                    //   (a) despur_iters=30 (no remove_thin): the
+                    //       cascade removes 16 1-px bridges, leaving
+                    //       a graph that's a strict subgraph of the
+                    //       iter-20 graph (which 4-colors fine) but
+                    //       that the race's BFS-order heuristic gets
+                    //       stuck on. χ is unchanged but the search
+                    //       trajectory shifts.
+                    //   (b) despur_iters=2 with remove_thin=True: same
+                    //       failure mode, ~400 scattered single-pixel
+                    //       removals at corner junctions perturb the
+                    //       graph just enough to break the race.
+                    // Without this budget both cases bump cur_n to 5
+                    // even though χ ≤ 4. 50 ms is enough for tabucol
+                    // to climb out of the local minimum on both.
+                    // Skipped when the race already found a valid
+                    // coloring (the !ok guard above).
+                    const int64_t budget_ns = 50LL * 1000LL * 1000LL;
                     const int64_t deadline_ns =
                         std::chrono::steady_clock::now()
                             .time_since_epoch().count() + budget_ns;
@@ -1520,12 +1532,15 @@ private:
                 // has failed → zero cost on the common path.
                 const int64_t bb_budget_ns =
                     50LL * 1000LL * 1000LL;  // 50 ms
-                // HEA gets 100 ms — empirically the trickiest
-                // adversarial shuffles (which bb_dsatur exhausts its
-                // budget on) need 25-90 ms of HEA to converge; 50 ms
-                // dropped a previously-passing shuffle.
+                // HEA gets 1 s — empirically the trickiest adversarial
+                // shuffles need 25-90 ms, but the despur-cliff cases on
+                // MM r=1 (despur_iters=30 no_thin, despur_iters=2
+                // remove_thin=True) need significantly longer. Both
+                // graphs are subgraphs of an already-4-colored graph
+                // so χ ≤ 4 is provable; the picker just needs a wider
+                // window. Fires only when bb_dsatur didn't succeed.
                 const int64_t hea_budget_ns =
-                    100LL * 1000LL * 1000LL;
+                    1000LL * 1000LL * 1000LL;
                 if (!ok) {
                     const int64_t node_budget = std::max<int64_t>(
                         200000, (int64_t)N * 100);
