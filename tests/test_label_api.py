@@ -400,3 +400,64 @@ def test_expand_labels_voronoi_default_unchanged():
     out_default = ncolor.expand_labels(arr)
     out_explicit = ncolor.expand_labels(arr, mode="voronoi")
     assert np.array_equal(out_default, out_explicit)
+
+
+def test_delete_spurs_remove_thin_one_shot():
+    """remove_thin=True catches 1-px-thick line interiors in ONE pass.
+    Build a label image with a horizontal 1-px bridge between two
+    blobs; the bridge interior pixels have face-count=2 (opposite),
+    so they survive iter 1 of the default despur but vanish with
+    remove_thin=True in a single pass. The pixel where the bridge
+    attaches to the blob is a junction (4 same-label 8-neighbors)
+    and correctly stays — the detector only removes pixels with
+    EXACTLY two same-label 8-conn neighbors on opposite sides."""
+    arr = np.zeros((9, 20), dtype=np.int32)
+    arr[3:6, 1:5] = 1                  # left blob (3x4)
+    arr[3:6, 14:19] = 2                # right blob (3x5)
+    arr[4, 5:14] = 1                   # 1-px bridge attached to left blob
+    # Default despur (1 iter): only the bridge's far endpoint (col 13,
+    # face-count=1) is peeled. The 8 interior + junction pixels survive.
+    cleaned_no, n_no = ncolor.delete_spurs(arr, kind="labels", max_iters=1,
+                                             remove_thin=False)
+    survived_no = (cleaned_no[4, 5:14] != 0).sum()
+    assert survived_no >= 7
+    # With remove_thin=True at iter 1: bridge interior (cols 6-12) + the
+    # spur endpoint (col 13) all vanish. Junction pixel at col 5 (which
+    # has 4 same-label 8-neighbors from the blob) correctly stays.
+    cleaned_yes, n_yes = ncolor.delete_spurs(arr, kind="labels", max_iters=1,
+                                              remove_thin=True)
+    assert (cleaned_yes[4, 6:14] == 0).all(), \
+        "interior + spur endpoint of bridge should all be removed"
+    assert cleaned_yes[4, 5] == 1, "junction pixel should survive"
+    assert n_yes > n_no
+
+
+def test_delete_spurs_remove_thin_keeps_real_cells():
+    """remove_thin must not eat 2x2 blocks (count=2 but perpendicular)
+    or L-shaped corners. Both have face-count=2 but the neighbors are
+    not opposite, so the detector leaves them alone."""
+    arr = np.zeros((8, 8), dtype=np.int32)
+    arr[2:4, 2:4] = 1                  # 2x2 block (perpendicular pairs)
+    arr[4:7, 4:7] = 2                  # 3x3 block, all interior count >= 3
+    cleaned, _ = ncolor.delete_spurs(arr, kind="labels", max_iters=20,
+                                       remove_thin=True)
+    # 2x2 survives: each pixel has 2 perpendicular face-neighbors.
+    assert (cleaned[2:4, 2:4] == 1).all()
+    # 3x3 survives: interior has count >= 3.
+    assert (cleaned[4:7, 4:7] == 2).all()
+
+
+def test_delete_spurs_remove_thin_catches_2d_diagonal_line():
+    """A 1-px-wide diagonal NW-SE line is caught by the diagonal-
+    opposite detector. (Note: pure diagonal lines also have face-
+    count=0 so they're already caught by the spur rule, but a single
+    face-neighbor plus an opposite diagonal isn't.)"""
+    # Build a 5-pixel diagonal line.
+    arr = np.zeros((10, 10), dtype=np.int32)
+    for k in range(5):
+        arr[2 + k, 2 + k] = 1
+    cleaned, n = ncolor.delete_spurs(arr, kind="labels", max_iters=1,
+                                      remove_thin=True)
+    # All 5 diagonal pixels gone (they were already spurs by face-count=0).
+    assert (cleaned == 0).all()
+    assert n == 5

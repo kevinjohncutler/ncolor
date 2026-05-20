@@ -70,6 +70,22 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
         nmax = int(labels.max()) if labels.size else 0
 
         if despur:
+            # Fast label-aware pre-pass: wipe spurs AND 1-voxel-thick
+            # straight interior pixels (axis-aligned + 2D diagonals)
+            # in a single mark-and-apply over the whole image. Catches
+            # 1-px inter-cell bridges that the per-label binary despur
+            # below would otherwise eat one ring at a time. The result
+            # is bit-equivalent to running the per-label loop to
+            # convergence, just produced in one pass.
+            if nmax > 0:
+                labels_i32_pre, _n_pre = _b.delete_spurs_labels(
+                    np.ascontiguousarray(labels_i32),
+                    threshold=1, max_iters=20, remove_thin=True)
+                labels_i32 = labels_i32_pre
+                labels = labels_i32.view(np.uint32) \
+                    if labels_i32.dtype == np.int32 \
+                    else labels_i32.astype(np.uint32, copy=False)
+                nmax = int(labels.max()) if labels.size else 0
             # delete_spurs mutates the per-label mask between rounds, so
             # the despur path stays per-label (bbox-cropped).
             global_props = _regionprops(np.ascontiguousarray(labels_i32), nmax) if nmax > 0 else None
@@ -190,7 +206,7 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
 
 def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
                  threshold=None, max_iter=-1, kind="auto",
-                 max_iters=None):
+                 max_iters=None, remove_thin=False):
     """N-D spur cleanup. Dispatches on input contents:
 
     * **Binary mask** (max value ≤ 1, or ``bool`` dtype) — fills small
@@ -230,6 +246,14 @@ def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
     ``max_iter`` (binary) / ``max_iters`` (label) — cap the iterative
     pruning loop. Binary default ``-1`` runs to convergence; label
     default 20 caps at 20 rounds.
+
+    ``remove_thin`` (label mode only, default ``False``) — also zero
+    1-voxel-thick straight interior pixels in the same pass. A pixel
+    qualifies iff it has exactly two same-label 8-connectivity
+    neighbors that sit at opposite offsets (axis-aligned in any ndim,
+    plus 2D diagonals NW-SE / NE-SW). Useful when expand_labels
+    leaves 1-px bridges between cells that would otherwise need many
+    iterations of end-peeling to clear.
     """
     if kind not in ("auto", "binary", "labels"):
         raise ValueError(
@@ -245,6 +269,9 @@ def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
         if mode not in ("cardinal", "total"):
             raise ValueError(
                 f"mode must be 'cardinal' or 'total', got {mode!r}")
+        if remove_thin:
+            raise ValueError(
+                "remove_thin only applies to kind='labels'")
         arr_u8 = arr.astype(np.uint8, copy=False)
         conn_kind = 1 if mode == "cardinal" else arr_u8.ndim
         thr = int(threshold) if threshold is not None else -1
@@ -255,4 +282,5 @@ def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
     thr = int(threshold) if threshold is not None else 1
     rounds = int(max_iters) if max_iters is not None else (
         20 if max_iter == -1 else int(max_iter))
-    return _b.delete_spurs_labels(arr32, threshold=thr, max_iters=rounds)
+    return _b.delete_spurs_labels(arr32, threshold=thr, max_iters=rounds,
+                                    remove_thin=bool(remove_thin))

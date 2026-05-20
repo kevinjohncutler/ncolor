@@ -1990,7 +1990,8 @@ PYBIND11_MODULE(_impl, m) {
           "runs to convergence.");
 
     m.def("delete_spurs_labels",
-          [](py::array labels_in, int threshold, int max_iters, int n_threads) {
+          [](py::array labels_in, int threshold, int max_iters, int n_threads,
+             bool remove_thin) {
               if (!(labels_in.flags() & py::array::c_style)) {
                   labels_in = py::array::ensure(labels_in, py::array::c_style);
               }
@@ -2022,18 +2023,25 @@ PYBIND11_MODULE(_impl, m) {
                           n_removed = ncolor_cpp::delete_spurs_labels_nd_inplace<T>(
                               static_cast<T*>(out.mutable_data()),
                               shape, threshold, max_iters,
-                              pool.get(), nt);
+                              pool.get(), nt, remove_thin);
                       });
               }
               return std::make_pair(std::move(out), n_removed);
           },
           py::arg("labels"), py::arg("threshold") = 1, py::arg("max_iters") = 20,
-          py::arg("n_threads") = 0,
+          py::arg("n_threads") = 0, py::arg("remove_thin") = false,
           "Label-aware despur. Iteratively zeros pixels whose count of\n"
           "face-adjacent SAME-label neighbors is ≤ threshold. Returns\n"
           "(cleaned_labels, n_removed). threshold=1 removes pixels with\n"
           "only 1 same-label neighbor AND isolated pixels (count 0).\n"
-          "Stops when no further removals or after max_iters.");
+          "Stops when no further removals or after max_iters.\n\n"
+          "``remove_thin=True`` also zeros 1-voxel-thick straight\n"
+          "interior pixels in the SAME pass (a pixel with exactly two\n"
+          "same-label 8-connectivity neighbors that sit at opposite\n"
+          "offsets — axis-aligned in 3D+, axis-aligned and diagonal\n"
+          "in 2D). Useful for cleaning up 1-px bridges left by L1\n"
+          "Voronoi expand without paying the iter-by-iter end-peeling\n"
+          "cost.");
 
     m.def("expand_spur_free",
           [](py::array labels_in, int max_rounds, int connectivity_threshold,

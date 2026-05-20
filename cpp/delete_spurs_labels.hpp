@@ -35,38 +35,125 @@ namespace ncolor_cpp {
 
 namespace despur_detail {
 
+// A pixel is marked for removal when it's a "spur" (≤ threshold
+// same-label face-neighbors) OR optionally a "thin-line interior":
+// exactly 2 same-label 8-connectivity neighbors AND those two are
+// on opposite sides of the pixel (N-S, W-E, NW-SE, or NE-SW). With
+// remove_thin = true a 1-px-wide straight line gets wiped wholesale
+// in a single pass instead of needing N/2 iterations to peel from
+// both ends. The thin check is 2D-only here; the ND helper below
+// supports the axis-aligned subset (no diagonals) for 3D+.
 template <typename T>
 inline void count_and_mark_2d(
     const T* labels, uint8_t* mark, int64_t H, int64_t W,
-    int threshold, int64_t y_lo, int64_t y_hi)
+    int threshold, int64_t y_lo, int64_t y_hi,
+    bool remove_thin = false)
 {
     for (int64_t y = y_lo; y < y_hi; ++y) {
         for (int64_t x = 0; x < W; ++x) {
             const int64_t i = y * W + x;
             const T lab = labels[i];
             if (lab == 0) continue;
-            int same = 0;
-            if (y > 0 && labels[i - W] == lab) ++same;
-            if (y + 1 < H && labels[i + W] == lab) ++same;
-            if (x > 0 && labels[i - 1] == lab) ++same;
-            if (x + 1 < W && labels[i + 1] == lab) ++same;
-            if (same <= threshold) mark[i] = 1;
+            const bool hN = (y > 0)         && labels[i - W]     == lab;
+            const bool hS = (y + 1 < H)     && labels[i + W]     == lab;
+            const bool hW = (x > 0)         && labels[i - 1]     == lab;
+            const bool hE = (x + 1 < W)     && labels[i + 1]     == lab;
+            const int face = (int)hN + (int)hS + (int)hW + (int)hE;
+            if (face <= threshold) { mark[i] = 1; continue; }
+            if (!remove_thin) continue;
+            // Need EXACTLY two same-label 8-connectivity neighbours and
+            // they must form an opposite pair. Check faces first; only
+            // peek at diagonals when face count is 0 or 2 (any other
+            // face count rules out a 2-opposite total).
+            const bool hNW = (y > 0     && x > 0)     && labels[i - W - 1] == lab;
+            const bool hNE = (y > 0     && x + 1 < W) && labels[i - W + 1] == lab;
+            const bool hSW = (y + 1 < H && x > 0)     && labels[i + W - 1] == lab;
+            const bool hSE = (y + 1 < H && x + 1 < W) && labels[i + W + 1] == lab;
+            const int total = face + (int)hNW + (int)hNE + (int)hSW + (int)hSE;
+            if (total != 2) continue;
+            // Match exactly one of the four opposite-pair patterns.
+            const bool ns   = hN  && hS  && !hW && !hE && !hNW && !hNE && !hSW && !hSE;
+            const bool we   = hW  && hE  && !hN && !hS && !hNW && !hNE && !hSW && !hSE;
+            const bool nwse = hNW && hSE && !hN && !hS && !hW  && !hE  && !hNE && !hSW;
+            const bool nesw = hNE && hSW && !hN && !hS && !hW  && !hE  && !hNW && !hSE;
+            if (ns || we || nwse || nesw) mark[i] = 1;
         }
     }
 }
 
-// ND fallback: per-pixel coord recomputation. Slower than 2D fast path
-// but works for any ndim.
+// ND offset table for the thin-line detector. Enumerates all
+// 3^ndim − 1 unit-displacement neighbours (skip the all-zero offset),
+// records which are face neighbours (exactly one nonzero coord), and
+// the index of each offset's opposite (negated) partner. Built once
+// per delete_spurs_labels_nd_inplace call.
+struct NDOffset {
+    std::vector<int8_t> dc;   // length ndim, values in {-1, 0, +1}
+    int64_t flat_offset;      // sum dc[d] * strides[d]
+    bool is_face;             // exactly one nonzero coord
+    int opposite_idx;         // index of -dc in the same table
+};
+
+inline std::vector<NDOffset> build_nd_offsets(
+    int ndim, const std::vector<int64_t>& strides)
+{
+    std::vector<NDOffset> out;
+    std::vector<int8_t> dc(ndim, -1);
+    while (true) {
+        int n_nz = 0;
+        bool any_nz = false;
+        int64_t flat = 0;
+        for (int d = 0; d < ndim; ++d) {
+            if (dc[d] != 0) { ++n_nz; any_nz = true; }
+            flat += (int64_t)dc[d] * strides[d];
+        }
+        if (any_nz) {
+            NDOffset o;
+            o.dc.assign(dc.begin(), dc.end());
+            o.flat_offset = flat;
+            o.is_face = (n_nz == 1);
+            o.opposite_idx = -1;
+            out.push_back(std::move(o));
+        }
+        // increment dc as a base-3 odometer over {-1,0,+1}
+        int d = ndim - 1;
+        while (d >= 0) {
+            ++dc[d];
+            if (dc[d] <= 1) break;
+            dc[d] = -1;
+            --d;
+        }
+        if (d < 0) break;
+    }
+    // Fill opposite_idx by linear scan.
+    for (size_t k = 0; k < out.size(); ++k) {
+        for (size_t j = 0; j < out.size(); ++j) {
+            bool opp = true;
+            for (int d = 0; d < ndim; ++d) {
+                if (out[k].dc[d] != -out[j].dc[d]) { opp = false; break; }
+            }
+            if (opp) { out[k].opposite_idx = (int)j; break; }
+        }
+    }
+    return out;
+}
+
+// ND fallback: per-pixel coord recomputation. With remove_thin = true
+// this catches any 1-voxel-wide straight segment, whether axis-aligned
+// or diagonal: a pixel is marked iff its same-label 8-connectivity
+// neighbours count exactly two AND they sit at opposite offsets
+// (their displacement vectors negate). Slower than 2D fast path; used
+// for ndim != 2 and as the parity reference for the 2D specialisation.
 template <typename T>
 inline void count_and_mark_nd(
     const T* labels, uint8_t* mark,
     const std::vector<int64_t>& shape,
     const std::vector<int64_t>& strides,
-    int threshold, int64_t i_lo, int64_t i_hi)
+    const std::vector<NDOffset>& offsets,
+    int threshold, int64_t i_lo, int64_t i_hi,
+    bool remove_thin = false)
 {
     const int ndim = (int)shape.size();
     std::vector<int64_t> coords(ndim, 0);
-    // Initialise coords from i_lo (row-major).
     {
         int64_t rem = i_lo;
         for (int d = 0; d < ndim; ++d) {
@@ -77,14 +164,37 @@ inline void count_and_mark_nd(
     for (int64_t i = i_lo; i < i_hi; ++i) {
         const T lab = labels[i];
         if (lab != 0) {
-            int same = 0;
-            for (int d = 0; d < ndim; ++d) {
-                if (coords[d] > 0 && labels[i - strides[d]] == lab) ++same;
-                if (coords[d] + 1 < shape[d] && labels[i + strides[d]] == lab) ++same;
+            int face_count = 0;
+            int total_count = 0;
+            int first_idx = -1, second_idx = -1;
+            bool over_two = false;
+            for (size_t k = 0; k < offsets.size(); ++k) {
+                const auto& o = offsets[k];
+                bool in_bounds = true;
+                for (int d = 0; d < ndim; ++d) {
+                    if (o.dc[d] == 0) continue;
+                    int64_t nc = coords[d] + o.dc[d];
+                    if (nc < 0 || nc >= shape[d]) {
+                        in_bounds = false; break;
+                    }
+                }
+                if (!in_bounds) continue;
+                if (labels[i + o.flat_offset] != lab) continue;
+                ++total_count;
+                if (o.is_face) ++face_count;
+                if (first_idx < 0) first_idx = (int)k;
+                else if (second_idx < 0) second_idx = (int)k;
+                else { over_two = true; }
             }
-            if (same <= threshold) mark[i] = 1;
+            if (face_count <= threshold) {
+                mark[i] = 1;
+            } else if (remove_thin && !over_two
+                       && total_count == 2 && second_idx >= 0
+                       && offsets[first_idx].opposite_idx == second_idx) {
+                mark[i] = 1;
+            }
         }
-        // Increment coords (row-major).
+        // increment coords (row-major)
         int d = ndim - 1;
         ++coords[d];
         while (d > 0 && coords[d] >= shape[d]) {
@@ -115,7 +225,8 @@ inline int64_t delete_spurs_labels_nd_inplace(
     int threshold = 1,
     int max_iters = 20,
     ForkJoinPool* pool = nullptr,
-    int n_threads = 1)
+    int n_threads = 1,
+    bool remove_thin = false)
 {
     const int ndim = (int)shape.size();
     if (ndim < 1) return 0;
@@ -139,8 +250,13 @@ inline int64_t delete_spurs_labels_nd_inplace(
     const int64_t W = (ndim >= 2 ? shape[1] : 1);
     const int nt = (pool && n_threads > 1) ? n_threads : 1;
 
+    // ND offsets table (used by count_and_mark_nd). Built once per call.
+    std::vector<despur_detail::NDOffset> nd_offsets;
+    if (!fast_2d) nd_offsets = despur_detail::build_nd_offsets(ndim, strides);
+
     // -- Iter 0: mark spurs in a shared bitmap via parallel slab
-    // dispatch, then zero them out.
+    // dispatch, then zero them out. ``remove_thin`` also kills
+    // 1-voxel-wide straight interior pixels in the same pass.
     std::vector<uint8_t> mark(total, 0);
     if (fast_2d) {
         if (nt > 1) {
@@ -152,12 +268,13 @@ inline int64_t delete_spurs_labels_nd_inplace(
                     if (y_lo >= H) break;
                     int64_t y_hi = std::min(H, y_lo + chunk);
                     despur_detail::count_and_mark_2d<T>(
-                        labels, mark.data(), H, W, threshold, y_lo, y_hi);
+                        labels, mark.data(), H, W, threshold, y_lo, y_hi,
+                        remove_thin);
                 }
             });
         } else {
             despur_detail::count_and_mark_2d<T>(
-                labels, mark.data(), H, W, threshold, 0, H);
+                labels, mark.data(), H, W, threshold, 0, H, remove_thin);
         }
     } else {
         const int64_t outer = shape[0];
@@ -171,13 +288,15 @@ inline int64_t delete_spurs_labels_nd_inplace(
                     if (s_lo >= outer) break;
                     int64_t s_hi = std::min(outer, s_lo + chunk_slabs);
                     despur_detail::count_and_mark_nd<T>(
-                        labels, mark.data(), shape, strides, threshold,
-                        s_lo * slab_size, s_hi * slab_size);
+                        labels, mark.data(), shape, strides, nd_offsets,
+                        threshold,
+                        s_lo * slab_size, s_hi * slab_size, remove_thin);
                 }
             });
         } else {
             despur_detail::count_and_mark_nd<T>(
-                labels, mark.data(), shape, strides, threshold, 0, total);
+                labels, mark.data(), shape, strides, nd_offsets,
+                threshold, 0, total, remove_thin);
         }
     }
 
