@@ -528,7 +528,7 @@ public:
             int weight_mode = 1 /* ReduceMode::Min */,
             py::object extra_edges_obj = py::none(),
             int connect_radius = 1,
-            int despur_iters = 20,
+            int despur_iters = 2,
             bool expand_spur_free = false,
             int spur_free_max_rounds = 1) {
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
@@ -705,11 +705,12 @@ public:
             // r=1. Iterative despur strips them: pixels with ≤
             // threshold same-label face-neighbors become bg. Iter 1
             // is empirically enough to break the K_5 cascade and
-            // reach n=4 on dense microscopy data; iters 2-20 just
-            // remove more cleanup pixels without changing n_used.
-            // Default is 20 (run-to-convergence) since the BFS
-            // implementation in delete_spurs_labels.hpp makes high
-            // iter counts cost roughly the same as low ones.
+            // reach n=4 on dense microscopy data; iter 2 (default) is
+            // chosen with margin. Running to convergence is NOT
+            // monotonically better — on dense data past ~iter 20 the
+            // cascade can eliminate small cells, allowing previously-
+            // buffered cells to touch and form a new K_5 that pushes
+            // n_used back up to 5. Stay well below that cliff.
             // ``lut_lbl_ptr`` is the buffer apply_color_lut_ reads at the
             // end: by default that's the post-expand ``expanded`` buffer.
             // When despur runs we want to keep coloring the spur pixels
@@ -1754,7 +1755,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("weight_mode") = 1,
              py::arg("extra_edges") = py::none(),
              py::arg("connect_radius") = 1,
-             py::arg("despur_iters") = 20,
+             py::arg("despur_iters") = 2,
              py::arg("expand_spur_free") = false,
              py::arg("spur_free_max_rounds") = 1,
              "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
