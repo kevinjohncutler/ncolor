@@ -99,19 +99,17 @@ inline void count_and_mark_nd(
 
 // BFS-style boundary-only despur. Same semantics as the full-scan
 // variant below, but iterates only over the dynamic frontier of
-// "pixels that might be spurs". Iter 0 is a full-image scan that
-// finds all initial spurs and seeds the frontier for iter 1+; each
+// "pixels that might be spurs". Iter 0 is a full-image scan; each
 // subsequent iter processes only same-label neighbors of pixels
-// removed in the previous iter. For typical microscopy seg's where
-// only ~5% of pixels are at cell boundaries and despur cascades are
-// shallow, this is 3-5× faster than full-scan iteration.
+// removed in the previous iter.
 //
-// Why iter 0 is still a full scan: the initial spur set IS the
-// boundary set (every spur is a boundary pixel), and we have no
-// cheaper way to identify boundary pixels than scanning everything
-// once. After iter 0, we know which pixels could possibly be new
-// spurs (only those adjacent to just-removed pixels) and skip the
-// interior entirely.
+// Empirically NOT a clear win against the parallel full-scan variant
+// at typical iteration counts (≤ 3): the frontier bookkeeping +
+// serial sync points cost more than the redundant scans they save.
+// Bench on macOS M1 Ultra (May 2026) shows BFS 0.5–1.3× full-scan
+// depending on input shape and iters. Kept here as a reference
+// implementation and for inputs that genuinely cascade deeply; not
+// exposed via Python.
 template <typename T>
 inline int64_t delete_spurs_labels_nd_bfs_inplace(
     T* labels,
