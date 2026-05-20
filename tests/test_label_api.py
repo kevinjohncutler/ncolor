@@ -310,3 +310,93 @@ def test_label_optimize_two_hop():
                                   return_conflicts=True)
     assert conflicts == 0
     _assert_valid_coloring(out, m)
+
+
+# ----------------------------------------------------------------------
+# delete_spurs dispatcher: binary vs label-aware
+# ----------------------------------------------------------------------
+
+
+def test_delete_spurs_binary_mode_default():
+    """Mask with values in {0,1} → binary mode auto-detected. Returns
+    a single mask (the cleaned bg pattern), not a (cleaned, n) tuple."""
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[1:7, 1:7] = 1
+    mask[4, 7] = 1  # spur sticking off the side
+    out = ncolor.delete_spurs(mask)
+    assert out.shape == mask.shape
+    # The spur is gone in the cleaned mask.
+    assert out[4, 7] == 0
+
+
+def test_delete_spurs_label_mode_autodetected():
+    """Multi-label image → label-aware mode auto-detected. Returns the
+    (cleaned_labels, n_removed) tuple from the cpp binding."""
+    arr = np.zeros((12, 12), dtype=np.int32)
+    arr[2:5, 2:5] = 1
+    arr[7:10, 7:10] = 2
+    arr[6, 6] = 1   # isolated label-1 pixel inside label-2's reach
+    cleaned, n_removed = ncolor.delete_spurs(arr)
+    assert cleaned.shape == arr.shape
+    assert n_removed >= 1
+    # The isolated label-1 pixel got zeroed; the two main blobs survive.
+    assert cleaned[6, 6] == 0
+    assert (cleaned[2:5, 2:5] == 1).all()
+    assert (cleaned[7:10, 7:10] == 2).all()
+
+
+def test_delete_spurs_force_kind_labels_on_binary_input():
+    """kind='labels' on a 0/1 mask forces the label-aware path. The
+    cpp binding returns (out, n_removed)."""
+    mask = np.zeros((8, 8), dtype=np.uint8)
+    mask[2:6, 2:6] = 1
+    cleaned, n_removed = ncolor.delete_spurs(mask, kind="labels")
+    assert cleaned.shape == mask.shape
+    # Tuple shape — label-aware path was taken.
+    assert isinstance(n_removed, int)
+
+
+def test_delete_spurs_rejects_unknown_kind():
+    arr = np.zeros((4, 4), dtype=np.int32)
+    with pytest.raises(ValueError, match="kind must be"):
+        ncolor.delete_spurs(arr, kind="laser")
+
+
+# ----------------------------------------------------------------------
+# expand_labels mode kwarg: voronoi vs spur_free
+# ----------------------------------------------------------------------
+
+
+def test_expand_labels_spur_free_mode():
+    """mode='spur_free' runs the BFS dilation path. Output is a label
+    image of the same shape with seeds preserved. Growth requires a
+    bg pixel to have ≥ threshold+1 = 2 face-neighbors of the same
+    label, which happens naturally in concave geometry / dense packings
+    but NOT along a single flat seed boundary (each bg pixel sees only
+    one seed face there). _circles_2d_dense gives the right geometry."""
+    m = _circles_2d_dense()
+    out = ncolor.expand_labels(m, mode="spur_free", max_rounds=3)
+    assert out.shape == m.shape
+    # Original seeds preserved.
+    fg = m > 0
+    assert np.array_equal(out[fg], m[fg])
+    # Some bg got claimed (BFS dilated into concavities).
+    assert (out[m == 0] != 0).any()
+
+
+def test_expand_labels_rejects_unknown_mode():
+    arr = np.zeros((8, 8), dtype=np.int32)
+    arr[2:4, 2:4] = 1
+    with pytest.raises(ValueError, match="mode must be"):
+        ncolor.expand_labels(arr, mode="chamfer")
+
+
+def test_expand_labels_voronoi_default_unchanged():
+    """The default mode='voronoi' must behave exactly like the pre-mode
+    expand_labels (regression check on the existing API)."""
+    arr = np.zeros((10, 10), dtype=np.int32)
+    arr[2:4, 2:4] = 1
+    arr[6:8, 6:8] = 2
+    out_default = ncolor.expand_labels(arr)
+    out_explicit = ncolor.expand_labels(arr, mode="voronoi")
+    assert np.array_equal(out_default, out_explicit)

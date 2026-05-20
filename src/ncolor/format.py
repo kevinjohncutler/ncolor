@@ -188,16 +188,30 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
     return out.astype(np.uint32, copy=False)
 
 
-def delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
-                 threshold=None, max_iter=-1):
-    """N-D mask cleanup: fill small bg holes, then iteratively prune
-    pixels whose neighbor count falls below ``threshold``.
+def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
+                 threshold=None, max_iter=-1, kind="auto",
+                 max_iters=None):
+    """N-D spur cleanup. Dispatches on input contents:
 
-    ``hole_threshold`` (default 5): bg components with pixel count ≤
-    this value get filled into the foreground before pruning. Pass 0
-    to skip hole filling entirely.
+    * **Binary mask** (max value ≤ 1, or ``bool`` dtype) — fills small
+      bg holes, then iteratively prunes pixels whose foreground-
+      neighbor count falls below ``threshold``. ``hole_threshold`` /
+      ``mode`` / ``threshold`` / ``max_iter`` apply.
+    * **Label image** (multiple non-zero values) — runs the label-
+      aware variant from ``delete_spurs_labels`` instead: zeros pixels
+      whose count of face-adjacent **same-label** neighbors is ≤
+      ``threshold`` (default 1). ``max_iters`` (alias ``max_iter``)
+      bounds the loop. ``hole_threshold`` and ``mode`` are ignored.
+      Returns ``(cleaned_labels, n_removed)`` for parity with the cpp
+      binding.
 
-    ``mode`` selects the connectivity used by the endpoint check:
+    Pass ``kind='binary'`` or ``kind='labels'`` to force one path.
+
+    ``hole_threshold`` (binary mode, default 5): bg components with
+    pixel count ≤ this value get filled into the foreground before
+    pruning. Pass 0 to skip hole filling entirely.
+
+    ``mode`` (binary mode) — connectivity used by the endpoint check:
 
     * ``"cardinal"`` (default) — face neighbors only (2·ndim of them).
       Catches pixels sticking out of a flat boundary; matches the
@@ -209,19 +223,36 @@ def delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
       they survive cardinal but fall below total). Use this when the
       input may contain genuine thin features you want to keep.
 
-    ``threshold`` (default ``None`` → ``ndim``): a pixel is a spur if
-    its fg-neighbor count is in ``[1, threshold)``. Isolated pixels
-    (count == 0) are always preserved.
+    ``threshold`` — binary mode default is ``None`` → ``ndim`` (pixel
+    is a spur if fg-neighbor count is in ``[1, threshold)``); label
+    mode default is 1.
 
-    ``max_iter`` (default ``-1``): caps the iterative pruning loop.
-    ``-1`` runs to convergence; positive values cap the depth (e.g.
-    ``max_iter=1`` gives a single peel pass).
+    ``max_iter`` (binary) / ``max_iters`` (label) — cap the iterative
+    pruning loop. Binary default ``-1`` runs to convergence; label
+    default 20 caps at 20 rounds.
     """
-    if mode not in ("cardinal", "total"):
-        raise ValueError(f"mode must be 'cardinal' or 'total', got {mode!r}")
+    if kind not in ("auto", "binary", "labels"):
+        raise ValueError(
+            f"kind must be 'auto', 'binary', or 'labels', got {kind!r}")
+    arr = np.ascontiguousarray(arr)
+    if kind == "auto":
+        if arr.dtype == bool or int(arr.max() if arr.size else 0) <= 1:
+            kind = "binary"
+        else:
+            kind = "labels"
     from ._backend import _impl as _b
-    arr = np.ascontiguousarray(mask).astype(np.uint8, copy=False)
-    conn_kind = 1 if mode == "cardinal" else arr.ndim
-    thr = int(threshold) if threshold is not None else -1  # cpp picks ndim
-    return _b.delete_spurs(arr, int(hole_threshold), int(conn_kind),
-                           thr, int(max_iter))
+    if kind == "binary":
+        if mode not in ("cardinal", "total"):
+            raise ValueError(
+                f"mode must be 'cardinal' or 'total', got {mode!r}")
+        arr_u8 = arr.astype(np.uint8, copy=False)
+        conn_kind = 1 if mode == "cardinal" else arr_u8.ndim
+        thr = int(threshold) if threshold is not None else -1
+        return _b.delete_spurs(arr_u8, int(hole_threshold), int(conn_kind),
+                                thr, int(max_iter))
+    # kind == "labels"
+    arr32 = arr.astype(np.int32, copy=False)
+    thr = int(threshold) if threshold is not None else 1
+    rounds = int(max_iters) if max_iters is not None else (
+        20 if max_iter == -1 else int(max_iter))
+    return _b.delete_spurs_labels(arr32, threshold=thr, max_iters=rounds)

@@ -1985,6 +1985,101 @@ PYBIND11_MODULE(_impl, m) {
           "pixels (count == 0) are always preserved. ``max_iter`` < 0\n"
           "runs to convergence.");
 
+    m.def("delete_spurs_labels",
+          [](py::array labels_in, int threshold, int max_iters, int n_threads) {
+              if (!(labels_in.flags() & py::array::c_style)) {
+                  labels_in = py::array::ensure(labels_in, py::array::c_style);
+              }
+              const auto buf = labels_in.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              if (ndim < 1) throw std::invalid_argument(
+                  "delete_spurs_labels requires ndim >= 1");
+              std::vector<int64_t> shape(ndim);
+              std::vector<py::ssize_t> out_shape(ndim);
+              for (int d = 0; d < ndim; ++d) {
+                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
+                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+              }
+              py::array out(labels_in.dtype(), out_shape);
+              std::memcpy(out.request().ptr, buf.ptr,
+                          (size_t)buf.size * (size_t)buf.itemsize);
+              int64_t n_removed = 0;
+              const int nt = n_threads > 0 ? n_threads :
+                  (int)std::thread::hardware_concurrency();
+              {
+                  py::gil_scoped_release release;
+                  std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
+                  if (nt > 1) {
+                      pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
+                  }
+                  dispatch_int_dtype(buf.format, buf.itemsize, "delete_spurs_labels",
+                      [&](auto* tag) {
+                          using T = std::remove_pointer_t<decltype(tag)>;
+                          n_removed = ncolor_cpp::delete_spurs_labels_nd_inplace<T>(
+                              static_cast<T*>(out.mutable_data()),
+                              shape, threshold, max_iters,
+                              pool.get(), nt);
+                      });
+              }
+              return std::make_pair(std::move(out), n_removed);
+          },
+          py::arg("labels"), py::arg("threshold") = 1, py::arg("max_iters") = 20,
+          py::arg("n_threads") = 0,
+          "Label-aware despur. Iteratively zeros pixels whose count of\n"
+          "face-adjacent SAME-label neighbors is ≤ threshold. Returns\n"
+          "(cleaned_labels, n_removed). threshold=1 removes pixels with\n"
+          "only 1 same-label neighbor AND isolated pixels (count 0).\n"
+          "Stops when no further removals or after max_iters.");
+
+    m.def("expand_spur_free",
+          [](py::array labels_in, int max_rounds, int connectivity_threshold,
+             int n_threads) {
+              if (!(labels_in.flags() & py::array::c_style)) {
+                  labels_in = py::array::ensure(labels_in, py::array::c_style);
+              }
+              const auto buf = labels_in.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              if (ndim < 1) throw std::invalid_argument(
+                  "expand_spur_free requires ndim >= 1");
+              std::vector<int64_t> shape(ndim);
+              std::vector<py::ssize_t> out_shape(ndim);
+              for (int d = 0; d < ndim; ++d) {
+                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
+                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+              }
+              py::array out(labels_in.dtype(), out_shape);
+              std::memcpy(out.request().ptr, buf.ptr,
+                          (size_t)buf.size * (size_t)buf.itemsize);
+              int64_t n_claimed = 0;
+              const int nt = n_threads > 0 ? n_threads :
+                  (int)std::thread::hardware_concurrency();
+              {
+                  py::gil_scoped_release release;
+                  std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
+                  if (nt > 1) {
+                      pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
+                  }
+                  dispatch_int_dtype(buf.format, buf.itemsize, "expand_spur_free",
+                      [&](auto* tag) {
+                          using T = std::remove_pointer_t<decltype(tag)>;
+                          n_claimed = ncolor_cpp::expand_spur_free_nd_inplace<T>(
+                              static_cast<T*>(out.mutable_data()),
+                              shape, max_rounds, connectivity_threshold,
+                              pool.get(), nt);
+                      });
+              }
+              return std::make_pair(std::move(out), n_claimed);
+          },
+          py::arg("labels"), py::arg("max_rounds") = 100,
+          py::arg("connectivity_threshold") = 1,
+          py::arg("n_threads") = 0,
+          "Spur-free expand via BFS dilation. Bg pixels are claimed by\n"
+          "a cell only if ≥ connectivity_threshold+1 of their face-\n"
+          "neighbors share that label, so the claimed pixel won't be a\n"
+          "spur. Pixels that never accumulate enough same-label neighbors\n"
+          "stay bg, naturally avoiding K_5-creating starfish convergence\n"
+          "points. Returns (expanded_labels, n_claimed).");
+
     m.def("two_hop_csr",
           [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indptr,
              py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indices)
