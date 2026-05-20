@@ -27,6 +27,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           out=None, p=1, wrap=False, balance=True, first_seen=False,
           weight_objective=0, de_table=None, weight_mode="min",
           optimize=None, extra_edges=None, connect_radius=1, despur_iters=2,
+          despur_remove_thin=False,
           expand_spur_free=False, spur_free_max_rounds=1):
     """4-color graph coloring of a label image.
 
@@ -172,6 +173,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
         weight_mode=wmode_int, extra_edges=extra_arr,
         connect_radius=int(connect_radius),
         despur_iters=int(despur_iters),
+        despur_remove_thin=bool(despur_remove_thin),
         expand_spur_free=bool(expand_spur_free),
         spur_free_max_rounds=int(spur_free_max_rounds))
     out = out_array

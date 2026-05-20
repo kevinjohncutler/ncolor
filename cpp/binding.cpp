@@ -529,6 +529,7 @@ public:
             py::object extra_edges_obj = py::none(),
             int connect_radius = 1,
             int despur_iters = 2,
+            bool despur_remove_thin = false,
             bool expand_spur_free = false,
             int spur_free_max_rounds = 1) {
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
@@ -711,6 +712,15 @@ public:
             // cascade can eliminate small cells, allowing previously-
             // buffered cells to touch and form a new K_5 that pushes
             // n_used back up to 5. Stay well below that cliff.
+            //
+            // ``despur_remove_thin`` ALSO catches 1-voxel-thick straight
+            // interior pixels (the 1462 thin bridges L1 Voronoi creates
+            // on MM-class data). Off by default in the labeling pipeline
+            // because removing those edges triggers the same picker
+            // heuristic failure as the iter-30 cliff, just earlier (at
+            // iter 2 instead of iter 30). The principled fix is to use
+            // expand_spur_free=True so the thin bridges never appear;
+            // remove_thin then has nothing to do.
             // ``lut_lbl_ptr`` is the buffer apply_color_lut_ reads at the
             // end: by default that's the post-expand ``expanded`` buffer.
             // When despur runs we want to keep coloring the spur pixels
@@ -725,7 +735,8 @@ public:
                 lut_lbl_ptr = lut_lbl_.data();
                 ncolor_cpp::delete_spurs_labels_nd_inplace<int32_t>(
                     expanded, shape, /*threshold=*/1,
-                    despur_iters, pool_.get(), n_threads_);
+                    despur_iters, pool_.get(), n_threads_,
+                    despur_remove_thin);
                 stage("despur");
             }
 
@@ -1756,6 +1767,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("extra_edges") = py::none(),
              py::arg("connect_radius") = 1,
              py::arg("despur_iters") = 2,
+             py::arg("despur_remove_thin") = false,
              py::arg("expand_spur_free") = false,
              py::arg("spur_free_max_rounds") = 1,
              "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
