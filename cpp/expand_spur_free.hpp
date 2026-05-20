@@ -214,7 +214,6 @@ inline int64_t expand_spur_free_2d_inplace(
 
     // 2. Iterative growth (parallelised within each round).
     std::vector<int64_t> next_frontier;
-    std::vector<uint8_t> in_frontier;  // legacy, unused
     for (int round = 1; round < max_rounds; ++round) {
         if (frontier.empty()) break;
 
@@ -293,17 +292,11 @@ inline int64_t expand_spur_free_2d_inplace(
             for (auto& [i, lab] : claims) labels[i] = lab;
         }
 
-        // Phase C: build next frontier — parallel.
-        // Insight: a pixel needs re-evaluation ONLY if one of its
-        // face-neighbours just changed state (got claimed this round).
-        // So next_frontier = { bg face-neighbours of pixels just
-        // claimed }. The earlier version's "also keep old frontier"
-        // pass was redundant — any old-frontier pixel that wasn't
-        // claimed AND doesn't have a newly-claimed neighbour has
-        // unchanged state and will not become claimable later.
-        // Dropping it halves Phase C work AND makes it parallelisable
-        // (no dedup-by-bitmap required — duplicates are tolerated and
-        // removed at the end via sort+unique).
+        // next_frontier = { bg face-neighbours of pixels just claimed }.
+        // An old-frontier pixel that wasn't claimed and has no newly-
+        // claimed neighbour can't become claimable later, so it's safe
+        // to drop. Halves the work and removes the dedup-by-bitmap
+        // requirement (duplicates are fine; we sort+unique at the end).
         next_frontier.clear();
         if (nt > 1 && claims.size() >= 1024) {
             std::vector<std::vector<int64_t>> per_thread_next(nt);
@@ -354,7 +347,6 @@ inline int64_t expand_spur_free_2d_inplace(
         total_claimed += (int64_t)claims.size();
         std::swap(frontier, next_frontier);
     }
-    (void)in_frontier;  // legacy buffer, no longer used after simplification
     return total_claimed;
 }
 

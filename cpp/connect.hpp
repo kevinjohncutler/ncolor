@@ -248,13 +248,10 @@ inline void build_forward_neighbours(
     nb_flat_out.clear();
     nb_dc_out.clear();
     if (radius < 1) return;
-    // First collect (cheb_distance, flat_offset, dc[]) tuples, then sort
-    // by Chebyshev distance ascending. This emits the SHORTEST (highest-
-    // confidence) edges first when iterated per pixel — radius=1 1-NN
-    // neighbours before radius=2 gap-bridging neighbours.
-    // Principle: WP greedy commits early choices firmly; let the
-    // physically-adjacent constraints drive those, and let the
-    // corrective wider-radius constraints fill in afterwards.
+    // Sort offsets by Chebyshev distance ascending so r=1 1-NN neighbours
+    // are emitted before r=2 gap-bridges. WP greedy commits early picks
+    // firmly; we want physically-adjacent edges driving those, with the
+    // wider-radius edges filling in afterwards.
     std::vector<std::tuple<int, int64_t, std::vector<int8_t>>> cands;
     std::vector<int8_t> dc(ndim, (int8_t)-radius);
     while (true) {

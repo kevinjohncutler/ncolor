@@ -11,8 +11,7 @@
 // completing the search. Returns the LARGEST clique discovered so far.
 //
 // Bit-packed adjacency for O(N²/64) memory; gate by N to avoid blowing
-// memory on huge graphs. Reuses the same bit-matrix machinery as
-// k5_detect, but generalises to arbitrary clique size.
+// memory on huge graphs.
 
 #pragma once
 
@@ -119,11 +118,10 @@ struct BKState {
             return;
         }
 
-        // Pivot: choose u in P ∪ X with most neighbours in P.
-        // (Skip X since we only need to PARTITION the recursive call
-        // set, and a P-pivot is sufficient.) For simplicity use the
-        // first vertex of P as pivot — degrades worst-case but keeps
-        // the loop tight.
+        // Pivot: first vertex of P. Skipping X is fine because we only
+        // need P-partitioning for the recursive call set. The "most
+        // neighbours in P" pivot would be a tighter bound but the loop
+        // to find it costs more than it saves on our sparse graphs.
         int pivot = -1;
         bk_detail::for_each_bit(P, words, [&](int v) {
             pivot = v;
@@ -348,10 +346,8 @@ inline int clique_lower_bound(
     s.best_clique = 1;  // singleton vertices are trivially clique-1
     s.scratch.assign((size_t)N * (size_t)words, 0);
 
-    // Degeneracy ordering would be ideal but adds complexity; for
-    // sparse cell graphs the naive vertex order with pivoting is fast
-    // enough. Process vertices in DESCENDING degree to find big
-    // cliques early (helps the prune kick in sooner).
+    // Descending-degree vertex order: find big cliques early so the
+    // size prune kicks in sooner.
     std::vector<int> order(N);
     for (int i = 0; i < N; ++i) order[i] = i;
     std::sort(order.begin(), order.end(), [&](int a, int b) {

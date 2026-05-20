@@ -11,8 +11,8 @@ specific chip's memory subsystem and cache topology. Empirically:
 There's no static heuristic from /proc/cpuinfo that picks the right answer
 across all of these. Memory-bandwidth probes (STREAM, pointer-chase) also
 fail to predict because the deciding factor is workload-specific stall
-behavior. The robust answer: time the actual workload at T=physical and
-T=logical once per machine, cache the result.
+behavior. The only thing that worked across all our hosts: time the actual
+workload at T=physical and T=logical once per machine, cache the result.
 
 Calibration runs at 1024² (the smallest size where SMT vs no-SMT separates
 cleanly across all hosts we tested) and takes ~200 ms. Result is cached at
@@ -36,14 +36,7 @@ from pathlib import Path
 
 
 def _user_cache_dir() -> Path:
-    """Per-OS cache directory (``~/Library/Caches/...`` on macOS,
-    ``~/.cache/...`` on Linux, ``%LOCALAPPDATA%\\...\\Cache`` on Windows).
-
-    ``platformdirs`` is a hard runtime dep (in ``setup.py``'s
-    ``install_requires``); a missing import here means the install was
-    incomplete and we'd rather raise than silently use a different cache
-    path than the build-time hook did.
-    """
+    """Per-OS cache dir via platformdirs (hard runtime dep)."""
     from platformdirs import user_cache_dir
     return Path(user_cache_dir("ncolor"))
 
@@ -240,18 +233,12 @@ def calibrate(force: bool = False, verbose: bool = False) -> int:
 
 
 def auto_threads() -> int:
-    """Return the optimal thread count for ``Solver``, capped at physical
-    cores.
+    """Calibrated thread count, clamped to ``[1, physical]``.
 
-    Reads the calibrated value from cache if present, else returns
-    ``_physical_cores()``. The result is clamped to ``[1, physical]`` —
-    SMT-doubled thread counts hurt on the memory-bandwidth-bound find_pairs
-    scan and on real workloads (2000² segmentations, spur-free expand) we
-    routinely see 5× slowdowns at logical-thread counts compared to
-    physical. The calibration mask (1024² synthetic) doesn't capture this,
-    so the cap protects against stale or workload-mismatched calibrations.
-    Callers who want SMT can pass an explicit ``n_threads`` to
-    ``Solver`` / ``ExpandEngine``.
+    SMT-doubled thread counts kill the memory-bandwidth-bound find_pairs
+    scan: 5× slowdowns at logical on 2000² spur-free expand. The 1024²
+    calibration mask is too compute-heavy to expose this, so we cap at
+    physical regardless of what the cache says.
     """
     phys = _physical_cores()
     cache = _load_cache()

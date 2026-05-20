@@ -607,11 +607,10 @@ public:
             // pattern of "skip the copy when input is int32" was a tiny
             // saving but cost us the multi-dtype generality.
             //
-            // Note: I tried fusing the min/max reduce from format_labels
-            // into this pass to "save a redundant read." It regressed:
-            // the data is still cache-hot from this pass when format
-            // does its own reduce, so we save no memory traffic, while
-            // the per-element min/max compares slow this kernel down.
+            // Tried fusing the min/max reduce from format_labels into
+            // this pass — regressed. The data is still cache-hot when
+            // format does its own reduce, so no memory traffic is saved,
+            // and the per-element compares slow this kernel down.
             expand_bufs_.resize(total);
             bg_mask_.resize(static_cast<size_t>(total));
             int32_t* expanded = expand_bufs_.lbl();
@@ -1143,7 +1142,7 @@ private:
                     "[clique-lb] N=%d ω≥%d (target=%d) %.1fms\n",
                     N, omega, n_colors + 1, clb_ms);
             }
-            if (omega > cur_n) cur_n = omega;
+            if (omega > cur_n) cur_n = omega;  // χ ≥ ω, so skip doomed cur_n values
         }
         for (int depth = 0; depth < max_depth && !ok; ++depth) {
             const auto depth_t0 = std::chrono::steady_clock::now();
@@ -1595,10 +1594,8 @@ private:
 
         int n_used = 0;
         for (uint8_t c : colors_) if (c > n_used) n_used = c;
-        // Cheap O(M) tally of adjacent same-colour pairs. Matches the
-        // legacy ``conflicts = sum(lut[pairs[:,0]] == lut[pairs[:,1]])``
-        // since src_idx_/dst_idx_ are exactly the pairs from connect()
-        // (shifted to 0-based) and colors_[k] == lut_[k+1].
+        // O(M) tally of adjacent same-colour pairs so callers that
+        // request return_conflicts don't pay another scan over labels.
         last_n_conflicts_ = 0;
         for (int32_t i = 0; i < M; ++i) {
             if (colors_[src_idx_[i]] == colors_[dst_idx_[i]]) ++last_n_conflicts_;
