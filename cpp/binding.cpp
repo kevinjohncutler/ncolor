@@ -1056,7 +1056,7 @@ private:
         return ncolor_cpp::find_pairs_weighted_nd_unpadded<int32_t, Mode>(
             labels, dist, shape, conn,
             static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap,
-            primary, counts, 1,
+            primary, counts,
             &fp_ht_buf_, &fp_primary_buf_, &fp_counts_buf_);
     }
 
@@ -1657,6 +1657,8 @@ private:
     // re-initialises per-thread slots to HT_EMPTY at the start of each
     // scan, so leaving stale data here between calls is safe.
     std::vector<uint64_t> fp_ht_buf_;
+    // Companion scratch for the boundary-weighted find_pairs path only;
+    // empty / unused when weight_objective==0 (the default).
     std::vector<double>   fp_primary_buf_;
     std::vector<int32_t>  fp_counts_buf_;
     int last_n_conflicts_ = 0;

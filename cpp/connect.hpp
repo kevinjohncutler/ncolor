@@ -725,7 +725,6 @@ find_pairs_weighted_nd_unpadded(const T* lbl, const int32_t* dist,
                                 ForkJoinPool& pool, bool wrap,
                                 std::vector<double>& out_primary,
                                 std::vector<int32_t>& out_counts,
-                                int radius = 1,
                                 std::vector<uint64_t>* ht_scratch = nullptr,
                                 std::vector<double>*  primary_scratch = nullptr,
                                 std::vector<int32_t>* counts_scratch = nullptr) {
@@ -738,11 +737,11 @@ find_pairs_weighted_nd_unpadded(const T* lbl, const int32_t* dist,
     return wrap
         ? find_pairs_unpadded_impl<T, true,  Mode>(
               lbl, shape, conn, ht_size, n_threads, pool, dist,
-              &out_primary, &out_counts, radius,
+              &out_primary, &out_counts, /*radius=*/1,
               ht_scratch, primary_scratch, counts_scratch)
         : find_pairs_unpadded_impl<T, false, Mode>(
               lbl, shape, conn, ht_size, n_threads, pool, dist,
-              &out_primary, &out_counts, radius,
+              &out_primary, &out_counts, /*radius=*/1,
               ht_scratch, primary_scratch, counts_scratch);
 }
 
