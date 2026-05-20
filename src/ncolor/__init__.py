@@ -11,8 +11,8 @@ Public names:
 * ``format_labels``        — normalize labels to contiguous 1..N with bg=0
 * ``get_lut``              — return the color lookup table built by ``label``
 * ``expand_labels``        — Voronoi-style label expansion (L1 / L2)
-* ``connected_components`` — N-D connected-components labelling
-* ``regionprops``          — area / bbox / centroid for a labelled image
+* ``connected_components`` — N-D connected-components labeling
+* ``regionprops``          — area / bbox / centroid for a labeled image
 * ``delete_spurs``         — N-D skeleton hole-fill + endpoint pruning
 """
 from ._version import __version__

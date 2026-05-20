@@ -1,5 +1,5 @@
 [![PyPI version](https://img.shields.io/pypi/v/ncolor.svg?color=green)](https://pypi.org/project/ncolor/)
-[![Downloads](https://static.pepy.tech/personalized-badge/ncolor?period=total&units=international_system&left_color=grey&right_color=green&left_text=Downloads)](https://pepy.tech/project/ncolor)
+[![Downloads](https://static.pepy.tech/personalized-badge/ncolor?period=total&units=international_system&left_color=gray&right_color=green&left_text=Downloads)](https://pepy.tech/project/ncolor)
 [![Tests](badges/tests.svg)](badges/tests.svg)
 [![Coverage](badges/coverage.svg)](badges/coverage.svg)
 
@@ -55,7 +55,7 @@ above pipeline used to call:
 
 ```python
 labels, n = ncolor.connected_components(mask, conn=2)   # like skimage.measure.label
-props     = ncolor.regionprops(labels, n)               # area, bbox, centroid (vectorised)
+props     = ncolor.regionprops(labels, n)               # area, bbox, centroid (vectorized)
 ```
 
 These run 1.5–3× faster than `scikit-image` on typical instance-mask

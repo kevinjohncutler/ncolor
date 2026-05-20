@@ -148,7 +148,7 @@ output verified element-wise.
    ([chamfer_l1_parallel](chamfer.hpp)) is still available as
    `expand_labels_l1_rp` for benchmarking.
 2. **Unpadded `find_pairs`** ([connect.hpp::find_pairs_2d_unpadded](connect.hpp))
-   — direct row-major scan with 2 forward neighbours (right, down) per pixel.
+   — direct row-major scan with 2 forward neighbors (right, down) per pixel.
    Skips the (H+2, W+2) padded-buffer roundtrip the original
    `search_hashset_parallel` needs.
 3. **Parallel `apply_lut`** at the tail — chunked dispatch via the persistent

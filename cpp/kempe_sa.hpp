@@ -1,11 +1,11 @@
 // Standalone Kempe-component simulated annealing for 4-coloring.
 //
-// Loss = α₂ · n_same_2hop  +  γ · Σ w(u, v) · 𝟙[colour(u) = colour(v)]
+// Loss = α₂ · n_same_2hop  +  γ · Σ w(u, v) · 𝟙[color(u) = color(v)]
 //
 // Moves: random Kempe (X, Y)-component swap on the 1-hop adjacency.
 // Kempe swaps preserve 1-hop validity by construction; combined with
-// Metropolis acceptance on the loss, this drives valid colourings
-// toward low 2-hop and low similarity-weighted same-colour pairs.
+// Metropolis acceptance on the loss, this drives valid colorings
+// toward low 2-hop and low similarity-weighted same-color pairs.
 //
 // All inputs are CSR arrays (indptr, indices) with 0-indexed cell IDs.
 // The similarity-pair CSR (iou_*) has float64 weights per edge.
@@ -46,7 +46,7 @@ struct KempeSAParams {
 };
 
 // `colors` is in-place: input = seed coloring (1-indexed values, but
-// addressed by 0-indexed cell), output = best colouring found.
+// addressed by 0-indexed cell), output = best coloring found.
 // All CSR pair arrays store both directions (u→v and v→u) so the
 // boundary delta computation in this function is symmetric.
 //
@@ -103,7 +103,7 @@ inline double kempe_sa(
             T = std::max(params.T_min, T * params.alpha_cool);
             continue;
         }
-        // Random partner colour.
+        // Random partner color.
         uint8_t Y;
         do {
             Y = static_cast<uint8_t>(1 + static_cast<int>(rand01(rng) * params.n_colors));

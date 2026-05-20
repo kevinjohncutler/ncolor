@@ -4,10 +4,10 @@
 //
 //   1. Pad-by-1, fill bg components with pixel count ≤ hole_threshold
 //      via face-connected CCL.
-//   2. Iteratively prune pixels whose fg-neighbour count is in
-//      [1, threshold). The connectivity used for the neighbour count is
+//   2. Iteratively prune pixels whose fg-neighbor count is in
+//      [1, threshold). The connectivity used for the neighbor count is
 //      controlled by ``conn_kind``: 1 → cardinal (face only, 2·ndim
-//      neighbours), ndim → full diagonal (3^ndim − 1 neighbours).
+//      neighbors), ndim → full diagonal (3^ndim − 1 neighbors).
 //      Isolated pixels (count == 0) are always preserved.
 //
 // Templated on input dtype T: any pixel where ``input[i] != T{0}`` is
@@ -36,11 +36,11 @@ namespace ncolor_cpp {
 
 namespace delete_spurs_detail {
 
-// Strided offsets to N-D neighbours under the given connectivity.
+// Strided offsets to N-D neighbors under the given connectivity.
 // kind=1 is face-only (2·ndim offsets); kind=ndim is full diagonal
-// (3^ndim - 1 offsets). The centre cell (offset 0) is excluded.
+// (3^ndim - 1 offsets). The center cell (offset 0) is excluded.
 inline std::vector<int64_t>
-make_neighbour_offsets(const std::vector<int64_t>& strides, int ndim, int kind) {
+make_neighbor_offsets(const std::vector<int64_t>& strides, int ndim, int kind) {
     std::vector<int64_t> offsets;
     std::vector<int> coord(ndim, -1);
     while (true) {
@@ -80,7 +80,7 @@ make_neighbour_offsets(const std::vector<int64_t>& strides, int ndim, int kind) 
 // ``conn_kind`` 1 = cardinal (omnipose-style external-spur rule, more
 //               aggressive, fewer iterations to converge); ndim = full
 //               diagonal (preserves 1-voxel-wide skeleton interiors).
-// ``threshold`` — a pixel is pruned when its fg-neighbour count is in
+// ``threshold`` — a pixel is pruned when its fg-neighbor count is in
 //                 [1, threshold). Use -1 to default to ndim.
 // ``max_iter``  — caps the pruning loop. -1 runs to convergence.
 template <typename T>
@@ -169,15 +169,15 @@ inline void delete_spurs_nd(const T* input, bool* output,
     }
 
     // Step 2: iterative endpoint pruning, candidate-list driven.
-    // Each iteration only re-checks pixels whose neighbour count could
+    // Each iteration only re-checks pixels whose neighbor count could
     // have changed (the previous iteration's removals + their fg
-    // neighbours). Total work is O(pixels_removed · n_neighbours)
+    // neighbors). Total work is O(pixels_removed · n_neighbors)
     // instead of O(iterations · image_pixels). Endpoints are collected
     // before any are removed so the parallel-removal semantics of the
     // naive algorithm are preserved.
     {
         const std::vector<int64_t> offsets =
-            delete_spurs_detail::make_neighbour_offsets(pstrides, ndim, conn_kind);
+            delete_spurs_detail::make_neighbor_offsets(pstrides, ndim, conn_kind);
         const int n_nbs = static_cast<int>(offsets.size());
 
         std::vector<int64_t> candidates;

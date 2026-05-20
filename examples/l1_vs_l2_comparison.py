@@ -65,14 +65,14 @@ masks_fmt = ncolor.format_labels(masks.astype(np.int32))
 # the SAME color assignment as the bg-masked output.
 # wrap=False (top half of figure): standard non-toroidal topology.
 # wrap=True  (bottom row of figure): treat image as a torus — left/right
-# and top/bottom edges become neighbours, so perimeter cells gain
-# adjacencies and the colouring uses 4 colours more uniformly.
+# and top/bottom edges become neighbors, so perimeter cells gain
+# adjacencies and the coloring uses 4 colors more uniformly.
 lut_l2 = ncolor.label(masks_fmt, expand=True, p=2, return_lut=True)
 lut_l1 = ncolor.label(masks_fmt, expand=True, p=1, return_lut=True)
 lut_l2w = ncolor.label(masks_fmt, expand=True, p=2, wrap=True, return_lut=True)
 lut_l1w = ncolor.label(masks_fmt, expand=True, p=1, wrap=True, return_lut=True)
 # wrap + balance: Welsh-Powell visit order (highest-degree first) on top
-# of toroidal Voronoi. Targets visual uniformity of the 4-colour count.
+# of toroidal Voronoi. Targets visual uniformity of the 4-color count.
 lut_l2wb = ncolor.label(masks_fmt, expand=True, p=2, wrap=True, balance=True, return_lut=True)
 lut_l1wb = ncolor.label(masks_fmt, expand=True, p=1, wrap=True, balance=True, return_lut=True)
 exp_l2 = ncolor.expand_labels(masks_fmt, p=2)
@@ -95,7 +95,7 @@ ncwrap_l2 = lut_l2w[exp_l2w][y1:y2, x1:x2]
 ncwrap_l1 = lut_l1w[exp_l1w][y1:y2, x1:x2]
 
 # Row 3 (wrap=True, masked): the actual user-facing output of
-# ncolor.label(masks, p=*, wrap=True). Same colouring as row 2 but
+# ncolor.label(masks, p=*, wrap=True). Same coloring as row 2 but
 # bg-masked back to the original cell pattern.
 ncwrap_masked_l2 = (lut_l2w[exp_l2w] * (masks_fmt > 0))[y1:y2, x1:x2]
 ncwrap_masked_l1 = (lut_l1w[exp_l1w] * (masks_fmt > 0))[y1:y2, x1:x2]
@@ -146,7 +146,7 @@ def colored_panel(arr, mask, *, vmin=None, vmax=None):
 #   row 2 — wrap=True,  masked
 #   row 3 — wrap=True,  full Voronoi expansion (toroidal)
 #   row 4 — wrap=True + balance=True, masked (recommended config —
-#           Welsh-Powell BFS ordering for the most uniform 4-colour
+#           Welsh-Powell BFS ordering for the most uniform 4-color
 #           distribution)
 fig, axes = plt.subplots(5, 4, figsize=(16, 20),
                          gridspec_kw={"wspace": 0.02, "hspace": 0.10})
@@ -178,7 +178,7 @@ axes[0, 3].imshow(diff_rgba, alpha=0.85)
 axes[0, 3].set_title(f"L1 ≠ L2 (red, masked)\n{(diff_pix / n_pix) * 100:.1f}% of fg pixels",
                      color="white", fontsize=10)
 
-# Row 1 — raw Voronoi expansion (every pixel labeled / coloured).
+# Row 1 — raw Voronoi expansion (every pixel labeled / colored).
 full = np.ones_like(m)  # alpha = 1 everywhere
 axes[1, 0].imshow(colored_panel(exp_l2[y1:y2, x1:x2], full))
 axes[1, 0].set_title("expand_labels(p=2)\nraw label map", color="white", fontsize=10)

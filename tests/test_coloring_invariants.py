@@ -17,7 +17,7 @@ import pytest
 import ncolor
 
 
-def _adj_same_color_pairs(label_image: np.ndarray, coloured: np.ndarray) -> int:
+def _adj_same_color_pairs(label_image: np.ndarray, colored: np.ndarray) -> int:
     """Brute-force pixel-pair check (8-conn). Returns the count of adjacent
     pixel pairs in DIFFERENT cells that share a nonzero color. A valid
     4-/5-/whatever-coloring of a label image must have this == 0."""
@@ -27,14 +27,14 @@ def _adj_same_color_pairs(label_image: np.ndarray, coloured: np.ndarray) -> int:
         if dx >= 0:
             a_lab = label_image[: H - dy, : W - dx]
             b_lab = label_image[dy:, dx:]
-            a_col = coloured[: H - dy, : W - dx]
-            b_col = coloured[dy:, dx:]
+            a_col = colored[: H - dy, : W - dx]
+            b_col = colored[dy:, dx:]
         else:
             adx = -dx
             a_lab = label_image[: H - dy, adx:]
             b_lab = label_image[dy:, : W - adx]
-            a_col = coloured[: H - dy, adx:]
-            b_col = coloured[dy:, : W - adx]
+            a_col = colored[: H - dy, adx:]
+            b_col = colored[dy:, : W - adx]
         diff_cell = (a_lab != b_lab) & (a_lab > 0) & (b_lab > 0)
         same_color = (a_col == b_col) & (a_col > 0)
         bad += int((diff_cell & same_color).sum())

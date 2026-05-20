@@ -12,8 +12,8 @@ Build pipeline:
     with ``NCOLOR_NO_CALIBRATE=1`` (cross-compile / CI).
 
 Windows builds: pass ``NCOLOR_USE_CLANG_CL=1`` to swap distutils' default
-``cl.exe`` for ``clang-cl.exe`` — clang-cl's LLVM autovectoriser handles
-the L1 inner loops MSVC's auto-vectoriser punts on.
+``cl.exe`` for ``clang-cl.exe`` — clang-cl's LLVM autovectorizer handles
+the L1 inner loops MSVC's auto-vectorizer punts on.
 """
 from __future__ import annotations
 

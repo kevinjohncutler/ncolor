@@ -18,7 +18,7 @@
 namespace ncolor_cpp {
 
 // Build symmetric CSR from M directed pairs (src[i], dst[i]). Output:
-// indptr[N+1] and indices[2*M]. Neighbours within each row are unordered.
+// indptr[N+1] and indices[2*M]. Neighbors within each row are unordered.
 inline void build_csr_from_pairs(
         const int32_t* src, const int32_t* dst, int32_t N, int32_t M,
         std::vector<int32_t>& indptr, std::vector<int32_t>& indices) {
@@ -84,7 +84,7 @@ inline void build_csr_from_pairs_weighted(
 //            weighted-ΔE objective instead of the balanced-greedy rule.
 // `de_table`: optional (n_colors+1) × (n_colors+1) row-major palette
 //             distance matrix. de_table[c1*(n_colors+1) + c2] is the
-//             ΔE between colour c1 and c2 (any units; viridis-LAB by
+//             ΔE between color c1 and c2 (any units; viridis-LAB by
 //             default). Indices 0..n_colors valid; row/col 0 (bg) ignored.
 // `weight_obj`: 0 = balance (current default), +1 = maximize weighted ΔE
 //               (sharp contrast on heavy edges), -1 = minimize weighted ΔE
@@ -101,7 +101,7 @@ inline bool color_graph_csr_legacy(
     const int32_t de_stride = n_colors + 1;
     // Soft balance pull: only active on LOW-DEGREE nodes (degree ≤ 2),
     // i.e. chains and leaves. On those the local score has just 1–2
-    // neighbours of information and greedy max-ΔE otherwise locks onto
+    // neighbors of information and greedy max-ΔE otherwise locks onto
     // the pairwise max-contrast pair forever (1D chain 2-cycles).
     // Higher-degree nodes (grid interior with deg 8, generic 2D cells
     // with deg 3+) already have enough multi-edge consensus for the
@@ -111,7 +111,7 @@ inline bool color_graph_csr_legacy(
     // regardless of weight_mode (harmonic / mean_inv / count / …).
     // (An earlier anisotropy-based gate `(top2 weight)/(total) > 0.6`
     // — meant to catch chains embedded in denser graphs like spoke
-    // patterns — was tried and reverted. It improved per-spoke colour
+    // patterns — was tried and reverted. It improved per-spoke color
     // count on the 8-spoke synthetic but destroyed the mirror symmetry
     // across the x-axis that the degree-gate output naturally has,
     // which is the more important structural property to preserve.)
@@ -141,9 +141,9 @@ inline bool color_graph_csr_legacy(
     int64_t tail = N;
     if (welsh_powell) {
         // Visit nodes in DESCENDING degree order. High-degree nodes are
-        // most constrained (most neighbours competing for distinct
-        // colours), so colouring them first reduces forced retries and
-        // tends to spread colour usage more evenly across the graph.
+        // most constrained (most neighbors competing for distinct
+        // colors), so coloring them first reduces forced retries and
+        // tends to spread color usage more evenly across the graph.
         // Bucket sort: O(N + max_degree). For our planar / near-planar
         // adjacency graphs, max_degree is small (typically ≤ 12).
         int32_t max_deg = 0;
@@ -278,7 +278,7 @@ inline bool color_graph_csr_legacy(
                 // WP descending-degree visit order — together they balance
                 // both the *assignment moment* (rare slots get priority)
                 // and the *graph order* (high-degree nodes first), yielding
-                // a near-uniform 4-colour distribution.
+                // a near-uniform 4-color distribution.
                 int32_t best = 2147483647;
                 for (int32_t c = 1; c <= n_colors; ++c) {
                     if ((mask & (1u << c)) != 0) continue;
@@ -295,7 +295,7 @@ inline bool color_graph_csr_legacy(
             }
             counter[u] = 0;
         } else {
-            // Tally colors among neighbours, pick least-used (excluding u's current).
+            // Tally colors among neighbors, pick least-used (excluding u's current).
             int32_t cnt[32] = {0};  // max 31 colors — comfortably above any usage
             for (int32_t k = row_beg; k < row_end; ++k) {
                 const uint8_t cv = colors[indices[k]];
@@ -362,7 +362,7 @@ inline bool has_conflict_csr(
 }
 
 // Local-greedy repair: a few passes of "if u has color 0 or matches a
-// neighbour, recolor to the smallest free color in 1..n". Cheap and resolves
+// neighbor, recolor to the smallest free color in 1..n". Cheap and resolves
 // most residual conflicts the BFS leaves behind. Returns true if no conflicts
 // remain afterward. Mirrors numba's `_repair_coloring`.
 inline bool repair_coloring(

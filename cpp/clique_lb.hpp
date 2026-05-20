@@ -120,7 +120,7 @@ struct BKState {
 
         // Pivot: first vertex of P. Skipping X is fine because we only
         // need P-partitioning for the recursive call set. The "most
-        // neighbours in P" pivot would be a tighter bound but the loop
+        // neighbors in P" pivot would be a tighter bound but the loop
         // to find it costs more than it saves on our sparse graphs.
         int pivot = -1;
         bk_detail::for_each_bit(P, words, [&](int v) {

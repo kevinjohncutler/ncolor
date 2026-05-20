@@ -2,26 +2,26 @@
 //
 // Replaces the Voronoi-style expand_labels + post-hoc despur sequence
 // with a single growth algorithm that REFUSES to claim bg pixels that
-// would create spurs (≤1 same-label face-neighbour after assignment).
+// would create spurs (≤1 same-label face-neighbor after assignment).
 //
 // Each round: each frontier bg pixel asks "which label do my face-
-// neighbours mostly agree on?" — if at least `connectivity_threshold+1`
-// face-neighbours share a single non-bg label L, the pixel is claimed
+// neighbors mostly agree on?" — if at least `connectivity_threshold+1`
+// face-neighbors share a single non-bg label L, the pixel is claimed
 // for L. Otherwise it stays bg. Iterate until no more claims happen.
 //
 // The K_5 "starfish" failure mode (5 cells meeting at a corner under
 // conn=1 r=2) is naturally avoided: the convergence pixel has 4 face-
-// neighbours from 4 different cells, so no single label appears
+// neighbors from 4 different cells, so no single label appears
 // twice — the pixel never gets claimed, the cells never form K_5
-// contact, and the resulting adjacency graph is 4-colourable.
+// contact, and the resulting adjacency graph is 4-colorable.
 //
 // Differences vs the standard Voronoi expand:
 //   * Some bg pixels remain bg (those where no label dominates the
-//     neighbourhood) — visible as thin gaps between tightly-packed
+//     neighborhood) — visible as thin gaps between tightly-packed
 //     cells. This is the algorithm's intent.
 //   * For cells separated by wide enough gaps, identical to Voronoi.
 //   * Connectivity-aware: cells only grow into pixels they have a
-//     "claim" on (≥2 face-neighbours already).
+//     "claim" on (≥2 face-neighbors already).
 //
 // Complexity: O(N) initial frontier scan + O(total claimed pixels)
 // across all rounds (each pixel handled once when claimed, and once
@@ -76,10 +76,10 @@ inline std::pair<T, int> dominant_label(const T* nbrs, int n) {
 //
 // Round 0 is fused with the initial-frontier scan: we do a single
 // full-image pass that BOTH finds the candidate pixels (bg with ≥1
-// labelled face-neighbour) AND computes their round-0 claim in one
+// labeled face-neighbor) AND computes their round-0 claim in one
 // go. For the common `max_rounds=1` case this is the only pass
 // needed — no separate frontier-building step. For larger
-// max_rounds, the BFS loop continues on round-0's claim-neighbours
+// max_rounds, the BFS loop continues on round-0's claim-neighbors
 // as before.
 template <typename T>
 inline int64_t expand_spur_free_2d_inplace(
@@ -95,7 +95,7 @@ inline int64_t expand_spur_free_2d_inplace(
 
     // Round 0 = fused initial-scan + claim computation. Single pass
     // over the full image; for each bg pixel, count same-label face-
-    // neighbours and emit a claim if the count exceeds the threshold.
+    // neighbors and emit a claim if the count exceeds the threshold.
     // No separate "is this pixel a frontier candidate?" pass needed.
     std::vector<std::pair<int64_t, T>> claims;
     auto scan_chunk_2d = [&](int64_t y_lo, int64_t y_hi,
@@ -168,7 +168,7 @@ inline int64_t expand_spur_free_2d_inplace(
     // frontier work needed.
     if (max_rounds <= 1) return total_claimed;
 
-    // Build next_frontier from round-0 claims' bg neighbours.
+    // Build next_frontier from round-0 claims' bg neighbors.
     std::vector<int64_t> frontier;
     if (nt > 1 && claims.size() >= 1024) {
         std::vector<std::vector<int64_t>> per_thread_next(nt);
@@ -212,7 +212,7 @@ inline int64_t expand_spur_free_2d_inplace(
     std::sort(frontier.begin(), frontier.end());
     frontier.erase(std::unique(frontier.begin(), frontier.end()), frontier.end());
 
-    // 2. Iterative growth (parallelised within each round).
+    // 2. Iterative growth (parallelized within each round).
     std::vector<int64_t> next_frontier;
     for (int round = 1; round < max_rounds; ++round) {
         if (frontier.empty()) break;
@@ -292,9 +292,9 @@ inline int64_t expand_spur_free_2d_inplace(
             for (auto& [i, lab] : claims) labels[i] = lab;
         }
 
-        // next_frontier = { bg face-neighbours of pixels just claimed }.
+        // next_frontier = { bg face-neighbors of pixels just claimed }.
         // An old-frontier pixel that wasn't claimed and has no newly-
-        // claimed neighbour can't become claimable later, so it's safe
+        // claimed neighbor can't become claimable later, so it's safe
         // to drop. Halves the work and removes the dedup-by-bitmap
         // requirement (duplicates are fine; we sort+unique at the end).
         next_frontier.clear();

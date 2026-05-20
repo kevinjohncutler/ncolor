@@ -1,6 +1,6 @@
 """8-panel comparison: cpp/numba × L1/L2 × balance on/off (no wrap).
 
-Visualises how each (backend, metric, balance) combination colors the
+Visualizes how each (backend, metric, balance) combination colors the
 example logo. Same viridis colormap and dark-bg styling as
 examples/example.ipynb. Uses subprocess to flip NCOLOR_BACKEND for the
 numba-side panels.

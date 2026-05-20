@@ -1,22 +1,22 @@
 // Branch-and-bound k-coloring using DSatur vertex ordering.
 //
-// Brélaz (1979) DSatur: at each step colour the uncoloured vertex with
-// maximum saturation degree (number of distinct colours among its
-// already-coloured neighbours). Adds backtracking on top: when a
-// vertex has all k colours forbidden, undo recent choices and try a
-// different colour.
+// Brélaz (1979) DSatur: at each step color the uncolored vertex with
+// maximum saturation degree (number of distinct colors among its
+// already-colored neighbors). Adds backtracking on top: when a
+// vertex has all k colors forbidden, undo recent choices and try a
+// different color.
 //
-// Forward checking via per-vertex forbidden-colour bitmask (uint8, K≤4):
-// before recursing we update neighbours' masks; on backtrack we undo
+// Forward checking via per-vertex forbidden-color bitmask (uint8, K≤4):
+// before recursing we update neighbors' masks; on backtrack we undo
 // only the bits we actually added (tracked per-recursion).
 //
 // For K_5-free graphs of a few hundred to a few thousand vertices that
-// ARE k-colourable, the search tree stays small and the algorithm is
+// ARE k-colorable, the search tree stays small and the algorithm is
 // effectively linear with low constants. Empirically faster than SAT
 // on the kind of "near-planar" cell-adjacency graphs we hit.
 //
 // Returns true if a k-coloring exists; on success `colors[]` is filled
-// (1-indexed colour values).
+// (1-indexed color values).
 
 #pragma once
 
@@ -34,15 +34,15 @@ struct BBDSatur {
     int32_t k;
     const int32_t* indptr;
     const int32_t* indices;
-    std::vector<uint8_t> colors;     // [N] 0=uncoloured, else 1..k
-    std::vector<uint8_t> forbidden;  // [N] bitmask of forbidden colours (bit c)
+    std::vector<uint8_t> colors;     // [N] 0=uncolored, else 1..k
+    std::vector<uint8_t> forbidden;  // [N] bitmask of forbidden colors (bit c)
     std::vector<int32_t> sat_deg;    // [N] cached saturation (popcount of forbidden)
     int64_t node_count = 0;
     int64_t node_budget = 0;         // 0 = unbounded
     int64_t deadline_ns = 0;         // 0 = no wall-clock cap
     const std::atomic<bool>* cancel = nullptr;  // sibling-cancel flag
 
-    // Pick the uncoloured vertex with the highest saturation degree.
+    // Pick the uncolored vertex with the highest saturation degree.
     // Ties: higher actual degree first. Linear scan; we run on small N
     // (≤ few thousand) so a heap would be overkill.
     int32_t pick_next() const {
@@ -62,7 +62,7 @@ struct BBDSatur {
         return best;
     }
 
-    // Apply colour c to u; propagate to neighbours' forbidden masks.
+    // Apply color c to u; propagate to neighbors' forbidden masks.
     // Returns list of (vertex, was_already_forbidden) so backtrack can
     // undo only the bits this call actually set.
     void apply(int32_t u, uint8_t c, std::vector<int32_t>& touched) {
@@ -95,7 +95,7 @@ struct BBDSatur {
         // another worker terminates the entire search tree quickly.
         // Checking only every N nodes is WRONG: when cancel returns
         // false from a deep child, the parent's `for c=1..k` loop
-        // moves on to the next colour and re-descends — without an
+        // moves on to the next color and re-descends — without an
         // entry-point check, unwinding the recursion stack would
         // take O(depth × k) extra mod-N intervals (~10 ms for our
         // graphs). Relaxed-load on x86 is essentially free with
@@ -114,10 +114,10 @@ struct BBDSatur {
         ++node_count;
         if (node_budget > 0 && node_count > node_budget) return false;
         const int32_t u = pick_next();
-        if (u < 0) return true;  // all coloured
+        if (u < 0) return true;  // all colored
 
         const uint8_t forb = forbidden[u];
-        // Try colours in 1..k order.
+        // Try colors in 1..k order.
         std::vector<int32_t> touched;
         touched.reserve(32);
         for (int32_t c = 1; c <= k; ++c) {

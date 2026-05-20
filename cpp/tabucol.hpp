@@ -7,8 +7,8 @@
 // vertex-ordering greedy hits the same local minimum.
 //
 // Classical TabuCol (Hertz & de Werra, 1987):
-//   - State: a colouring with possible conflicts.
-//   - Move: change one conflicting vertex's colour.
+//   - State: a coloring with possible conflicts.
+//   - Move: change one conflicting vertex's color.
 //   - Move choice: best Δconflicts, ties broken at random.
 //   - Tabu: forbid (u, c_old) for some tenure after u→c_new; aspiration
 //     allows tabu moves that strictly reduce conflicts.
@@ -25,7 +25,7 @@
 
 namespace ncolor_cpp {
 
-// Returns true iff the function found a k-colouring with zero
+// Returns true iff the function found a k-coloring with zero
 // conflicts. `colors` is read+written in place. Inputs are CSR
 // adjacency; `colors[v]` must be in 1..k for every v in 1..N on entry
 // (call sites pass the conflicted greedy output, which already
@@ -52,7 +52,7 @@ inline bool tabucol(
         return (size_t)u * (size_t)(k + 1) + (size_t)c;
     };
 
-    // conf[u, c] = number of u's neighbours coloured c. Vertices and
+    // conf[u, c] = number of u's neighbors colored c. Vertices and
     // CSR indices are 0-based (matching the rest of the ncolor C++
     // pipeline).
     std::vector<int32_t> conf((size_t)N * (size_t)(k + 1), 0);
@@ -78,7 +78,7 @@ inline bool tabucol(
         return (uint32_t)(rs >> 32);
     };
 
-    // Best-move scan buffer (vertices × colours).
+    // Best-move scan buffer (vertices × colors).
     std::vector<std::pair<int32_t, int32_t>> best_moves;
     best_moves.reserve(64);
 
@@ -105,7 +105,7 @@ inline bool tabucol(
         // doesn't dominate inner-loop cost on small N.
         if (cancel && cancel->load(std::memory_order_relaxed)) {
             if (dbg_traj) std::fprintf(stderr,
-                "[tabu seed=%llu] CANCELLED it=%d final=%d best=%d\n",
+                "[tabu seed=%llu] Canceled it=%d final=%d best=%d\n",
                 (unsigned long long)seed, it, total_conf, best_total);
             return false;
         }

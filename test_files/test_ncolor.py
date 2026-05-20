@@ -69,7 +69,7 @@ def generate_mask(kind):
     raise ValueError(f"Unknown mask kind: {kind}")
 
 
-# -------- parametrised test ------------------------------------------------
+# -------- parametrized test ------------------------------------------------
 
 @pytest.mark.parametrize("mask_kind", ["example", "empty", "single", "two_disjoint", "memmap", "disjoint_same"])
 @pytest.mark.parametrize("expand, return_n", list(itertools.product([0, 1], [0, 1])))
@@ -113,7 +113,7 @@ def test_format_labels_variants(mask_kind, clean, ignore, verbose, background, d
     Exercise format_labels across mask types and flag combinations.
 
     * clean toggles area/cleanup logic.
-    * ignore toggles the special-background behaviour.
+    * ignore toggles the special-background behavior.
     """
     masks = generate_mask(mask_kind)
     formatted = format_labels(

@@ -1,4 +1,4 @@
-"""Compare L1+balance vs L2+nobalance colour distributions across 10 seeds
+"""Compare L1+balance vs L2+nobalance color distributions across 10 seeds
 on the example cellpose mask (test_files/example.png).
 
 ncolor.label is deterministic per input, so to vary the "seed" we permute
@@ -7,7 +7,7 @@ Welsh-Powell visit order changes (it's degree-then-ID), so tie-broken
 choices differ — a real seed knob.
 
 For each (p, balance, seed) the script prints an "alignment score" — the
-number of axis-aligned same-colour groups of 3+ cells whose centroids land
+number of axis-aligned same-color groups of 3+ cells whose centroids land
 in a narrow row/column band. Higher score → more visible stripes.
 
 Output: bench_balance_seeds.png (2 × 10 grid of viridis panels matching
@@ -56,51 +56,51 @@ def permute_label_ids(arr: np.ndarray, seed: int) -> np.ndarray:
     return lut[arr]
 
 
-def adj_same_color_pairs(label_image: np.ndarray, coloured: np.ndarray) -> int:
+def adj_same_color_pairs(label_image: np.ndarray, colored: np.ndarray) -> int:
     """Brute-force adjacency check (8-conn, pixel-pair-level): count adjacent
     pixel pairs that are in DIFFERENT cells in ``label_image`` AND have the
-    SAME nonzero color in ``coloured``. Should be 0 for a valid coloring."""
+    SAME nonzero color in ``colored``. Should be 0 for a valid coloring."""
     H, W = label_image.shape
     bad = 0
     for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
         if dx >= 0:
             a_lab = label_image[: H - dy, : W - dx]
             b_lab = label_image[dy:, dx:]
-            a_col = coloured[: H - dy, : W - dx]
-            b_col = coloured[dy:, dx:]
+            a_col = colored[: H - dy, : W - dx]
+            b_col = colored[dy:, dx:]
         else:
             adx = -dx
             a_lab = label_image[: H - dy, adx:]
             b_lab = label_image[dy:, : W - adx]
-            a_col = coloured[: H - dy, adx:]
-            b_col = coloured[dy:, : W - adx]
+            a_col = colored[: H - dy, adx:]
+            b_col = colored[dy:, : W - adx]
         diff_cell = (a_lab != b_lab) & (a_lab > 0) & (b_lab > 0)
         same_color = (a_col == b_col) & (a_col > 0)
         bad += int((diff_cell & same_color).sum())
     return bad
 
 
-def alignment_score(label_image: np.ndarray, coloured: np.ndarray,
+def alignment_score(label_image: np.ndarray, colored: np.ndarray,
                     band: int = 6) -> tuple[int, int]:
-    """Count axis-aligned bands containing 3+ same-colour cells.
+    """Count axis-aligned bands containing 3+ same-color cells.
 
-    For each colour c we project the centroids of all cells coloured c
+    For each color c we project the centroids of all cells colored c
     onto the y-axis (and x-axis), bin them at ``band`` px, and count bins
-    holding 3+ entries. The total per axis is the sum over colours.
-    A "long stripe" (4-cell row of one colour) contributes 2; a 5-cell
+    holding 3+ entries. The total per axis is the sum over colors.
+    A "long stripe" (4-cell row of one color) contributes 2; a 5-cell
     row contributes 3; etc.
     """
     rprops = measure.regionprops(label_image)
     centroids = np.array([r.centroid for r in rprops])  # (N, 2) (y, x)
-    cell_colours = np.array([
-        coloured[int(r.centroid[0]), int(r.centroid[1])] for r in rprops
+    cell_colors = np.array([
+        colored[int(r.centroid[0]), int(r.centroid[1])] for r in rprops
     ])
     h_count = v_count = 0
     H, W = label_image.shape
-    for c in np.unique(cell_colours):
+    for c in np.unique(cell_colors):
         if c == 0:
             continue
-        idx = cell_colours == c
+        idx = cell_colors == c
         if idx.sum() < 3:
             continue
         ys = centroids[idx, 0]
@@ -191,7 +191,7 @@ for seed in range(N_SEEDS_LARGE):
         h = hash_coloring(out)
         hash_seeds[name].setdefault(h, []).append(seed)
 
-print(f"\n{'config':<10} {'fail %':>7} {'unique colourings':>20} "
+print(f"\n{'config':<10} {'fail %':>7} {'unique colorings':>20} "
       f"{'biggest collision':>20} {'adj viol':>10}")
 for name, _, _ in CONFIGS:
     n_unique = len(hash_seeds[name])
@@ -234,10 +234,10 @@ if n_matches > 5:
     print(f"    ... and {n_matches - 5} more")
 
 
-# -- Visualisation: discrete 5-colour categorical palette so colour 5 (when
-# the BFS heuristic bumps from 4 to 5) is visually distinct from colour 4.
-# Five hand-picked colours that stay legible on a black background and
-# remain perceptually distinct under colour-blindness simulation.
+# -- Visualization: discrete 5-color categorical palette so color 5 (when
+# the BFS heuristic bumps from 4 to 5) is visually distinct from color 4.
+# Five hand-picked colors that stay legible on a black background and
+# remain perceptually distinct under color-blindness simulation.
 plt.style.use("dark_background")
 mpl.rcParams["figure.dpi"] = 200
 PALETTE = ["#000000",  # 0 — bg (alpha-masked anyway)

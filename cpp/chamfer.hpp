@@ -4,10 +4,10 @@
  * forward + backward 1D sweep with label propagation; the innermost
  * axis fuses init with the forward sweep into a single register-carry
  * pass over each row, the rest use a slab pass with C-band split for
- * SIMD-friendly auto-vectorisation.
+ * SIMD-friendly auto-vectorization.
  *
  * Output is L1 nearest-seed assignment (slightly different boundary
- * placement at corner ties vs L2; the 4-colouring graph is the same in
+ * placement at corner ties vs L2; the 4-coloring graph is the same in
  * practice).
  */
 
@@ -27,9 +27,9 @@
 namespace ncolor_cpp {
 
 // Update macro used by both the 1D row sweep and the (B, C) slab pass:
-// branchful on gcc/clang (auto-vectorises with masked stores; skips work
+// branchful on gcc/clang (auto-vectorizes with masked stores; skips work
 // on no-update lanes), branchless wins on MSVC. Switch the Windows
-// toolchain to clang-cl for vectorised builds; the macro is then a
+// toolchain to clang-cl for vectorized builds; the macro is then a
 // single source of truth across compilers.
 #define NCOLOR_L1_UPDATE(D, L, NEWD, NEWL)              \
     do { if ((NEWD) < (D)) { (D) = (NEWD); (L) = (NEWL); } } while (0)
@@ -69,7 +69,7 @@ inline void chamfer_l1_row_init(int32_t* __restrict lr, int32_t* __restrict dr,
 
 // L1 chamfer pass over a contiguous (B, C) slab. Sweep axis is B (rows),
 // inner loop is contiguous over the C-band [c0, c1) so the compiler can
-// auto-vectorise. The serial RAW dep along the swept axis is unchanged
+// auto-vectorize. The serial RAW dep along the swept axis is unchanged
 // (carries through `dprev[c]`), but we now process a full column-band
 // per-row, so each row's work is data-parallel across C.
 //
@@ -111,7 +111,7 @@ inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
 // propagation. For each axis ax we view the array as (A, B, C) where
 //   A = product of axes BEFORE ax    (outer parallel domain)
 //   B = shape[ax]                    (serial sweep axis)
-//   C = product of axes AFTER ax     (inner contiguous, auto-vectorised)
+//   C = product of axes AFTER ax     (inner contiguous, auto-vectorized)
 //
 // Innermost axis (ax = ndim-1, C = 1): each "row" is a contiguous run of
 // length B, parallel-over-rows; per-row uses the fused
@@ -120,7 +120,7 @@ inline void chamfer_l1_slab_pass(int32_t* __restrict lbl,
 // because every cell is touched.
 //
 // Other axes (C > 1): slab pass with C-band split so the inner loop is
-// contiguous and vectorises. Each band must be ≥ MIN_BAND_W ints; the
+// contiguous and vectorizes. Each band must be ≥ MIN_BAND_W ints; the
 // remaining parallelism comes from A. Mirrors numba's
 // _expand_l1_axis_propagate.
 inline void chamfer_st_l1_nd(int32_t* lbl, int32_t* dist,

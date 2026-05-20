@@ -190,7 +190,7 @@ def test_label_wrap_returns_valid_coloring(p):
 
 
 def test_label_wrap_output_differs_from_non_wrap():
-    """wrap=True should generally produce a different colouring than the
+    """wrap=True should generally produce a different coloring than the
     non-wrap path (because the adjacency graph gains wrap-around edges).
     Asserts there's *some* difference rather than a specific permutation."""
     m = _circles_2d_dense(seed=42)
@@ -198,13 +198,13 @@ def test_label_wrap_output_differs_from_non_wrap():
     yes_wrap = ncolor.label(m, p=1, wrap=True)
     # Both valid, both compact 0..n_colors.
     assert no_wrap.max() <= 4 and yes_wrap.max() <= 4
-    # Foreground bg patterns identical (only the colours change).
+    # Foreground bg patterns identical (only the colors change).
     assert np.array_equal(no_wrap == 0, yes_wrap == 0)
     # At least *some* fg pixels should differ — otherwise wrap is a no-op
     # and we may have wired it incorrectly.
     fg = m > 0
     assert (no_wrap[fg] != yes_wrap[fg]).any(), \
-        "wrap=True produced an identical colouring — toroidal path may be no-op"
+        "wrap=True produced an identical coloring — toroidal path may be no-op"
 
 
 @pytest.mark.parametrize("p", [1, 2])
@@ -246,8 +246,8 @@ def _assert_valid_coloring(out, mask, expected_n_max=8):
 
 @pytest.mark.parametrize("r", [1, 2])
 def test_label_connect_radius(r):
-    """connect_radius widens the neighbour search window. r=2 catches
-    near-adjacent cells through 1-pixel gaps; both should 4-colour the
+    """connect_radius widens the neighbor search window. r=2 catches
+    near-adjacent cells through 1-pixel gaps; both should 4-color the
     dense circles input."""
     m = _circles_2d_dense()
     out, conflicts = ncolor.label(m, conn=1, connect_radius=r,
@@ -258,7 +258,7 @@ def test_label_connect_radius(r):
 
 @pytest.mark.parametrize("despur", [1, 2, 5])
 def test_label_despur_iters(despur):
-    """Iterative label-aware despur should not break the colouring."""
+    """Iterative label-aware despur should not break the coloring."""
     m = _circles_2d_dense()
     out, conflicts = ncolor.label(m, despur_iters=despur,
                                   return_conflicts=True)
@@ -269,7 +269,7 @@ def test_label_despur_iters(despur):
 @pytest.mark.parametrize("rounds", [1, 3])
 def test_label_expand_spur_free(rounds):
     """expand_spur_free=True is the BFS dilation path that avoids
-    creating K_5-shaped convergence pixels. Should still 4-colour."""
+    creating K_5-shaped convergence pixels. Should still 4-color."""
     m = _circles_2d_dense()
     out, n_used = ncolor.label(m, expand_spur_free=True,
                                spur_free_max_rounds=rounds, return_n=True)
@@ -280,7 +280,7 @@ def test_label_expand_spur_free(rounds):
 def test_label_extra_edges_constrains_pair():
     """extra_edges adds (1-indexed) cell-pair constraints on top of the
     geometric adjacency. The constrained pair must end up with different
-    colours even though the two blobs are otherwise disjoint."""
+    colors even though the two blobs are otherwise disjoint."""
     m = _two_circle_2d()  # disjoint blobs with labels 1 and 2
     extra = np.array([[1, 2]], dtype=np.int32)
     out, conflicts = ncolor.label(m, extra_edges=extra, return_conflicts=True)
@@ -294,7 +294,7 @@ def test_label_extra_edges_constrains_pair():
 def test_label_weight_objective_modes(mode):
     """Boundary-weighted picker: weight_objective != 0 routes through
     find_pairs_weighted, which computes a per-pair (d_i+d_j) reducer
-    selected by weight_mode. All reducers must still 4-colour."""
+    selected by weight_mode. All reducers must still 4-color."""
     m = _circles_2d_dense()
     out, conflicts = ncolor.label(m, weight_objective=1, weight_mode=mode,
                                   return_conflicts=True)
@@ -303,8 +303,8 @@ def test_label_weight_objective_modes(mode):
 
 
 def test_label_optimize_two_hop():
-    """optimize='two_hop' post-processes the BFS colouring via a 2-hop
-    SA optimiser. Exercises ncolor._optimize.optimize_two_hop."""
+    """optimize='two_hop' post-processes the BFS coloring via a 2-hop
+    SA optimizer. Exercises ncolor._optimize.optimize_two_hop."""
     m = _circles_2d_dense()
     out, conflicts = ncolor.label(m, optimize="two_hop",
                                   return_conflicts=True)

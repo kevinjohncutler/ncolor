@@ -303,7 +303,7 @@ inline void envelope_pass0_row(
     // ceil((s_k + s_{k+1}) / 2) is the first index that snaps to seed k+1
     // (non-strict ``2*i >= s_k + s_{k+1}`` matches the integer envelope).
     // Within each segment seeds[k] and lbl_save[k] are constant, so we can
-    // vectorise the (di*di + 0) write via envelope_fill_simd.
+    // vectorize the (di*di + 0) write via envelope_fill_simd.
     int64_t i_start = 0;
     for (int32_t k = 0; k < n_seeds; ++k) {
         int64_t i_end;
@@ -625,7 +625,7 @@ inline void expand_labels_inplace(
             const int64_t n_slices = total / n;
             if (wrap) {
                 // Wrap pass for the innermost axis: the midpoint-based
-                // pass0 fast path doesn't generalise cleanly to torus
+                // pass0 fast path doesn't generalize cleanly to torus
                 // tie-break, so route to envelope_pass with wrap=true.
                 // Init dist: 0 at seeds, INF elsewhere (envelope_pass
                 // expects dist already populated).

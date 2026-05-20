@@ -42,7 +42,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     ``wrap=True`` treats the image as a torus: opposite edges are
     treated as adjacent. Useful when the cells of interest are crammed
     near the image borders (tight crops); the wrap-around adjacency
-    adds constraint pressure on perimeter cells and tightens the colour
+    adds constraint pressure on perimeter cells and tightens the color
     distribution. For interior-clustered inputs it can *worsen* balance
     by over-constraining the graph, and for non-periodic data it bakes
     in a false adjacency. Runtime cost: ~5-15% extra in 2D, ~15-35%
@@ -50,7 +50,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
 
     ``balance=True`` uses the Welsh-Powell heuristic: cells are
     visited in descending-degree order so the most-constrained cells
-    get coloured first. Spreads colour usage more evenly than the
+    get colored first. Spreads color usage more evenly than the
     default label-ID order at ~zero runtime cost. Recommended with
     p=1, where BFS would otherwise concentrate color 4 unevenly.
 
@@ -58,16 +58,16 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     order (matching ``fastremap.renumber`` from the pre-cpp pipeline)
     instead of the default ascending-source-ID order. Affects which
     cell is visited first by the BFS, so it shifts the coloring even
-    though both orderings produce valid 4-colourings. Useful for
+    though both orderings produce valid 4-colorings. Useful for
     bit-reproducing colorings from the legacy Python implementation.
 
-    ``weight_objective`` enables boundary-weighted colour selection.
-    The BFS uses Σ_v w(u,v) × ΔE(c, colour(v)) as a soft objective and
-    picks colours that maximise or minimise this score.
+    ``weight_objective`` enables boundary-weighted color selection.
+    The BFS uses Σ_v w(u,v) × ΔE(c, color(v)) as a soft objective and
+    picks colors that maximize or minimize this score.
 
       0 / "off" / "balance"  (default) → ignore weights, behave as before
-      +1 / "max" / "sharp"             → maximise Σ w × ΔE on heavy edges
-      -1 / "min" / "soft"              → minimise Σ w × ΔE
+      +1 / "max" / "sharp"             → maximize Σ w × ΔE on heavy edges
+      -1 / "min" / "soft"              → minimize Σ w × ΔE
 
     ``weight_mode`` selects the per-pair reducer that defines w. All
     reducers operate on (d_i + d_j) at boundary pixels, where d is the
@@ -78,7 +78,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
                            closest physical approach. Corner-kiss and long
                            seam are indistinguishable (both have min=0).
       "mean"     w = 1 / (1 + mean(d_i+d_j))
-                           average separation along the boundary. Penalises
+                           average separation along the boundary. Penalizes
                            pairs whose Voronoi seam is mostly far from cells.
       "max"      w = 1 / (1 + max(d_i+d_j))
                            farthest point. Only pairs with everywhere-close
@@ -88,45 +88,45 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
       "harmonic" w = Σ 1 / (1 + d_i + d_j)
                            combines length AND closeness in one number.
       "mean_inv" w = (Σ 1 / (1 + d_i + d_j)) / boundary_count
-                           length-normalised harmonic. Removes the long-
+                           length-normalized harmonic. Removes the long-
                            boundary bias of plain harmonic so peripheral
                            cells (with much Voronoi-extended seam) aren't
-                           penalised; per-pixel inverse-distance only.
+                           penalized; per-pixel inverse-distance only.
 
     ``de_table`` lets you override the default viridis-ΔE palette table;
     pass an ``(n+1) × (n+1)`` float array. Requires ``balance=True``.
 
-    ``optimize`` enables a post-greedy GLOBAL optimisation of the colour
+    ``optimize`` enables a post-greedy GLOBAL optimization of the color
     LUT. The greedy WP picker commits cell-by-cell and can leave local
-    minima (e.g. a ring whose cells use only 3 of 4 colours even though
-    a 4-colour assignment exists). The optimiser sees the whole graph
+    minima (e.g. a ring whose cells use only 3 of 4 colors even though
+    a 4-color assignment exists). The optimizer sees the whole graph
     and finds a near-optimum under a label-equivariant loss — no
     colormap / ΔE information enters.
 
-      None (default)   no optimisation; pure greedy output
-      "two_hop"        Simulated annealing minimising same-colour
+      None (default)   no optimization; pure greedy output
+      "two_hop"        Simulated annealing minimizing same-color
                        2-hop pairs (cells at graph-distance 2). All
                        moves are Kempe swaps, so the result is always
-                       a valid 4-colouring. Runtime ≈ tens of ms to a
+                       a valid 4-coloring. Runtime ≈ tens of ms to a
                        few seconds for hundreds of cells; pure Python,
                        slows on very large graphs.
 
     ⚠ When to use ``optimize="two_hop"``: irregular inputs (real cell
-    segmentations, blob fields). It improves "all 4 colours used
+    segmentations, blob fields). It improves "all 4 colors used
     uniformly" without hurting validity.
 
     ⚠ When NOT to use it: regular tilings (square grids, hex grids).
-    The 2-hop objective penalises the tight 2-period tile that those
-    inputs naturally produce — same colour repeats every 2 cells along
+    The 2-hop objective penalizes the tight 2-period tile that those
+    inputs naturally produce — same color repeats every 2 cells along
     each row, which IS the visually uniform tiling but registers as
     many 2-hop violations. ``optimize="two_hop"`` will trade that for
-    a 4-cycle-per-row that uses all 4 colours but breaks the 2-period
+    a 4-cycle-per-row that uses all 4 colors but breaks the 2-period
     pattern. Stick with the default greedy for those inputs.
 
     Symmetric synthetic inputs (e.g. radial spokes) are an in-between
     case: the rasterisation breaks the geometric symmetry, so neither
     mode produces fully symmetric output. ``optimize="two_hop"`` at
-    least guarantees all 4 colours appear wherever the graph allows.
+    least guarantees all 4 colors appear wherever the graph allows.
     """
     del verbose  # accepted for back-compat; cpp pipeline doesn't trace stages
 
@@ -181,23 +181,23 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
         if opt_kind in ("two_hop", "twohop", "2hop", "2-hop"):
             from ._optimize import optimize_two_hop, build_adjacency_from_label
             # Recover the per-label LUT used by the greedy picker: the
-            # value at any pixel with label L is colour LUT[L]. The
+            # value at any pixel with label L is color LUT[L]. The
             # input ``lab_arr`` may have non-contiguous labels (compacted
             # by format_input=True inside the solver); reconstruct the
             # LUT from ``solver.get_last_lut`` when available.
             lut = solver.get_last_lut()
             if lut is None or len(lut) == 0:
-                return out  # nothing to optimise
+                return out  # nothing to optimize
             # Build the same adjacency graph the picker used.
             adj, N, _ = build_adjacency_from_label(lab_arr, p=int(p),
                                                     conn=int(conn))
             new_lut, _ = optimize_two_hop(list(lut), adj, N,
                                            n_colors=int(n_used) if n_used else int(n))
-            # Apply optimised LUT back to the output image.
+            # Apply optimized LUT back to the output image.
             lut_arr = np.array(new_lut, dtype=out.dtype)
             # ``out`` was produced via the same LUT indexing pipeline,
             # so we need to remap based on label positions. Rebuild
-            # ``out`` from the (possibly relabelled) input.
+            # ``out`` from the (possibly relabeled) input.
             # The expanded image is the same one the picker used; we
             # already build it inside build_adjacency_from_label, but
             # we can simply remap ``lab_arr`` (or its expanded variant
@@ -210,7 +210,7 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
                 out = lut_arr[lab_arr].astype(out.dtype)
             # Mirror the cpp pipeline: zero out pixels that were bg in
             # the original input. Without this the optimize path emits
-            # colour at expanded-bg pixels, breaking parity with the
+            # color at expanded-bg pixels, breaking parity with the
             # non-optimize path.
             out[lab_arr == 0] = 0
         else:
@@ -253,7 +253,7 @@ def connect(img, conn=1):
 
 
 def connected_components(mask, conn=2):
-    """N-D connected-components labelling. Foreground = ``mask != 0``.
+    """N-D connected-components labeling. Foreground = ``mask != 0``.
 
     Returns a tuple ``(labels, n_components)``: ``labels`` is an int32
     array of the same shape as ``mask`` with dense 1..N component IDs
@@ -263,16 +263,16 @@ def connected_components(mask, conn=2):
     diagonal; equivalent to scipy/skimage's ``connectivity`` argument).
 
     Drop-in replacement for ``skimage.measure.label`` for callers that
-    only need the labelled array, without the scikit-image dep.
+    only need the labeled array, without the scikit-image dep.
     """
     from ._backend import _impl as _b
     return _b.cc_label(mask, conn=int(conn))
 
 
 def regionprops(labels, n_labels=0):
-    """Region properties for a dense int32 1..N labelled image.
+    """Region properties for a dense int32 1..N labeled image.
 
-    Returns ``dict`` with vectorised numpy arrays:
+    Returns ``dict`` with vectorized numpy arrays:
         ``area`` (n_labels,):           int64 pixel counts
         ``bbox_min`` (n_labels, ndim):  int64 inclusive lower bounds
         ``bbox_max`` (n_labels, ndim):  int64 exclusive upper bounds
@@ -280,7 +280,7 @@ def regionprops(labels, n_labels=0):
     Pass ``n_labels=0`` (default) to auto-detect from ``labels.max()``.
 
     Drop-in for the common subset of ``skimage.measure.regionprops``;
-    returns vectorised arrays instead of per-region Python objects.
+    returns vectorized arrays instead of per-region Python objects.
     """
     from ._backend import _impl as _b
     return _b.regionprops(labels, int(n_labels))

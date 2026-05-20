@@ -29,7 +29,7 @@ inline void per_cell_geometry(
     const L* labels, int64_t H, int64_t W, int32_t N,
     std::vector<CellGeom>& out,
     // Optional: extract a per-label LUT from a second label image
-    // (e.g. an existing 4-colouring) in the same pixel pass. Saves a
+    // (e.g. an existing 4-coloring) in the same pixel pass. Saves a
     // separate np.unique on the input label image, which scales as
     // O(M log N) and dominated geometric_fast's runtime at high N.
     const uint8_t* second_lookup = nullptr,
@@ -96,7 +96,7 @@ inline void per_cell_geometry(
 }
 
 
-// 2-hop neighbours of a graph in CSR form.
+// 2-hop neighbors of a graph in CSR form.
 // out[u] = { v : graph_distance(u, v) == 2 }. Both directions emitted
 // (so the result is symmetric: u ∈ twohop[v] iff v ∈ twohop[u]).
 // Uses an "epoch tag" per vertex (O(N) scratch, no per-cell set
@@ -117,7 +117,7 @@ inline void compute_two_hop_csr(
     for (int32_t u = 0; u < N; ++u) {
         const int32_t epoch = u + 1;
         const int32_t k_lo = adj_indptr[u], k_hi = adj_indptr[u + 1];
-        // Mark 1-hop neighbours + self so they're skipped.
+        // Mark 1-hop neighbors + self so they're skipped.
         seen[u] = epoch;
         for (int32_t k = k_lo; k < k_hi; ++k) seen[adj_indices[k]] = epoch;
         int32_t count = 0;

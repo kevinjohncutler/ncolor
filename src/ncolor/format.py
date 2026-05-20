@@ -191,7 +191,7 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
 def delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
                  threshold=None, max_iter=-1):
     """N-D mask cleanup: fill small bg holes, then iteratively prune
-    pixels whose neighbour count falls below ``threshold``.
+    pixels whose neighbor count falls below ``threshold``.
 
     ``hole_threshold`` (default 5): bg components with pixel count ≤
     this value get filled into the foreground before pruning. Pass 0
@@ -199,18 +199,18 @@ def delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
 
     ``mode`` selects the connectivity used by the endpoint check:
 
-    * ``"cardinal"`` (default) — face neighbours only (2·ndim of them).
+    * ``"cardinal"`` (default) — face neighbors only (2·ndim of them).
       Catches pixels sticking out of a flat boundary; matches the
       omnipose external-spur rule. Aggressive; fewer iterations to
       converge.
-    * ``"total"`` — full-diagonal (3^ndim − 1 neighbours). Preserves
+    * ``"total"`` — full-diagonal (3^ndim − 1 neighbors). Preserves
       1-voxel-wide skeletons in 3D (their interiors have face=2 but
       total=2, both equal to ndim=3 minus 1 — under ``threshold=ndim``
       they survive cardinal but fall below total). Use this when the
       input may contain genuine thin features you want to keep.
 
     ``threshold`` (default ``None`` → ``ndim``): a pixel is a spur if
-    its fg-neighbour count is in ``[1, threshold)``. Isolated pixels
+    its fg-neighbor count is in ``[1, threshold)``. Isolated pixels
     (count == 0) are always preserved.
 
     ``max_iter`` (default ``-1``): caps the iterative pruning loop.

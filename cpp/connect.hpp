@@ -194,20 +194,20 @@ inline void ht_insert_min(uint64_t* ht, int32_t* mins, uint64_t ht_mask,
 // adds pre-computed nb_flat[k] offsets; only edge pixels pay the per-axis
 // bounds check.
 //
-// Forward-neighbour set: enumerate dc ∈ {-1,0,1}^ndim with
+// Forward-neighbor set: enumerate dc ∈ {-1,0,1}^ndim with
 //   - 1 ≤ #(nonzero coords) ≤ conn  (Chebyshev radius / connectivity strength)
-//   - lex-first nonzero coord is +1  (ensures neighbour has strictly greater
+//   - lex-first nonzero coord is +1  (ensures neighbor has strictly greater
 //     flat index in row-major layout, so each undirected adjacency is emitted
 //     exactly once)
 // Counts: 2D conn=1 → 2; 2D conn=2 → 4; 3D conn=1 → 3; conn=2 → 9; conn=3 → 13.
 
 namespace detail {
 
-// Count the forward neighbours produced by the (ndim, conn) connectivity.
+// Count the forward neighbors produced by the (ndim, conn) connectivity.
 // Caller uses this to size the per-thread hashtables in Solver. The full
-// (dc, flat_offset) tuples come from build_forward_neighbours below; this
+// (dc, flat_offset) tuples come from build_forward_neighbors below; this
 // is a cheap wrapper that just iterates the same odometer.
-inline int64_t count_forward_neighbours(int ndim, int conn, int radius = 1) {
+inline int64_t count_forward_neighbors(int ndim, int conn, int radius = 1) {
     if (ndim < 1 || radius < 1) return 0;
     int64_t n_fwd = 0;
     std::vector<int8_t> dc(ndim, (int8_t)-radius);
@@ -217,7 +217,7 @@ inline int64_t count_forward_neighbours(int ndim, int conn, int radius = 1) {
             if (first_nz < 0) first_nz = d;
             ++n_nz;
         }
-        // Forward-only: first nonzero coord is positive. Generalises the
+        // Forward-only: first nonzero coord is positive. Generalizes the
         // radius=1 condition `dc[first_nz] == 1` so the predicate works
         // for any radius (positive offset in row-major order ⇒ greater
         // flat index ⇒ each undirected pair emitted at most once).
@@ -234,9 +234,9 @@ inline int64_t count_forward_neighbours(int ndim, int conn, int radius = 1) {
     return n_fwd;
 }
 
-// Generate the forward-neighbour set's (dc[0..ndim-1], flat_offset) tuples.
+// Generate the forward-neighbor set's (dc[0..ndim-1], flat_offset) tuples.
 // Used by find_pairs_unpadded_impl.
-inline void build_forward_neighbours(
+inline void build_forward_neighbors(
         const std::vector<int64_t>& shape, int conn,
         std::vector<int64_t>& strides_out,
         std::vector<int64_t>& nb_flat_out,
@@ -248,7 +248,7 @@ inline void build_forward_neighbours(
     nb_flat_out.clear();
     nb_dc_out.clear();
     if (radius < 1) return;
-    // Sort offsets by Chebyshev distance ascending so r=1 1-NN neighbours
+    // Sort offsets by Chebyshev distance ascending so r=1 1-NN neighbors
     // are emitted before r=2 gap-bridges. WP greedy commits early picks
     // firmly; we want physically-adjacent edges driving those, with the
     // wider-radius edges filling in afterwards.
@@ -264,7 +264,7 @@ inline void build_forward_neighbours(
                 ++n_nz;
             }
         }
-        // Forward-only: first nonzero coord positive. See count_forward_neighbours.
+        // Forward-only: first nonzero coord positive. See count_forward_neighbors.
         if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] > 0) {
             int64_t off = 0;
             for (int d = 0; d < ndim; ++d) off += static_cast<int64_t>(dc[d]) * strides_out[d];
@@ -293,7 +293,7 @@ inline void build_forward_neighbours(
 }  // namespace detail
 
 // Inner-axis fast scan: walk the open interval (x_start, x_end) of a
-// row, emit forward-neighbour pairs to ``ht`` using pre-computed flat
+// row, emit forward-neighbor pairs to ``ht`` using pre-computed flat
 // offsets. Templated on ``N_NBS`` so the per-pixel inner loop unrolls;
 // the offsets are hoisted into local int64s so the compiler keeps them
 // in registers across the x sweep.
@@ -365,7 +365,7 @@ static inline void scan_inner_axis_fast_runtime(
     }
 }
 
-// Dispatch on the actual forward-neighbour counts produced by
+// Dispatch on the actual forward-neighbor counts produced by
 // (ndim, conn): 2D conn=1 → 2; 2D conn=2 → 4; 3D conn=1 → 3; conn=2 → 9;
 // conn=3 → 13. Other counts (5D+ or non-default conn) take the runtime
 // fallback.
@@ -392,7 +392,7 @@ static inline void scan_inner_axis_dispatch(
     }
 }
 
-// Internal scan kernel: walks one strip of axis-0, emits forward-neighbour
+// Internal scan kernel: walks one strip of axis-0, emits forward-neighbor
 // pairs into a single hashtable. Generic ND odometer — interior pixels use
 // the pre-computed flat offsets in nb_flat; boundary pixels rebuild offsets
 // per-axis (with optional wrap). `Wrap` is templated so the boundary path
@@ -423,9 +423,9 @@ inline void scan_band_unpadded(
         }
     };
     // Boundary scan kernel.
-    //   Wrap=false (default): out-of-bounds neighbours are skipped — matches
-    //     the legacy padded-buffer behaviour (no edges across the image edge).
-    //   Wrap=true: out-of-bounds neighbours wrap to the opposite edge of the
+    //   Wrap=false (default): out-of-bounds neighbors are skipped — matches
+    //     the legacy padded-buffer behavior (no edges across the image edge).
+    //   Wrap=true: out-of-bounds neighbors wrap to the opposite edge of the
     //     same axis (toroidal topology). For each OOB axis we recompute the
     //     wrapped coord and rebuild the flat offset directly, since the
     //     pre-computed nb_flat[k] assumed no wrap.
@@ -469,7 +469,7 @@ inline void scan_band_unpadded(
     // odometer over axes [0 .. ndim-2]; for each outer state, the inner
     // axis (ndim-1) is walked as a tight contiguous run. When the outer
     // coords are all interior (outer_bnd == 0) and the inner axis is wide
-    // enough (W ≥ 3) we get the same fast path the 2D/3D specialisations
+    // enough (W ≥ 3) we get the same fast path the 2D/3D specializations
     // had: split inner axis into [0], [1, W-1), [W-1] and the middle slice
     // touches only the pre-computed nb_flat[k] offsets — no per-pixel
     // coord arithmetic, no boundary mask updates.
@@ -536,7 +536,7 @@ inline void scan_band_unpadded(
     }
 }
 
-// Internal driver — generates neighbours, allocates per-thread HTs,
+// Internal driver — generates neighbors, allocates per-thread HTs,
 // parallel-scans dim-0 strips, merges. The public dispatcher below
 // routes here. ``Wrap`` is templated so the wrap branch in
 // scan_band_unpadded is compile-time-elided when not needed.
@@ -561,7 +561,7 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
     std::vector<int64_t> strides;
     std::vector<int64_t> nb_flat;
     std::vector<int8_t> nb_dc;
-    detail::build_forward_neighbours(shape, conn, strides, nb_flat, nb_dc, radius);
+    detail::build_forward_neighbors(shape, conn, strides, nb_flat, nb_dc, radius);
     const int n_nbs = static_cast<int>(nb_flat.size());
     const uint64_t ht_mask = ht_size - 1;
 

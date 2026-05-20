@@ -133,7 +133,7 @@ def main():
 def _is_valid_coloring(colored, original_mask):
     """Check that no adjacent (4-conn) pixels with non-bg labels share a color."""
     H, W = colored.shape
-    # Compare to right and down neighbours.
+    # Compare to right and down neighbors.
     nz_right = (original_mask[:, :-1] != 0) & (original_mask[:, 1:] != 0)
     nz_down  = (original_mask[:-1, :] != 0) & (original_mask[1:, :] != 0)
     diff_label_right = original_mask[:, :-1] != original_mask[:, 1:]

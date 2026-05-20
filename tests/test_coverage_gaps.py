@@ -80,7 +80,7 @@ def test_expand_labels_empty_or_all_zero_short_circuits():
 
 
 # ----------------------------------------------------------------------
-# ncolor/color.py — kwarg normalisation + return-flag combos
+# ncolor/color.py — kwarg normalization + return-flag combos
 # ----------------------------------------------------------------------
 
 
@@ -90,7 +90,7 @@ def test_expand_labels_empty_or_all_zero_short_circuits():
                            ("not-a-mode", 0)])
 def test_label_weight_objective_str_alias(alias, wobj_int):
     """String aliases for weight_objective map to the int values; the
-    actual numeric value is only observable via behaviour, so we just
+    actual numeric value is only observable via behavior, so we just
     verify the call succeeds for each alias."""
     m = np.zeros((16, 16), dtype=np.int32)
     m[2:6, 2:6] = 1
@@ -317,7 +317,7 @@ def test_optimize_two_hop_diagnostic_loss():
     m[2:5, 8:11] = 2
     m[10:13, 5:8] = 3
     adj, N, _ = build_adjacency_from_label(m, p=1, conn=2)
-    # Build a trivial LUT with everyone the same colour — must have ≥0
+    # Build a trivial LUT with everyone the same color — must have ≥0
     # 2-hop violations.
     lut = [0] + [1] * N
     loss = two_hop_loss(lut, adj, N)
@@ -325,10 +325,10 @@ def test_optimize_two_hop_diagnostic_loss():
 
 
 def test_optimize_two_hop_no_pairs_short_circuits():
-    """If the 2-hop pair set is empty the optimiser returns the input
+    """If the 2-hop pair set is empty the optimizer returns the input
     LUT and loss 0 without iterating."""
     from ncolor._optimize import optimize_two_hop
-    # Single isolated cell: no neighbours → no 2-hop pairs.
+    # Single isolated cell: no neighbors → no 2-hop pairs.
     adj = {1: set()}
     lut, loss = optimize_two_hop([0, 1], adj, N=1, n_iters=100)
     assert loss == 0
@@ -341,11 +341,11 @@ def test_optimize_two_hop_ignores_bg_label_slot():
     from ncolor._optimize import optimize_two_hop
     # Build a tiny path of 3 cells. lut[0] is bg.
     adj = {1: {2}, 2: {1, 3}, 3: {2}}
-    lut_in = [0, 1, 2, 1]  # valid 2-colouring
+    lut_in = [0, 1, 2, 1]  # valid 2-coloring
     lut_out, loss = optimize_two_hop(lut_in, adj, N=3,
                                       n_iters=200, rng_seed=0)
-    # The 2-hop pair {1, 3} share colour 1 → loss == 1 initially.
-    # Optimiser may or may not improve at 3 cells; just check return.
+    # The 2-hop pair {1, 3} share color 1 → loss == 1 initially.
+    # Optimizer may or may not improve at 3 cells; just check return.
     assert lut_out[0] == 0
     assert loss >= 0
 
@@ -632,9 +632,9 @@ def test_format_labels_clean_non_despur_secondary_dropped_silently():
 
 def test_kempe_component_returns_empty_for_off_palette_seed():
     """``_kempe_component`` returns the empty set when the seed's
-    colour isn't in the (c1, c2) pair. Hits the early-return branch."""
+    color isn't in the (c1, c2) pair. Hits the early-return branch."""
     from ncolor._optimize import _kempe_component
-    # Seed=1 has colour 3; asking for the (1, 2) swap from this seed →
+    # Seed=1 has color 3; asking for the (1, 2) swap from this seed →
     # empty component.
     lut = [0, 3, 1, 2]
     adj = {1: {2}, 2: {1, 3}, 3: {2}}
@@ -996,9 +996,9 @@ def test_maybe_calibrate_skips_when_numpy_missing(monkeypatch):
 def test_optimize_two_hop_skips_zero_label_slot():
     """In the SA loop, if the randomly-picked vertex u has ``lut[u] == 0``
     the iteration continues without attempting a Kempe swap. Force that
-    by seeding most slots to 0 and verify the optimiser still terminates."""
+    by seeding most slots to 0 and verify the optimizer still terminates."""
     from ncolor._optimize import optimize_two_hop
-    # 5 cells, only two have non-zero colours.
+    # 5 cells, only two have non-zero colors.
     adj = {i: set() for i in range(1, 6)}
     adj[1] = {2}; adj[2] = {1, 3}; adj[3] = {2, 4}; adj[4] = {3, 5}; adj[5] = {4}
     lut_in = [0, 1, 0, 0, 0, 2]
@@ -1025,7 +1025,7 @@ def test_format_labels_clean_despur_drops_tiny_primary(capsys):
     """despur=True with a primary component that survives delete_spurs
     but is still ≤ min_area gets dropped with a verbose warning. A
     2×2 square (4 pixels) survives delete_spurs (each pixel has 2
-    same-label face-neighbours, the default threshold) so the
+    same-label face-neighbors, the default threshold) so the
     ``area <= min_area`` arm in the despur branch fires."""
     arr = np.zeros((16, 16), dtype=np.int32)
     arr[1:3, 1:3] = 1     # 2×2 primary, area=4

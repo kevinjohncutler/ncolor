@@ -664,7 +664,7 @@ public:
                     // check. Naturally avoids K_5-creating "starfish"
                     // convergence patterns by refusing to claim bg
                     // pixels that would have ≤1 same-label face-
-                    // neighbour. Equivalent to (expand_labels +
+                    // neighbor. Equivalent to (expand_labels +
                     // delete_spurs_labels) at the result level, but
                     // computed in a single pass that bounds growth
                     // at the connectivity check rather than fixing
@@ -698,19 +698,19 @@ public:
             // fills the gaps between adjacent cells, two cells that
             // originally touched only at a single point may now share
             // a 1-pixel-wide "convergence pixel" — one cell narrows
-            // to a single-same-label-neighbour pixel inside another's
+            // to a single-same-label-neighbor pixel inside another's
             // territory. These convergence points create K_5
             // obstructions in densely-packed segmentations (5 cells
-            // meeting at a corner) that prevent 4-colouring at conn=1
+            // meeting at a corner) that prevent 4-coloring at conn=1
             // r=1. Iterative despur strips them: pixels with ≤
-            // threshold same-label face-neighbours become bg. 2 iters
+            // threshold same-label face-neighbors become bg. 2 iters
             // is empirically enough to break K_5 cascades on real
             // microscopy data; 20 = full convergence (more aggressive,
             // ~5× slower).
             // ``lut_lbl_ptr`` is the buffer apply_color_lut_ reads at the
             // end: by default that's the post-expand ``expanded`` buffer.
-            // When despur runs we want to keep colouring the spur pixels
-            // with their parent cell's colour rather than turning them
+            // When despur runs we want to keep coloring the spur pixels
+            // with their parent cell's color rather than turning them
             // into bg, so we save the pre-despur labels into ``lut_lbl_``
             // and use that for the final LUT application. Despur still
             // modifies ``expanded`` in place so find_pairs / coloring
@@ -769,7 +769,7 @@ public:
                 }
             } else {
                 // Unified pair-find: `connect_radius` widens the
-                // neighbour offset window (Chebyshev distance) for
+                // neighbor offset window (Chebyshev distance) for
                 // each pixel. radius=1 is the standard 8-connectivity
                 // path; radius>1 catches near-adjacent cells
                 // separated by a thin gap of another cell's
@@ -781,7 +781,7 @@ public:
             // Canonical sort: orders pairs by (src, dst). Without this,
             // pairs come from HT iteration (slot order = hash-mixed,
             // dependent on offset enumeration order). Same EDGE SET
-            // produces different CSR neighbour-iteration order, which
+            // produces different CSR neighbor-iteration order, which
             // TabuCol's heuristic can be sensitive to. Sorting gives
             // determinism + matches the legacy weight-find_pairs path
             // that emitted in canonical order via sort+unique.
@@ -847,7 +847,7 @@ public:
                         // Length-normalized harmonic: mean of 1/(1+d) over
                         // boundary pixels. Removes the "long-boundary bias"
                         // of plain Harmonic, so peripheral cells with much
-                        // Voronoi-extended boundary aren't penalised.
+                        // Voronoi-extended boundary aren't penalized.
                         pair_w[i] = pair_counts[i] > 0
                             ? pair_primary[i] / static_cast<double>(pair_counts[i])
                             : 0.0;
@@ -898,7 +898,7 @@ public:
                         for (int j = 0; j < K; ++j)
                             de_table_vec[i * (n_colors + 1) + j] = viridis_de4[i][j];
                     // For n_colors > 4 (3D fallback), entries beyond 4 stay 0:
-                    // those colours then contribute no contrast preference,
+                    // those colors then contribute no contrast preference,
                     // which is acceptable — the weight_obj only matters when
                     // a perceptual palette is provided explicitly.
                     de_ptr = de_table_vec.data();
@@ -918,7 +918,7 @@ public:
             // 5. Build LUT (expanded[i] is in 1..N, so lut size = N+1) and
             // apply it to the expanded-label buffer. When despur ran,
             // ``lut_lbl_ptr`` points at the pre-despur copy so spur pixels
-            // get their parent cell's colour (they only need to be hidden
+            // get their parent cell's color (they only need to be hidden
             // from the adjacency graph, not from the final image).
             lut_.assign(static_cast<size_t>(N) + 1, 0);
             for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
@@ -1014,7 +1014,7 @@ private:
     }
 
     // Find adjacency pairs in an int32 label image. Sizes the hashtable
-    // from the (ndim, conn) connectivity's forward-neighbour count and
+    // from the (ndim, conn) connectivity's forward-neighbor count and
     // the maximum label value, then dispatches to the ND scan kernel.
     // Returns {} for an empty input (max_label == 0).
     std::vector<std::pair<int32_t, int32_t>> find_pairs_(
@@ -1022,7 +1022,7 @@ private:
             int conn, bool wrap, int32_t max_label, int radius = 1) {
         if (max_label == 0) return {};
         const int ndim = static_cast<int>(shape.size());
-        const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbours(
+        const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbors(
             ndim, conn, radius);
         const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
         const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE));
@@ -1047,7 +1047,7 @@ private:
         primary.clear(); counts.clear();
         if (max_label == 0) return {};
         const int ndim = static_cast<int>(shape.size());
-        const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbours(ndim, conn);
+        const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbors(ndim, conn);
         const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
         const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE));
         return ncolor_cpp::find_pairs_weighted_nd_unpadded<int32_t, Mode>(
@@ -1066,7 +1066,7 @@ private:
     //
     // Slot assignment within attempts_per_n at each cur_n:
     //   balance=True   slots: [WP,  BFS, BFS, BFS]
-    //                  WP first (uniform colour distribution); on failure
+    //                  WP first (uniform color distribution); on failure
     //                  three BFS variants with offsets {1, 2, 3} as
     //                  fallback before bumping cur_n.
     //   balance=False  slots: [BFS, BFS, BFS, WP]
@@ -1089,7 +1089,7 @@ private:
     //
     // Side effects: writes the winning coloring into ``colors_`` and the
     // adjacency-conflict count into ``last_n_conflicts_``. Returns
-    // ``n_used`` = max colour value in the winning coloring.
+    // ``n_used`` = max color value in the winning coloring.
     int solve_coloring_(int32_t N, int32_t M, int n_colors,
                         int max_depth, int rand_period, bool balance,
                         int color_mode, int ndim, bool wrap,
@@ -1118,7 +1118,7 @@ private:
         bool ok = false;
         static const bool dbg_solve = std::getenv("NCOLOR_SOLVE_DEBUG") != nullptr;
         // ω(G) lower bound: χ(G) ≥ ω(G). If a clique larger than the
-        // user's target k exists, the graph requires ≥ ω colours and
+        // user's target k exists, the graph requires ≥ ω colors and
         // we'd otherwise burn ~200 ms per (race+tabu-restart+
         // bb_dsatur+HEA) round each time we increment cur_n on the
         // way up to ω. Bron-Kerbosch with a tight deadline (10 ms)
@@ -1153,7 +1153,7 @@ private:
                 const int32_t* ix = indices_.data();
 
                 // Shared early-exit flag: as soon as any parallel
-                // attempt finds a 0-conflict colouring, other workers
+                // attempt finds a 0-conflict coloring, other workers
                 // (a) skip subsequent slots and (b) abort any
                 // in-flight per-attempt tabucol. Without (b), race
                 // latency = slowest worker's full tabucol budget; with
@@ -1304,7 +1304,7 @@ private:
                     // bounds time wasted on infeasible-at-cur_n graphs.
                     // Without this, the 16 per-attempt tabucols all run
                     // their full iter budget (up to several seconds on
-                    // N≥few-thousand) trying to escape a non-k-colourable
+                    // N≥few-thousand) trying to escape a non-k-colorable
                     // graph. 50 ms is plenty for any feasible case at
                     // our scale — successes typically converge in <5 ms.
                     const int64_t race_deadline_ns =
@@ -1362,8 +1362,8 @@ private:
                 for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
                     // When weight_obj != 0: slots 0..(attempts-2) run
                     // weighted-WP (different offsets); LAST slot is a
-                    // pure-balance WP fallback so a 4-colourable graph
-                    // doesn't get bumped to 5 colours when broad-support
+                    // pure-balance WP fallback so a 4-colorable graph
+                    // doesn't get bumped to 5 colors when broad-support
                     // reducers (count, harmonic) over-constrain the BFS.
                     const bool wobj_active = weight_obj != 0 && edge_weights != nullptr;
                     const bool wp = wobj_active
@@ -1388,7 +1388,7 @@ private:
                     // promise for the balanced path. For the weighted path
                     // the user has opted into a perceptual objective and
                     // accepts repair as part of the deal — otherwise the
-                    // WP-weighted result is silently dropped in favour of a
+                    // WP-weighted result is silently dropped in favor of a
                     // non-WP, non-weighted fallback (which defeats the point).
                     const bool clean_wp_required = wp && !weighted_attempt;
                     if (a_ok && (!clean_wp_required || !conflict)) ok = true;
@@ -1397,7 +1397,7 @@ private:
             if (!ok && cur_n == n_colors) {
                 const auto tabu_restart_t0 = std::chrono::steady_clock::now();
                 // TabuCol fallback at the user's target k. Some graphs
-                // are k-colourable (verified by SAT) but every
+                // are k-colorable (verified by SAT) but every
                 // vertex-ordering greedy hits the same local minimum
                 // (e.g. dense corner-touching cells under conn=2 with
                 // K4 substructures). Tabu search rescues these by
@@ -1432,14 +1432,14 @@ private:
                 }
                 {
                     // Tabu-search restart loop. First restart uses the
-                    // conflicted-greedy colouring as a starting point
+                    // conflicted-greedy coloring as a starting point
                     // (often within a few moves of valid). Subsequent
-                    // restarts use a fresh uniform-random colouring so
+                    // restarts use a fresh uniform-random coloring so
                     // they sample different basins.
                     //
                     // Total time is capped by a shared wall-clock budget
                     // (default 200 ms) so dense graphs that don't
-                    // 4-colour quickly fall through to cur_n bump
+                    // 4-color quickly fall through to cur_n bump
                     // instead of burning seconds. Each restart still has
                     // its own iter cap as a secondary bound.
                     const int per_seed_iters = std::min(
@@ -1494,7 +1494,7 @@ private:
                 // next is a linear scan), so a fixed node budget
                 // translates to multi-second wall time on graphs with
                 // N in the thousands. A graph that is genuinely NOT
-                // k-colourable would otherwise burn the entire
+                // k-colorable would otherwise burn the entire
                 // bb_dsatur node budget AND HEA's generation budget
                 // proving infeasibility before cur_n bumps to k+1.
                 // The 50 ms-each deadlines cap the wasted time per
@@ -1577,14 +1577,14 @@ private:
             if (!ok) {
                 ++cur_n;
                 // ndim-aware floor on the FIRST failure only. Planar
-                // (ndim=2) inputs hit ≤ 4 colours by the 4-colour theorem,
+                // (ndim=2) inputs hit ≤ 4 colors by the 4-color theorem,
                 // so the floor is a no-op there. For ndim ≥ 3 there's no
                 // such bound; empirically dense-blob inputs hit ~3·ndim − 2
-                // colours (more with wrap), so jumping directly to that
+                // colors (more with wrap), so jumping directly to that
                 // floor skips 2-5 doomed sequential attempts on the
                 // fallback path. Triggered only after depth==0 fails, so
                 // user-supplied n_colors and planar workloads remain
-                // bit-identical to the pre-patch behaviour.
+                // bit-identical to the pre-patch behavior.
                 if (depth == 0 && ndim >= 3) {
                     const int floor_n = 3 * ndim - 2 + (wrap ? 1 : 0);
                     if (cur_n < floor_n) cur_n = floor_n;
@@ -1594,7 +1594,7 @@ private:
 
         int n_used = 0;
         for (uint8_t c : colors_) if (c > n_used) n_used = c;
-        // O(M) tally of adjacent same-colour pairs so callers that
+        // O(M) tally of adjacent same-color pairs so callers that
         // request return_conflicts don't pay another scan over labels.
         last_n_conflicts_ = 0;
         for (int32_t i = 0; i < M; ++i) {
@@ -1603,8 +1603,8 @@ private:
         return n_used;
     }
 
-    // Apply the colour LUT to ``expanded[i]``: bg pixels (bg_mask_[i]==1)
-    // get colour 0; foreground pixels get ``lut_[expanded[i]]``. Parallel
+    // Apply the color LUT to ``expanded[i]``: bg pixels (bg_mask_[i]==1)
+    // get color 0; foreground pixels get ``lut_[expanded[i]]``. Parallel
     // when total ≥ 8192. The bg pattern was captured by ``cast_with_bg``
     // at the start of label(); using a uint8 mask here keeps the inner
     // loop typeless wrt the original input dtype.
@@ -1643,7 +1643,7 @@ private:
     std::vector<uint8_t> lut_;
     // Pre-despur copy of the expanded-label buffer, used by apply_lut so
     // spur pixels (zeroed out of the despurred working buffer) still get
-    // their parent cell's colour in the final image. Only populated when
+    // their parent cell's color in the final image. Only populated when
     // ``despur_iters > 0``; otherwise apply_lut reads ``expanded`` directly.
     std::vector<int32_t> lut_lbl_;
     // Persistent per-thread hashtable buffer for find_pairs (n_threads_ *
@@ -1770,14 +1770,14 @@ PYBIND11_MODULE(_impl, m) {
              "instead of allocating a new array — useful for batch\n"
              "pipelines that reuse the same output buffer across calls.\n"
              "wrap=True treats the image as a torus (left/right edges are\n"
-             "neighbours, top/bottom edges are neighbours), adding wrap-\n"
+             "neighbors, top/bottom edges are neighbors), adding wrap-\n"
              "around adjacencies between cells whose Voronoi territories\n"
              "land on opposite image edges. Useful for tile-equivalent or\n"
-             "periodic-imaging assumptions; balances colour frequencies on\n"
+             "periodic-imaging assumptions; balances color frequencies on\n"
              "tightly-cropped microcolony images at ~zero runtime cost.\n"
              "balance=True visits cells in descending-degree order during\n"
              "the BFS coloring (Welsh-Powell heuristic). High-degree (most\n"
-             "constrained) cells are coloured first, which spreads colour\n"
+             "constrained) cells are colored first, which spreads color\n"
              "usage more evenly across the graph. ~zero runtime cost\n"
              "(O(N) bucket sort). Recommended for visual uniformity.")
         .def("connect", &Solver::connect,
@@ -1833,7 +1833,7 @@ PYBIND11_MODULE(_impl, m) {
               return {std::move(out), n_labels};
           },
           py::arg("mask"), py::arg("conn") = 2,
-          "N-D connected-components labelling. Returns (labels, n_components).\n"
+          "N-D connected-components labeling. Returns (labels, n_components).\n"
           "Foreground = (mask != 0). conn = 1 (face only) up to ndim\n"
           "(full diagonal). Compatible with skimage.measure.label output\n"
           "format (int32, dense 1..N labels, 0 = bg).");
@@ -1889,7 +1889,7 @@ PYBIND11_MODULE(_impl, m) {
               return out;
           },
           py::arg("labels"), py::arg("n_labels") = 0,
-          "Region properties of a dense int32 1..N labelled image.\n"
+          "Region properties of a dense int32 1..N labeled image.\n"
           "Returns dict with keys 'area' (n_labels,), 'bbox_min'/'bbox_max'\n"
           "(n_labels, ndim), 'centroid' (n_labels, ndim). Pass n_labels=0\n"
           "to auto-detect from labels.max(). One raster pass; no per-component\n"
@@ -1978,7 +1978,7 @@ PYBIND11_MODULE(_impl, m) {
           py::arg("max_iter") = -1,
           "N-D skeleton/boundary cleanup: fill bg holes ≤ hole_threshold\n"
           "pixels (face-connected), then iteratively strip pixels whose\n"
-          "fg-neighbour count under the chosen connectivity is below\n"
+          "fg-neighbor count under the chosen connectivity is below\n"
           "``threshold`` (default ndim). ``conn_kind`` = 1 → cardinal\n"
           "(face only, omnipose-style external-spur rule, fewer iters);\n"
           "ndim → full diagonal (preserves 1-voxel skeletons). Isolated\n"
@@ -2012,7 +2012,7 @@ PYBIND11_MODULE(_impl, m) {
               return {std::move(indptr), std::move(indices)};
           },
           py::arg("adj_indptr"), py::arg("adj_indices"),
-          "Build 2-hop neighbour CSR from a 1-hop adjacency CSR.\n"
+          "Build 2-hop neighbor CSR from a 1-hop adjacency CSR.\n"
           "Both directions emitted (symmetric output). O(N · avg_deg²) time.");
 
     m.def("symmetric_pair_csr",

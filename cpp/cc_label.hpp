@@ -2,9 +2,9 @@
  * cc_label.hpp — N-D connected-components labeling + minimal regionprops.
  *
  * Two-pass union-find (Wu et al. 2009-style) over an N-D foreground mask.
- * Backward-neighbour set is computed via the same odometer machinery as
- * connect.hpp, so connectivity (conn ∈ [1, ndim]) generalises cleanly to
- * any ndim. Single-threaded for the prototype; parallelisation via
+ * Backward-neighbor set is computed via the same odometer machinery as
+ * connect.hpp, so connectivity (conn ∈ [1, ndim]) generalizes cleanly to
+ * any ndim. Single-threaded for the prototype; parallelization via
  * strip-merge is straightforward if benchmarks demand it.
  *
  * Public entry points:
@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <vector>
 
-#include "connect.hpp"  // detail::build_forward_neighbours
+#include "connect.hpp"  // detail::build_forward_neighbors
 
 namespace ncolor_cpp {
 
@@ -65,7 +65,7 @@ struct UnionFind {
 }  // namespace cc_detail
 
 // Inner-axis fast pass-1 scan: walks an interior row whose outer coords
-// are guaranteed all-interior, so every backward neighbour at offset
+// are guaranteed all-interior, so every backward neighbor at offset
 // ``-nb[k]`` is in-bounds (except at the inner axis's two endpoints,
 // which the caller handles separately). Templated on ``N_NBS`` so the
 // per-pixel inner loop unrolls and the offset constants live in
@@ -121,7 +121,7 @@ static inline void cc_pass1_interior_inner_runtime(
 // an outer odometer over coords[0..ndim-2] × inner axis (ndim-1). When
 // the outer coords are all-interior the inner axis runs as a tight
 // templated unrolled loop touching only the pre-computed
-// backward-neighbour offsets (no per-axis bounds check). The endpoints
+// backward-neighbor offsets (no per-axis bounds check). The endpoints
 // of every inner row, and any row whose outer coords land on a
 // boundary axis, take the per-pixel boundary-mask path.
 template <typename T>
@@ -142,10 +142,10 @@ inline int32_t cc_label_nd(const T* input, int32_t* output,
     };
     auto t_start = times ? clk::now() : clk::time_point{};
 
-    // Forward-neighbour set (lex-first +1). Backward offsets = negate.
+    // Forward-neighbor set (lex-first +1). Backward offsets = negate.
     std::vector<int64_t> strides, nb_fwd;
     std::vector<int8_t> nb_dc_fwd;
-    detail::build_forward_neighbours(shape, conn, strides, nb_fwd, nb_dc_fwd);
+    detail::build_forward_neighbors(shape, conn, strides, nb_fwd, nb_dc_fwd);
     const int n_nbs = static_cast<int>(nb_fwd.size());
 
     cc_detail::UnionFind uf;
@@ -309,7 +309,7 @@ inline int32_t cc_label_nd(const T* input, int32_t* output,
 }
 
 
-// Label-aware connected components. Like cc_label_nd, but neighbours
+// Label-aware connected components. Like cc_label_nd, but neighbors
 // are only unioned when they share the same nonzero input value, so
 // each output component lies entirely within one source label.
 // ``output`` holds dense 1..N component IDs (0 = bg);
@@ -331,7 +331,7 @@ inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
 
     std::vector<int64_t> strides, nb_fwd;
     std::vector<int8_t> nb_dc_fwd;
-    detail::build_forward_neighbours(shape, conn, strides, nb_fwd, nb_dc_fwd);
+    detail::build_forward_neighbors(shape, conn, strides, nb_fwd, nb_dc_fwd);
     const int n_nbs = static_cast<int>(nb_fwd.size());
 
     cc_detail::UnionFind uf;
@@ -344,7 +344,7 @@ inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
     const int64_t W = shape[inner];
 
     // No inner-row fast path: the per-label union check has to read
-    // input[] at every neighbour anyway, so the unrolled fg-only
+    // input[] at every neighbor anyway, so the unrolled fg-only
     // variant in cc_label_nd doesn't help here.
     auto step_pixel_checked = [&](const int64_t* coords, int64_t flat) {
         const T cur = input[flat];

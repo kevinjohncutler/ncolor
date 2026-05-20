@@ -163,7 +163,7 @@ def _coloring_is_valid(mask, colored, conn):
 
     Uses scipy.ndimage as an *independent* validator (the cpp engine has
     its own connected-components and adjacency code; we want a third
-    party to vouch for the colouring). Auto-skips the calling test when
+    party to vouch for the coloring). Auto-skips the calling test when
     scipy isn't installed — scipy is in the [clean] extra, not in the
     default install.
     """

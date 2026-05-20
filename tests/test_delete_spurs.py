@@ -34,7 +34,7 @@ def _ref_delete_spurs(mask, hole_threshold=5, *, mode="cardinal",
       2. Hole fill: bg components (face-connected) with pixel count
          ≤ ``hole_threshold`` get flipped to foreground. Matches the
          cpp ``areas[c] <= fill_thresh`` rule directly.
-      3. Iterative spur pruning: a pixel whose fg-neighbour count
+      3. Iterative spur pruning: a pixel whose fg-neighbor count
          under the chosen connectivity is in ``[1, threshold)`` is
          removed each pass; repeat until convergence or ``max_iter``.
 
@@ -241,7 +241,7 @@ def test_delete_spurs_preserves_junction():
 def test_delete_spurs_total_mode_removes_diagonal_spurs_3d():
     """Under ``mode='total'``, single-voxel spurs touching a 3D ball at
     a face / edge / vertex are all pruned (each has total=1 fg
-    neighbour). Locks in the full-diagonal rule's symmetric treatment
+    neighbor). Locks in the full-diagonal rule's symmetric treatment
     of contact types."""
     grids = np.indices((16, 16, 16))
     cz, cy, cx = 8, 8, 8
@@ -261,7 +261,7 @@ def test_delete_spurs_total_mode_removes_diagonal_spurs_3d():
 
 
 def test_delete_spurs_cardinal_mode_keeps_diagonal_only_spurs():
-    """Cardinal mode keys on face neighbours, so a voxel attached only
+    """Cardinal mode keys on face neighbors, so a voxel attached only
     via a diagonal contact has cardinal count == 0 — treated as
     isolated and preserved. (Use ``mode='total'`` if you want diagonal
     contacts to count as connections.)"""
@@ -288,7 +288,7 @@ def test_delete_spurs_cardinal_mode_keeps_diagonal_only_spurs():
 def test_delete_spurs_cardinal_catches_flat_row_protrusion():
     """The motivating case for cardinal mode: a single pixel sticking up
     out of a flat row has face=1 + 2 diagonals (total=3). Under total
-    mode it has 3 neighbours, not an endpoint. Under cardinal mode its
+    mode it has 3 neighbors, not an endpoint. Under cardinal mode its
     face count is 1 < ndim=2, so it gets pruned along with the row's
     own endpoints."""
     H, W = 7, 21

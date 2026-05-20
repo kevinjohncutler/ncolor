@@ -1,16 +1,16 @@
 // Label-aware ND despur. Iteratively remove pixels whose count of
-// face-adjacent same-label neighbours is ≤ `threshold`. Unlike the
+// face-adjacent same-label neighbors is ≤ `threshold`. Unlike the
 // existing `delete_spurs.hpp` (which is binary — any nonzero pixel
 // treated as foreground), this version respects label boundaries:
-// a pixel of cell A whose only face-neighbour from cell A is one
+// a pixel of cell A whose only face-neighbor from cell A is one
 // other pixel (the rest are other labels or bg) counts as a spur.
 //
 // Use case: after `expand_labels` fills the gaps between adjacent
 // cells, two cells that originally touched only at a single point
 // may now share a 1-pixel-wide "convergence pixel" that's only
-// 1-same-label-neighbour-attached to its parent cell. Removing
+// 1-same-label-neighbor-attached to its parent cell. Removing
 // these widens the inter-cell gap, breaking K_5-creating contact
-// patterns (5 cells meeting at a corner) so that 4-colouring
+// patterns (5 cells meeting at a corner) so that 4-coloring
 // becomes feasible at conn=1 r=1.
 //
 // Operates in place on the label buffer; removed pixels become 0
@@ -101,7 +101,7 @@ inline void count_and_mark_nd(
 // variant below, but iterates only over the dynamic frontier of
 // "pixels that might be spurs". Iter 0 is a full-image scan that
 // finds all initial spurs and seeds the frontier for iter 1+; each
-// subsequent iter processes only same-label neighbours of pixels
+// subsequent iter processes only same-label neighbors of pixels
 // removed in the previous iter. For typical microscopy seg's where
 // only ~5% of pixels are at cell boundaries and despur cascades are
 // shallow, this is 3-5× faster than full-scan iteration.
@@ -139,7 +139,7 @@ inline int64_t delete_spurs_labels_nd_bfs_inplace(
     };
 
     // -- Iter 0: full-image scan, find all initial spurs, seed
-    // frontier from their neighbours.
+    // frontier from their neighbors.
     std::vector<int64_t> spurs;     // pixels to remove this iter
     std::vector<int64_t> frontier;  // candidates for next iter
     spurs.reserve(total / 64);
@@ -203,11 +203,11 @@ inline int64_t delete_spurs_labels_nd_bfs_inplace(
     for (int64_t i : spurs) {
         labels[i] = 0;
     }
-    // Build frontier: same-label neighbours of removed pixels. The
+    // Build frontier: same-label neighbors of removed pixels. The
     // labels are now 0 for removed pixels; this means "same-label
     // before removal" must be derived from spurs list. Instead, we
-    // simply add every nonzero neighbour of every removed pixel —
-    // these may or may not have lost a same-label neighbour, but
+    // simply add every nonzero neighbor of every removed pixel —
+    // these may or may not have lost a same-label neighbor, but
     // they're the only candidates that could newly become spurs.
     std::vector<uint8_t> in_frontier(total, 0);
     for (int64_t i : spurs) {
