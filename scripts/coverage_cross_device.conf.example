@@ -1,0 +1,19 @@
+# scripts/coverage_cross_device.conf — list of remote hosts that
+# scripts/coverage_cross_device.sh ssh's into to collect coverage.
+# Copy this file to scripts/coverage_cross_device.conf (which is
+# gitignored) and edit it for your dev setup.
+#
+# Format: one entry per line, "label  user@host".
+# Lines starting with '#' and blank lines are ignored. The label is
+# used as the suffix on the local .coverage.<label> data file.
+#
+# Example: a Linux box on the LAN that mounts the same NAS source tree
+# at $HOME/DataDrive/ncolor (set NCOLOR_COV_REMOTE_ROOT to override):
+#
+#   big-box   you@bigbox.local
+#   tiny-nuc  you@nuc.lan
+#
+# Equivalent inline form via env var (skips the config file):
+#
+#   NCOLOR_COV_REMOTES="big-box=you@bigbox.local tiny-nuc=you@nuc.lan" \
+#       bash scripts/coverage_cross_device.sh

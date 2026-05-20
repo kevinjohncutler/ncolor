@@ -60,3 +60,19 @@ omit = [
 ]
 branch = false
 parallel = true
+
+[tool.coverage.paths]
+# Map per-host checkout roots back to the canonical src/ncolor so
+# coverage combine can merge .coverage data collected on multiple
+# machines (e.g. via scripts/coverage_cross_device.sh). The wildcard
+# entries cover the common cases: a Unix-style absolute path ending
+# in ``/ncolor/src/ncolor`` (works for both macOS and Linux), and a
+# Windows path with backslash separators.
+source = [
+    "src/ncolor",
+    "*/ncolor/src/ncolor",
+    "*\\ncolor\\src\\ncolor",
+]
+
+[tool.coverage.report]
+show_missing = true

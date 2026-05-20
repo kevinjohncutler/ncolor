@@ -145,3 +145,9 @@ dmypy.json
 # off PyPI as of v1.6.0; resurrect from git history if you need it for
 # parity testing).
 /legacy_numba/
+
+# Personal host list for scripts/coverage_cross_device.sh — contains
+# user@hostname entries specific to your dev machines.
+/scripts/coverage_cross_device.conf
+# Output dir of scripts/coverage_cross_device.sh.
+/.coverage_combined/
