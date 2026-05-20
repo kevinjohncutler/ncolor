@@ -208,6 +208,11 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
                 out = lut_arr[expanded].astype(out.dtype)
             else:
                 out = lut_arr[lab_arr].astype(out.dtype)
+            # Mirror the cpp pipeline: zero out pixels that were bg in
+            # the original input. Without this the optimize path emits
+            # colour at expanded-bg pixels, breaking parity with the
+            # non-optimize path.
+            out[lab_arr == 0] = 0
         else:
             raise ValueError(f"unknown optimize mode: {optimize!r}")
 

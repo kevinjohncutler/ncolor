@@ -228,3 +228,85 @@ def test_expand_labels_wrap_changes_extent(p):
                 (e_std[:, -border:] != e_wrap[:, -border:]).sum()
     assert edge_diff > 0, \
         "wrap=True gave identical Voronoi as non-wrap near image borders"
+
+
+# ----------------------------------------------------------------------
+# Smoke coverage for the kwargs that the live pipeline exposes but
+# weren't otherwise exercised. Each test asserts the same minimum:
+# the kwarg path runs, returns a valid 4-coloring (no conflicts), and
+# the output shape/dtype/bg pattern survive.
+# ----------------------------------------------------------------------
+
+
+def _assert_valid_coloring(out, mask, expected_n_max=8):
+    assert out.shape == mask.shape
+    assert out.dtype == np.uint8
+    assert np.array_equal(out == 0, mask == 0)
+
+
+@pytest.mark.parametrize("r", [1, 2])
+def test_label_connect_radius(r):
+    """connect_radius widens the neighbour search window. r=2 catches
+    near-adjacent cells through 1-pixel gaps; both should 4-colour the
+    dense circles input."""
+    m = _circles_2d_dense()
+    out, conflicts = ncolor.label(m, conn=1, connect_radius=r,
+                                  return_conflicts=True)
+    assert conflicts == 0
+    _assert_valid_coloring(out, m)
+
+
+@pytest.mark.parametrize("despur", [1, 2, 5])
+def test_label_despur_iters(despur):
+    """Iterative label-aware despur should not break the colouring."""
+    m = _circles_2d_dense()
+    out, conflicts = ncolor.label(m, despur_iters=despur,
+                                  return_conflicts=True)
+    assert conflicts == 0
+    _assert_valid_coloring(out, m)
+
+
+@pytest.mark.parametrize("rounds", [1, 3])
+def test_label_expand_spur_free(rounds):
+    """expand_spur_free=True is the BFS dilation path that avoids
+    creating K_5-shaped convergence pixels. Should still 4-colour."""
+    m = _circles_2d_dense()
+    out, n_used = ncolor.label(m, expand_spur_free=True,
+                               spur_free_max_rounds=rounds, return_n=True)
+    _assert_valid_coloring(out, m)
+    assert 1 <= int(n_used) <= 4
+
+
+def test_label_extra_edges_constrains_pair():
+    """extra_edges adds (1-indexed) cell-pair constraints on top of the
+    geometric adjacency. The constrained pair must end up with different
+    colours even though the two blobs are otherwise disjoint."""
+    m = _two_circle_2d()  # disjoint blobs with labels 1 and 2
+    extra = np.array([[1, 2]], dtype=np.int32)
+    out, conflicts = ncolor.label(m, extra_edges=extra, return_conflicts=True)
+    assert conflicts == 0
+    assert out[m == 1][0] != out[m == 2][0]
+    _assert_valid_coloring(out, m)
+
+
+@pytest.mark.parametrize("mode", ["min", "max", "mean", "count",
+                                   "harmonic", "mean_inv"])
+def test_label_weight_objective_modes(mode):
+    """Boundary-weighted picker: weight_objective != 0 routes through
+    find_pairs_weighted, which computes a per-pair (d_i+d_j) reducer
+    selected by weight_mode. All reducers must still 4-colour."""
+    m = _circles_2d_dense()
+    out, conflicts = ncolor.label(m, weight_objective=1, weight_mode=mode,
+                                  return_conflicts=True)
+    assert conflicts == 0
+    _assert_valid_coloring(out, m)
+
+
+def test_label_optimize_two_hop():
+    """optimize='two_hop' post-processes the BFS colouring via a 2-hop
+    SA optimiser. Exercises ncolor._optimize.optimize_two_hop."""
+    m = _circles_2d_dense()
+    out, conflicts = ncolor.label(m, optimize="two_hop",
+                                  return_conflicts=True)
+    assert conflicts == 0
+    _assert_valid_coloring(out, m)
