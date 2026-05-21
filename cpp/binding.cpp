@@ -1169,10 +1169,19 @@ private:
         // path (perceptual objective is orthogonal to clique
         // structure).
         const bool wobj_active_for_clique = weight_obj != 0 && edge_weights != nullptr;
-        if (!wobj_active_for_clique && N >= 5) {
+        // Skip clique-lower-bound when N is large enough that the
+        // Bron-Kerbosch sweep is more expensive than just letting the
+        // picker discover infeasibility via slot-race failure. For
+        // typical cell-adjacency graphs ω = target (no K_5), so clb
+        // would return "no adjustment" anyway — pure overhead. The
+        // 1500-cell cutoff is empirical: at N ≈ 1500 the dense-bitmap
+        // pass through fills ~280 KB, where L2 starts paying for the
+        // random access pattern.
+        static constexpr int32_t CLB_SKIP_ABOVE_N = 1500;
+        if (!wobj_active_for_clique && N >= 5 && N <= CLB_SKIP_ABOVE_N) {
             const auto clb_t0 = std::chrono::steady_clock::now();
             const int64_t clb_deadline_ns =
-                clb_t0.time_since_epoch().count() + 10LL * 1000LL * 1000LL;
+                clb_t0.time_since_epoch().count() + 2LL * 1000LL * 1000LL;
             const int omega = ncolor_cpp::clique_lower_bound(
                 N, indptr_.data(), indices_.data(),
                 /*target=*/n_colors + 1, clb_deadline_ns);
