@@ -1332,7 +1332,17 @@ private:
                 // slot reliably converges in <3 ms on K_4-clean
                 // graphs of any size.
                 static const bool dbg_warmup = std::getenv("NCOLOR_WARMUP_DEBUG") != nullptr;
-                const bool try_warmup = (N <= 200);
+                // Warmup empirically fails on all real cell-adjacency
+                // graphs we've measured (logo, synth, MM) — Welsh-
+                // Powell without tabucol just isn't strong enough.
+                // The race fanout pays a fixed ~0.5 ms dispatch but
+                // its tabucol-enabled slots reliably win in ~3 ms.
+                // Setting the threshold to 0 disables warmup entirely;
+                // wrapped in NCOLOR_WARMUP_ENABLE=<N> env in case a
+                // specific small input wants it back.
+                const char* warmup_env = std::getenv("NCOLOR_WARMUP_ENABLE");
+                const int warmup_max_n = warmup_env ? std::atoi(warmup_env) : 0;
+                const bool try_warmup = (N <= warmup_max_n);
                 bool warmup_ok = false;
                 if (try_warmup) {
                     const auto warmup_t0 = std::chrono::steady_clock::now();
@@ -1349,6 +1359,7 @@ private:
                             N, M, local_cur_n, local_depth, (int)warmup_ok);
                     }
                 }
+
                 if (warmup_ok) {
                     colors_.swap(per_attempt_colors_[0]);
                     ok = true;
