@@ -732,16 +732,20 @@ public:
             // modifies ``expanded`` in place so find_pairs / coloring
             // operate on the despurred graph.
             const int32_t* lut_lbl_ptr = expanded;
-            // Note on fusion: ``find_pairs_with_face_count_2d`` (see
-            // ``connect_with_face_count.hpp``) can emit pairs + face-
-            // count in one scan, which would save ~1 ms vs separate
-            // calls on dense inputs. But the pair list it produces is
-            // computed BEFORE despur, so any pair whose only contact
-            // was a spur pixel becomes a "ghost" edge after despur.
-            // On sparse-cell images (MM) this can over-constrain the
-            // picker and push n_used 4 → 5. Until pair-contact counts
-            // are tracked so ghost edges can be pruned, we keep the
-            // safe separate-pass path here.
+            // Note on fusion: ``find_pairs_with_face_count_2d_v2`` +
+            // ``despur_via_face_count_with_pair_decrement_2d`` (see
+            // ``connect_with_face_count.hpp``) provide a correct fused
+            // path that emits pairs + face_count in one scan and
+            // prunes ghost edges via per-pair contact counts. Verified
+            // to produce a bit-identical pair list to the safe
+            // separate-pass path on MM (14769 pairs both ways).
+            //
+            // BUT: the HT_lookup-driven decrements during the despur
+            // peel-back (~56 k lookups on MM with random access in a
+            // 512 KB hashtable) cost ~5 ms — more than the ~1.5 ms
+            // saved by skipping a standalone find_pairs pass. Net
+            // regression. Keeping the algorithm in-tree but not wired
+            // here; can be turned on by callers that want it.
             if (despur_iters > 0 && expand) {
                 lut_lbl_.assign(expanded, expanded + total);
                 lut_lbl_ptr = lut_lbl_.data();
