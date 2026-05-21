@@ -24,6 +24,7 @@
 #include "color.hpp"
 #include "delete_spurs.hpp"
 #include "delete_spurs_labels.hpp"
+#include "fast_despur.hpp"
 #include "expand_spur_free.hpp"
 #include "expand_lp.hpp"
 #include "format_labels.hpp"
@@ -733,10 +734,28 @@ public:
             if (despur_iters > 0 && expand) {
                 lut_lbl_.assign(expanded, expanded + total);
                 lut_lbl_ptr = lut_lbl_.data();
-                ncolor_cpp::delete_spurs_labels_nd_inplace<int32_t>(
-                    expanded, shape, /*threshold=*/1,
-                    despur_iters, pool_.get(), n_threads_,
-                    despur_remove_thin);
+                if (despur_remove_thin) {
+                    // remove_thin path uses the legacy peel-back since
+                    // fast_despur doesn't (yet) detect 1-voxel-thick
+                    // straight interior lines.
+                    ncolor_cpp::delete_spurs_labels_nd_inplace<int32_t>(
+                        expanded, shape, /*threshold=*/1,
+                        despur_iters, pool_.get(), n_threads_,
+                        despur_remove_thin);
+                } else {
+                    // Fast path: precompute per-pixel same-label face
+                    // count once (parallel branchless scan), then
+                    // queue-peel spurs decrementing neighbours' counts
+                    // on revert. No iter-0 full-image rescan after the
+                    // initial count pass.
+                    despur_face_count_.assign((size_t)total, 0);
+                    ncolor_cpp::compute_face_count_nd<int32_t>(
+                        expanded, despur_face_count_.data(), shape,
+                        pool_.get(), n_threads_);
+                    ncolor_cpp::despur_via_face_count_nd<int32_t>(
+                        expanded, despur_face_count_.data(), shape,
+                        /*threshold=*/1, pool_.get(), n_threads_);
+                }
                 stage("despur");
             }
 
@@ -1681,6 +1700,10 @@ private:
     // their parent cell's color in the final image. Only populated when
     // ``despur_iters > 0``; otherwise apply_lut reads ``expanded`` directly.
     std::vector<int32_t> lut_lbl_;
+    // Per-pixel same-label face-neighbour count, reused by fast_despur
+    // (compute_face_count_nd + despur_via_face_count_nd). Only allocated
+    // when fast_despur runs.
+    std::vector<uint8_t> despur_face_count_;
     // Persistent per-thread hashtable buffer for find_pairs (n_threads_ *
     // ht_size entries). Reused across calls so we don't pay malloc/free
     // for ~tens of MB on every label() invocation. find_pairs itself
@@ -2074,6 +2097,52 @@ PYBIND11_MODULE(_impl, m) {
           "in 2D). Useful for cleaning up 1-px bridges left by L1\n"
           "Voronoi expand without paying the iter-by-iter end-peeling\n"
           "cost.");
+
+    // Fast despur built on a pre-computed face-count array. Avoids the
+    // iter-0 full-image scan that dominates ``delete_spurs_labels``.
+    m.def("fast_despur",
+          [](py::array labels_in, int threshold, int n_threads) {
+              if (!(labels_in.flags() & py::array::c_style)) {
+                  labels_in = py::array::ensure(labels_in, py::array::c_style);
+              }
+              const auto buf = labels_in.request();
+              const int ndim = static_cast<int>(buf.ndim);
+              std::vector<int64_t> shape(ndim);
+              std::vector<py::ssize_t> out_shape(ndim);
+              for (int d = 0; d < ndim; ++d) {
+                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
+                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+              }
+              py::array out(labels_in.dtype(), out_shape);
+              std::memcpy(out.request().ptr, buf.ptr,
+                          (size_t)buf.size * (size_t)buf.itemsize);
+              int64_t n_removed = 0;
+              const int nt = n_threads > 0 ? n_threads :
+                  (int)std::thread::hardware_concurrency();
+              const int64_t total = (int64_t)buf.size;
+              std::vector<uint8_t> face_count((size_t)total);
+              {
+                  py::gil_scoped_release release;
+                  std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
+                  if (nt > 1) pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
+                  dispatch_int_dtype(buf.format, buf.itemsize, "fast_despur",
+                      [&](auto* tag) {
+                          using T = std::remove_pointer_t<decltype(tag)>;
+                          T* lbl = static_cast<T*>(out.mutable_data());
+                          ncolor_cpp::compute_face_count_nd<T>(
+                              lbl, face_count.data(), shape, pool.get(), nt);
+                          n_removed = ncolor_cpp::despur_via_face_count_nd<T>(
+                              lbl, face_count.data(), shape,
+                              threshold, pool.get(), nt);
+                      });
+              }
+              return std::make_pair(std::move(out), n_removed);
+          },
+          py::arg("labels"), py::arg("threshold") = 1, py::arg("n_threads") = 0,
+          "Fast despur: precompute per-pixel same-label face-neighbour\n"
+          "count once (parallel branchless scan), then peel back spurs\n"
+          "via a queue that decrements neighbours' counts on revert.\n"
+          "No full-image rescans after iter 0.");
 
     m.def("expand_spur_free",
           [](py::array labels_in, int max_rounds, int connectivity_threshold,
