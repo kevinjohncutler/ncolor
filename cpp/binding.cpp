@@ -1321,25 +1321,33 @@ private:
                     return slot_ok;
                 };
 
-                // Conditional fan-out: try slot 0 sequentially first.
-                // The vast majority of inputs (including all bact-logo
-                // shuffles at radius=1) succeed on the first attempt;
-                // skipping the pool dispatch in that case recovers
-                // ~0.5 ms of median latency that the 16-way race
-                // unconditionally pays. Only fan out when warmup fails.
+                // Conditional fan-out: try slot 0 sequentially first
+                // ONLY for small graphs where Welsh-Powell-without-
+                // tabucol stands a chance. Above ~1000 cells the
+                // warmup empirically fails 100% on real cell-adjacency
+                // graphs (verified on logo N=160 — even there the
+                // warmup misses) and the 1.1 ms it costs is pure
+                // waste before falling through to the race. The race
+                // pays a one-time ~0.5 ms dispatch but its bb_dsatur
+                // slot reliably converges in <3 ms on K_4-clean
+                // graphs of any size.
                 static const bool dbg_warmup = std::getenv("NCOLOR_WARMUP_DEBUG") != nullptr;
-                const auto warmup_t0 = std::chrono::steady_clock::now();
-                const bool warmup_ok = run_one_attempt(
-                    0, nullptr, /*allow_tabucol=*/false, /*race_deadline_ns=*/0);
-                if (dbg_solve) {
-                    const double warmup_ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - warmup_t0).count();
-                    std::fprintf(stderr, "  [warmup] %.1fms ok=%d\n", warmup_ms, (int)warmup_ok);
-                }
-                if (dbg_warmup) {
-                    std::fprintf(stderr,
-                        "[warmup] N=%d M=%d cur_n=%d depth=%d ok=%d\n",
-                        N, M, local_cur_n, local_depth, (int)warmup_ok);
+                const bool try_warmup = (N <= 200);
+                bool warmup_ok = false;
+                if (try_warmup) {
+                    const auto warmup_t0 = std::chrono::steady_clock::now();
+                    warmup_ok = run_one_attempt(
+                        0, nullptr, /*allow_tabucol=*/false, /*race_deadline_ns=*/0);
+                    if (dbg_solve) {
+                        const double warmup_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - warmup_t0).count();
+                        std::fprintf(stderr, "  [warmup] %.1fms ok=%d\n", warmup_ms, (int)warmup_ok);
+                    }
+                    if (dbg_warmup) {
+                        std::fprintf(stderr,
+                            "[warmup] N=%d M=%d cur_n=%d depth=%d ok=%d\n",
+                            N, M, local_cur_n, local_depth, (int)warmup_ok);
+                    }
                 }
                 if (warmup_ok) {
                     colors_.swap(per_attempt_colors_[0]);
