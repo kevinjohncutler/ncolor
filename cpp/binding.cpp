@@ -17,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "cc_label.hpp"
@@ -28,6 +29,8 @@
 #include "connect_with_face_count.hpp"
 #include "expand_spur_free.hpp"
 #include "expand_lp.hpp"
+#include "bridge_free.hpp"
+#include "soft_color.hpp"
 #include "format_labels.hpp"
 #include "connect.hpp"
 #include "geometry.hpp"
@@ -159,6 +162,37 @@ public:
             } else {
                 throw std::invalid_argument("expand_labels: p must be 1 or 2");
             }
+        }
+        return out;
+    }
+
+    // Bridge-free Voronoi label expansion. After each EDT axis sweep,
+    // pixels that form an antipodal-only bridge (exactly two same-label
+    // neighbors arranged opposite each other: N-S, E-W, NE-SW, or NW-SE
+    // in 2D) are marked as barriers (lbl=0) so the next axis sweep
+    // can't refill them. Currently 2D L2 only — falls back to standard
+    // L2 expand for ND > 2 until 3D antipodal generalization lands.
+    py::array_t<int32_t> expand_labels_bridge_free(
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
+            int p = 2) {
+        if (p != 1 && p != 2) {
+            throw std::invalid_argument(
+                "expand_labels_bridge_free: p must be 1 or 2");
+        }
+        const auto buf = labels.request();
+        std::vector<int64_t> shape(buf.ndim);
+        for (int i = 0; i < buf.ndim; ++i) shape[i] = buf.shape[i];
+
+        const int32_t* input = static_cast<const int32_t*>(buf.ptr);
+        py::array_t<int32_t> out(buf.shape);
+        int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
+
+        {
+            py::gil_scoped_release release;
+            ncolor_cpp::expand_labels_bridge_free_inplace(
+                input, bufs_, shape, *pool_, n_threads_, p);
+            std::memcpy(out_ptr, bufs_.lbl(),
+                        bufs_.size() * sizeof(int32_t));
         }
         return out;
     }
@@ -533,7 +567,13 @@ public:
             int despur_iters = 2,
             bool despur_remove_thin = false,
             bool expand_spur_free = false,
-            int spur_free_max_rounds = 1) {
+            int spur_free_max_rounds = 1,
+            int min_contact = 1,
+            std::string expand_mode = "bridge_free",
+            py::object soft_extra_edges_obj = py::none(),
+            int soft_conn = 2,
+            int soft_radius = 2,
+            bool clean_mask = false) {
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
         // coloring path without rebuilding the extension.
@@ -595,6 +635,24 @@ public:
                 if (eb.ndim == 2 && eb.shape[1] == 2) {
                     n_extra = static_cast<int32_t>(eb.shape[0]);
                     extra_ptr = static_cast<const int32_t*>(eb.ptr);
+                }
+            }
+        }
+        // Same parse for soft_extra_edges (Nx2 int32 pairs). Soft edges
+        // are NOT added to the hard CSR; they go to a separate post-solve
+        // local-search pass that minimises the count of soft edges whose
+        // endpoints share a color.
+        int32_t n_soft = 0;
+        const int32_t* soft_ptr = nullptr;
+        py::array_t<int32_t> soft_arr_holder;
+        if (!soft_extra_edges_obj.is_none()) {
+            soft_arr_holder = py::array_t<int32_t,
+                py::array::c_style | py::array::forcecast>::ensure(soft_extra_edges_obj);
+            if (soft_arr_holder) {
+                const auto sb = soft_arr_holder.request();
+                if (sb.ndim == 2 && sb.shape[1] == 2) {
+                    n_soft = static_cast<int32_t>(sb.shape[0]);
+                    soft_ptr = static_cast<const int32_t*>(sb.ptr);
                 }
             }
         }
@@ -661,17 +719,42 @@ public:
             // envelope. Result lands in expand_bufs_.lbl(); the
             // ``input == output`` self-copy guards inside LpExpand
             // variants make this a no-op when expand_input == expanded.
+            // Resolve expand strategy. `expand_spur_free=true` is a legacy
+            // alias for `expand_mode="spur_free"`; explicit `expand_mode`
+            // wins when both are set. Default is "bridge_free": ND Lp
+            // Voronoi expand fused with an antipodal-bridge test and a
+            // despur peel-back cascade in one pass (subsumes despur, so
+            // despur_iters is unused on that path).
+            std::string em = expand_mode;
+            if (em.empty()) em = "bridge_free";
+            if (expand_spur_free && em == "bridge_free") em = "spur_free";
+            // When `clean_mask=false` (default) and bridge_free is in
+            // use, the output LUT should be applied to the ORIGINAL
+            // foreground labels (before bridge_free zeros bridge/stub
+            // pixels as graph barriers). The picker's coloring is still
+            // built from the cleaned graph; we only redirect the final
+            // pixel-by-pixel LUT lookup. Snapshot the post-format /
+            // pre-expand labels here so apply_color_lut_ can use them.
+            const bool need_orig_snapshot = !clean_mask
+                && expand && em == "bridge_free";
+            if (need_orig_snapshot) {
+                orig_labels_.assign(expand_input, expand_input + total);
+            }
             if (expand) {
-                if (expand_spur_free) {
+                if (em == "bridge_free") {
+                    // Bridge-free Voronoi expand (ND, Lp). Single pass
+                    // does the EDT sweep + antipodal bridge removal +
+                    // despur cascade; result lands in expand_bufs_.lbl()
+                    // which `expanded` already points to.
+                    ncolor_cpp::expand_labels_bridge_free_inplace(
+                        expand_input, expand_bufs_, shape,
+                        *pool_, n_threads_, p);
+                } else if (em == "spur_free") {
                     // Spur-free expand: BFS dilation with connectivity
                     // check. Naturally avoids K_5-creating "starfish"
                     // convergence patterns by refusing to claim bg
                     // pixels that would have ≤1 same-label face-
-                    // neighbor. Equivalent to (expand_labels +
-                    // delete_spurs_labels) at the result level, but
-                    // computed in a single pass that bounds growth
-                    // at the connectivity check rather than fixing
-                    // up afterwards. Slower than Voronoi expand for
+                    // neighbor. Slower than Voronoi expand for
                     // small/medium inputs (3-4× on bact/synth) but
                     // same speed as expand+despur on large dense
                     // inputs where the K_5 prevention matters most.
@@ -686,10 +769,16 @@ public:
                         expanded, shape, spur_free_max_rounds,
                         /*connectivity_threshold=*/1,
                         pool_.get(), n_threads_);
-                } else if (p == 2) {
-                    ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
+                } else if (em == "voronoi") {
+                    if (p == 2) {
+                        ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
+                    } else {
+                        ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
+                    }
                 } else {
-                    ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
+                    throw std::invalid_argument(
+                        "expand_mode must be 'bridge_free', 'spur_free', "
+                        "or 'voronoi'; got '" + em + "'");
                 }
             }
             // (Suppress unused-var warning when expand=false — expanded
@@ -808,6 +897,66 @@ public:
                             expanded, expand_bufs_.dist(), shape, conn, wrap,
                             max_label, pair_primary, pair_counts); break;
                 }
+            } else if (min_contact > 1 && connect_radius > 1) {
+                // Contact-filtered pair-find: tracks per-pair pixel-
+                // contact count via ReduceMode::Count and drops pairs
+                // whose count is below `min_contact`. At r=2 the
+                // wider neighbor window picks up cells that share
+                // only a 1-pixel "leak" through a bg gap (median
+                // r=2-only contact is 2 on mm-class data, vs 44 for
+                // legitimate r=1 face-adjacent pairs). Filtering
+                // these by contact count removes the spurious
+                // Mycielski-like obstruction that pushes χ from 4 to
+                // 5. Only fires when r > 1 and the user asks for it.
+                using ncolor_cpp::ReduceMode;
+                std::vector<double> primary_unused;
+                pair_counts.clear();
+                pairs = find_pairs_weighted_<ReduceMode::Count>(
+                    expanded, /*dist=*/nullptr, shape, conn, wrap,
+                    max_label, primary_unused, pair_counts,
+                    connect_radius);
+                // Filter pairs by count.
+                int kept = 0;
+                for (size_t i = 0; i < pairs.size(); ++i) {
+                    if (pair_counts[i] >= min_contact) {
+                        pairs[kept] = pairs[i];
+                        ++kept;
+                    }
+                }
+                pairs.resize(kept);
+            } else if (soft_conn > 0 && soft_radius > 0 &&
+                        (soft_conn > conn || soft_radius > connect_radius) &&
+                        max_label > 0) {
+                // Fused base+soft pair-find: one pixel walk emits both
+                // base pairs (at conn, connect_radius) and the delta
+                // pairs at (soft_conn, soft_radius) excluding base.
+                // Replaces the separate post-pass scan for the soft
+                // auto-builder; saves the second pixel walk + HT init +
+                // merge on the soft side. Falls through to the single-
+                // emit path when no soft kernel is requested or when it
+                // would be a subset of the base.
+                const int ndim_local = (int)shape.size();
+                const int64_t n_fwd_base = ncolor_cpp::detail::
+                    count_forward_neighbors(ndim_local, conn, connect_radius);
+                const int64_t n_fwd_soft = ncolor_cpp::detail::
+                    count_forward_neighbors(ndim_local, soft_conn, soft_radius);
+                const int64_t n_fwd_delta = std::max<int64_t>(1, n_fwd_soft - n_fwd_base);
+                const int64_t base_ht_raw =
+                    2 * n_fwd_base * (int64_t)max_label;
+                const int64_t soft_ht_raw =
+                    2 * n_fwd_delta * (int64_t)max_label;
+                const uint64_t base_ht_size = (uint64_t)ipow2_ge(
+                    std::max<int64_t>(base_ht_raw, MIN_HT_SIZE));
+                const uint64_t soft_ht_size = (uint64_t)ipow2_ge(
+                    std::max<int64_t>(soft_ht_raw, MIN_HT_SIZE));
+                ncolor_cpp::find_pairs_dual_nd_unpadded<int32_t>(
+                    expanded, shape, conn, connect_radius,
+                    soft_conn, soft_radius,
+                    base_ht_size, soft_ht_size,
+                    n_threads_, *pool_, wrap,
+                    pairs, fused_soft_pairs_,
+                    /*base_ht_scratch=*/&fp_ht_buf_,
+                    /*soft_ht_scratch=*/&fp_soft_ht_buf_);
             } else {
                 // Unified pair-find: `connect_radius` widens the
                 // neighbor offset window (Chebyshev distance) for
@@ -818,6 +967,7 @@ public:
                 // kernel regardless of radius.
                 pairs = find_pairs_(expanded, shape, conn, wrap,
                                      max_label, connect_radius);
+                fused_soft_pairs_.clear();
             }
             // Canonical sort: orders pairs by (src, dst). Without this,
             // pairs come from HT iteration (slot order = hash-mixed,
@@ -956,14 +1106,70 @@ public:
                                      edge_weights_ptr, de_ptr, wobj);
             stage("color");
 
+            // 4b. Optional soft-edge local search. Operates on the valid
+            // hard coloring just found, recoloring vertices (without
+            // breaking hard adjacency) to reduce the count of soft edges
+            // whose endpoints share a color. See cpp/soft_color.hpp.
+            n_soft_violations_last_ = 0.0;
+            // Soft edges can come from either an explicit (E, 2) array
+            // (soft_ptr/n_soft, parsed above) OR from auto-build using
+            // a richer (soft_conn, soft_radius) kernel. The latter is
+            // cheaper since it stays in C++ and reuses find_pairs.
+            std::vector<int32_t> auto_soft_pairs_flat;
+            int32_t n_soft_eff = n_soft;
+            const int32_t* soft_ptr_eff = soft_ptr;
+            if (n_soft == 0 && soft_conn > 0 && soft_radius > 0
+                && N > 0 && n_used > 0) {
+                // Delta pairs were already computed in the fused base+soft
+                // find_pairs call (stage 2). Re-pack them as a flat int32
+                // array for build_soft_csr. The fused-scan path is empty
+                // when (soft_conn ≤ conn AND soft_radius ≤ connect_radius);
+                // we get an empty list and the soft search no-ops cleanly.
+                auto_soft_pairs_flat.reserve(2 * fused_soft_pairs_.size());
+                for (auto& p : fused_soft_pairs_) {
+                    auto_soft_pairs_flat.push_back(p.first);
+                    auto_soft_pairs_flat.push_back(p.second);
+                }
+                n_soft_eff = static_cast<int32_t>(
+                    auto_soft_pairs_flat.size() / 2);
+                soft_ptr_eff = auto_soft_pairs_flat.data();
+            }
+            if (n_soft_eff > 0 && N > 0 && n_used > 0) {
+                ncolor_cpp::build_soft_csr(
+                    N, n_soft_eff, soft_ptr_eff, /*weights_in=*/nullptr,
+                    soft_indptr_, soft_indices_, soft_weights_);
+                stage("soft_csr");
+                // Triangle-count weights bias the search toward fixing
+                // edges inside dense soft sub-cliques (K_4-soft clusters
+                // like the logo cluster) ahead of isolated leak/noise
+                // edges. Replaces uniform weights. See compute_triangle
+                // _weights for the rationale. Cost: O(sum of soft-deg²)
+                // ≈ tiny on our test images (avg soft-deg < 1).
+                ncolor_cpp::compute_triangle_weights(
+                    N, soft_indptr_.data(), soft_indices_.data(),
+                    soft_weights_);
+                stage("soft_weights");
+                n_soft_violations_last_ = ncolor_cpp::soft_local_search(
+                    colors_.data(), N,
+                    indptr_.data(), indices_.data(),
+                    soft_indptr_.data(), soft_indices_.data(),
+                    soft_weights_.data(),
+                    n_used);
+                stage("soft_search");
+            }
+
             // 5. Build LUT (expanded[i] is in 1..N, so lut size = N+1) and
-            // apply it to the expanded-label buffer. When despur ran,
-            // ``lut_lbl_ptr`` points at the pre-despur copy so spur pixels
-            // get their parent cell's color (they only need to be hidden
-            // from the adjacency graph, not from the final image).
+            // apply it to the fg-label buffer. Default (clean_mask=false)
+            // uses the pre-expand snapshot ``orig_labels_`` so original-fg
+            // pixels keep their cell's color even if bridge_free zeroed
+            // them as barriers for graph cleanup. With clean_mask=true,
+            // the post-expand buffer (lut_lbl_ptr) is used and bridge_free
+            // barriers surface as 0 in the output.
             lut_.assign(static_cast<size_t>(N) + 1, 0);
             for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
-            apply_color_lut_(lut_lbl_ptr, out_ptr, total);
+            const int32_t* lut_src =
+                (need_orig_snapshot ? orig_labels_.data() : lut_lbl_ptr);
+            apply_color_lut_(lut_src, out_ptr, total);
             stage("apply_lut");
         }  // close: if (!early_exit_empty)
         }  // close: gil_scoped_release scope
@@ -980,6 +1186,7 @@ public:
         return arr;
     }
     int get_last_n_conflicts() const { return last_n_conflicts_; }
+    double get_last_n_soft_violations() const { return n_soft_violations_last_; }
 
 private:
     // Validate or allocate the uint8 output buffer. Returns the (possibly
@@ -1084,17 +1291,19 @@ private:
             const std::vector<int64_t>& shape,
             int conn, bool wrap, int32_t max_label,
             std::vector<double>& primary,
-            std::vector<int32_t>& counts) {
+            std::vector<int32_t>& counts,
+            int radius = 1) {
         primary.clear(); counts.clear();
         if (max_label == 0) return {};
         const int ndim = static_cast<int>(shape.size());
-        const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbors(ndim, conn);
+        const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbors(
+            ndim, conn, radius);
         const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
         const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE));
         return ncolor_cpp::find_pairs_weighted_nd_unpadded<int32_t, Mode>(
             labels, dist, shape, conn,
             static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap,
-            primary, counts,
+            primary, counts, radius,
             &fp_ht_buf_, &fp_primary_buf_, &fp_counts_buf_);
     }
 
@@ -1169,19 +1378,32 @@ private:
         // path (perceptual objective is orthogonal to clique
         // structure).
         const bool wobj_active_for_clique = weight_obj != 0 && edge_weights != nullptr;
-        // Skip clique-lower-bound when N is large enough that the
-        // Bron-Kerbosch sweep is more expensive than just letting the
-        // picker discover infeasibility via slot-race failure. For
-        // typical cell-adjacency graphs ω = target (no K_5), so clb
-        // would return "no adjustment" anyway — pure overhead. The
-        // 1500-cell cutoff is empirical: at N ≈ 1500 the dense-bitmap
-        // pass through fills ~280 KB, where L2 starts paying for the
-        // random access pattern.
-        static constexpr int32_t CLB_SKIP_ABOVE_N = 1500;
-        if (!wobj_active_for_clique && N >= 5 && N <= CLB_SKIP_ABOVE_N) {
+        // Clique-lower-bound: detect K_{k+1} (or larger) in the graph
+        // to skip doomed cur_n=k attempts. For typical cell-adjacency
+        // graphs ω = target (no K_5), so CLB returns "no adjustment"
+        // — pure overhead. But on dense or higher-connectivity inputs
+        // (conn=2, connect_radius=2) K_5 is common and CLB saves the
+        // ~200 ms the picker would otherwise burn at cur_n=n_colors.
+        //
+        // Two regimes:
+        //   • N ≤ 1500: 2 ms deadline, classic behavior. CLB rarely
+        //     fires but is cheap when it does.
+        //   • N > 1500: 5 ms deadline, max_N up to 8000. Bron-Kerbosch
+        //     on dense graphs >8k vertices has a memory/time profile
+        //     that loses to slot-race failure detection. Below 8k,
+        //     the early-out at target+1 finds K_5 in <2 ms on real
+        //     cell-adjacency graphs (verified mm 2k² L1 r=2: ~1 ms
+        //     to detect K_5, vs the 200 ms the picker otherwise burns
+        //     on n=4 attempts before bumping).
+        static constexpr int32_t CLB_TIGHT_N = 1500;
+        static constexpr int32_t CLB_MAX_N   = 8000;
+        if (!wobj_active_for_clique && N >= 5 && N <= CLB_MAX_N) {
             const auto clb_t0 = std::chrono::steady_clock::now();
+            const int64_t budget_ns = (N <= CLB_TIGHT_N)
+                ? (2LL * 1000LL * 1000LL)
+                : (5LL * 1000LL * 1000LL);
             const int64_t clb_deadline_ns =
-                clb_t0.time_since_epoch().count() + 2LL * 1000LL * 1000LL;
+                clb_t0.time_since_epoch().count() + budget_ns;
             const int omega = ncolor_cpp::clique_lower_bound(
                 N, indptr_.data(), indices_.data(),
                 /*target=*/n_colors + 1, clb_deadline_ns);
@@ -1376,9 +1598,21 @@ private:
                     // N≥few-thousand) trying to escape a non-k-colorable
                     // graph. 50 ms is plenty for any feasible case at
                     // our scale — successes typically converge in <5 ms.
+                    // For large N (> 1500) on graphs that are
+                    // genuinely (k+1)-chromatic (Mycielski-like, e.g.
+                    // mm r=2 after despur), no race slot will find a
+                    // k-coloring. Cap race wall budget more tightly
+                    // to bound the wasted time on the failure path.
+                    // Successes on real cell-adjacency graphs converge
+                    // in <5ms anyway; the 50ms slack was tuned for
+                    // adversarial despur-perturbation cases on small N
+                    // that benefit from longer per-slot tabucol.
+                    const int64_t race_budget_ns = (N > 1500)
+                        ? (15LL * 1000LL * 1000LL)
+                        : (50LL * 1000LL * 1000LL);
                     const int64_t race_deadline_ns =
                         race_t0.time_since_epoch().count()
-                        + 50LL * 1000LL * 1000LL;
+                        + race_budget_ns;
                     pool_->parallel([&]() {
                         int idx;
                         while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < attempts_per_n) {
@@ -1534,7 +1768,13 @@ private:
                     // to climb out of the local minimum on both.
                     // Skipped when the race already found a valid
                     // coloring (the !ok guard above).
-                    const int64_t budget_ns = 50LL * 1000LL * 1000LL;
+                    // Tighter budget for large N — see race_budget_ns
+                    // rationale above. Tabucol can't escape Mycielski-
+                    // like local minima within ANY reasonable budget,
+                    // so a shorter cap just bounds the inevitable wait.
+                    const int64_t budget_ns = (N > 1500)
+                        ? (15LL * 1000LL * 1000LL)
+                        : (50LL * 1000LL * 1000LL);
                     const int64_t deadline_ns =
                         std::chrono::steady_clock::now()
                             .time_since_epoch().count() + budget_ns;
@@ -1584,22 +1824,25 @@ private:
                 // where HEA solves in 25-37 ms) still finish well
                 // within budget. Fires only when every cheaper path
                 // has failed → zero cost on the common path.
-                const int64_t bb_budget_ns =
-                    50LL * 1000LL * 1000LL;  // 50 ms
-                // HEA gets 100 ms — empirically the trickiest
-                // adversarial shuffles (which bb_dsatur exhausts its
-                // budget on) need 25-90 ms of HEA to converge. The
-                // despur-cliff cases (where χ ≤ 4 is provable as a
-                // subgraph of an already-coloured input) need much
-                // longer than this — but throwing wall-time at them
-                // is the wrong fix; the right fix is warm-starting
-                // the picker from the previous iteration's coloring
-                // instead of re-searching from scratch on each
-                // despur step. Until that lands, the cliff cases
-                // fall back to n_used=5; users hit them only with
-                // expand_spur_free=False on dense MM-class data.
-                const int64_t hea_budget_ns =
-                    100LL * 1000LL * 1000LL;
+                // For graphs that defeat the race + tabu-restart, the
+                // bb_dsatur + HEA chain is a desperation play. When a
+                // graph is genuinely (k+1)-chromatic (e.g. Mycielski-
+                // like structure: no K_{k+1} subgraph but χ = k+1
+                // anyway), neither bb_dsatur nor HEA can find a
+                // k-coloring — they just exhaust their budgets proving
+                // it. For N > 1500 those budgets dominate the failure-
+                // path cost (~200ms on mm 2k² r=2). Trim them for
+                // large N to bound the wasted time. Small N keeps the
+                // generous budget because (a) it amortizes to little
+                // wall time anyway, (b) HEA has a real win-rate there
+                // on the despur-perturbation cases the original budget
+                // was tuned for.
+                const int64_t bb_budget_ns = (N > 1500)
+                    ? (10LL * 1000LL * 1000LL)   // 10 ms for large N
+                    : (50LL * 1000LL * 1000LL);  // 50 ms otherwise
+                const int64_t hea_budget_ns = (N > 1500)
+                    ? (20LL * 1000LL * 1000LL)   // 20 ms for large N
+                    : (100LL * 1000LL * 1000LL); // 100 ms otherwise
                 if (!ok) {
                     const int64_t node_budget = std::max<int64_t>(
                         200000, (int64_t)N * 100);
@@ -1681,6 +1924,60 @@ private:
             }
         }
 
+        // Post-success class-merge decoloring: if the picker had to
+        // bump cur_n past the user's target k (n_colors), try the
+        // CHEAP recovery — find two color classes (a, b) that have no
+        // mutual edges and merge them. O(M + cur_n²) per merge.
+        //
+        // This is a no-op when the (k+1)-coloring has all classes
+        // pairwise adjacent (e.g. mm 2k² p=2 bridge_free, where the
+        // 5-coloring is "tight"); in those cases χ is still k but
+        // recovering it from a fresh coloring would require Kempe-chain
+        // recoloring or a stronger heuristic. We don't attempt that
+        // here — leaving cur_n at the picker's discovered value rather
+        // than burning more wall-clock time on a recovery that's not
+        // reliable for graphs where tabucol got stuck in the first
+        // place. Documented limitation; the picker's race +
+        // tabu-restart already runs ~100ms of effort at cur_n=n_colors.
+        if (ok && cur_n > n_colors && (int32_t)colors_.size() >= N) {
+            const int32_t* ip = indptr_.data();
+            const int32_t* ix = indices_.data();
+            while (cur_n > n_colors) {
+                const int dim = cur_n + 1;
+                std::vector<uint8_t> cadj((size_t)dim * dim, 0);
+                for (int32_t u = 0; u < N; ++u) {
+                    const int cu = colors_[u];
+                    if (cu < 1) continue;
+                    for (int32_t j = ip[u]; j < ip[u + 1]; ++j) {
+                        const int32_t v = ix[j];
+                        const int cv = colors_[v];
+                        if (cv < 1 || cv == cu) continue;
+                        cadj[(size_t)cu * dim + cv] = 1;
+                        cadj[(size_t)cv * dim + cu] = 1;
+                    }
+                }
+                int merge_a = -1, merge_b = -1;
+                for (int a = 1; a <= cur_n && merge_a < 0; ++a) {
+                    for (int b = a + 1; b <= cur_n; ++b) {
+                        if (!cadj[(size_t)a * dim + b]) {
+                            merge_a = a; merge_b = b; break;
+                        }
+                    }
+                }
+                if (merge_a < 0) break;  // No mergeable pair; bail out.
+                for (int32_t u = 0; u < N; ++u) {
+                    if (colors_[u] == merge_b) colors_[u] = (uint8_t)merge_a;
+                    else if (colors_[u] > merge_b) colors_[u]--;
+                }
+                --cur_n;
+                if (dbg_solve) {
+                    std::fprintf(stderr,
+                        "[decolor merge] class %d -> %d, cur_n=%d\n",
+                        merge_b, merge_a, cur_n);
+                }
+            }
+        }
+
         int n_used = 0;
         for (uint8_t c : colors_) if (c > n_used) n_used = c;
         // O(M) tally of adjacent same-color pairs so callers that
@@ -1697,22 +1994,31 @@ private:
     // when total ≥ 8192. The bg pattern was captured by ``cast_with_bg``
     // at the start of label(); using a uint8 mask here keeps the inner
     // loop typeless wrt the original input dtype.
-    void apply_color_lut_(const int32_t* expanded, uint8_t* out_ptr,
-                          int64_t total) {
+    // Apply LUT to fg pixels. bg pixels (bg_mask_[i] == 1) ALWAYS get
+    // 0 in the output — `expand` is an internal graph-building thing,
+    // not a visual fill. ``src`` provides the label for each fg pixel:
+    //   - default (clean_mask=false): a pre-bridge_free snapshot of the
+    //     fg labels, so original-fg pixels never lose their cell color
+    //     to a barrier zero from bridge_free.
+    //   - clean_mask=true OR no snapshot available: the post-expand
+    //     buffer (lut_lbl_ptr), which surfaces bridge_free's barriers
+    //     as 0 in the output too.
+    void apply_color_lut_(const int32_t* src, uint8_t* out_ptr,
+                           int64_t total) {
         const int nt = std::max(1, n_threads_);
         const uint8_t* bg_p = bg_mask_.data();
         const uint8_t* lp = lut_.data();
         if (nt == 1 || total < 8192) {
             for (int64_t i = 0; i < total; ++i) {
-                out_ptr[i] = bg_p[i] ? 0 : lp[expanded[i]];
+                out_ptr[i] = bg_p[i] ? 0 : lp[src[i]];
             }
             return;
         }
         ncolor_cpp::dispatch_parallel(*pool_, static_cast<size_t>(total),
             static_cast<size_t>(nt) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
-            [bg_p, expanded, lp, out_ptr](size_t begin, size_t end) {
+            [bg_p, src, lp, out_ptr](size_t begin, size_t end) {
                 for (size_t i = begin; i < end; ++i) {
-                    out_ptr[i] = bg_p[i] ? 0 : lp[expanded[i]];
+                    out_ptr[i] = bg_p[i] ? 0 : lp[src[i]];
                 }
             });
     }
@@ -1728,6 +2034,11 @@ private:
     // weighted coloring path. Empty/unused for the default coloring.
     // Real-valued to encode EDT-distance-based contact strength.
     std::vector<double> edge_weights_;
+    // Soft-edge CSR + weights, populated only when soft_extra_edges is
+    // passed to label(). Used by ncolor_cpp::soft_local_search.
+    std::vector<int32_t> soft_indptr_, soft_indices_;
+    std::vector<float>   soft_weights_;
+    double n_soft_violations_last_ = 0.0;  // exposed via accessor
     std::vector<uint8_t> colors_;
     std::vector<uint8_t> lut_;
     // Pre-despur copy of the expanded-label buffer, used by apply_lut so
@@ -1735,6 +2046,13 @@ private:
     // their parent cell's color in the final image. Only populated when
     // ``despur_iters > 0``; otherwise apply_lut reads ``expanded`` directly.
     std::vector<int32_t> lut_lbl_;
+    // Snapshot of the post-format, pre-expand labels (just the original
+    // foreground pixels with their 1..N IDs; bg is 0). Used by
+    // apply_color_lut_ when clean_mask=false so original-fg pixels
+    // ALWAYS get their cell's color even when bridge_free zeroed them
+    // as bridges/stubs for graph cleanup. Only populated when
+    // clean_mask=false AND expand_mode="bridge_free" AND expand=true.
+    std::vector<int32_t> orig_labels_;
     // Per-pixel same-label face-neighbour count, reused by fast_despur
     // (compute_face_count_nd + despur_via_face_count_nd). Only allocated
     // when fast_despur runs.
@@ -1749,6 +2067,14 @@ private:
     // empty / unused when weight_objective==0 (the default).
     std::vector<double>   fp_primary_buf_;
     std::vector<int32_t>  fp_counts_buf_;
+    // Second per-thread HT buffer for the dual base+soft find_pairs path
+    // (auto-build of soft_extra_edges). Empty / unused when soft_conn or
+    // soft_radius is 0.
+    std::vector<uint64_t> fp_soft_ht_buf_;
+    // Soft (delta-only) pair list captured by the fused base+soft scan in
+    // label(). Consumed by the soft_local_search post-pass without a
+    // second pixel walk. Cleared on every non-soft label() call.
+    std::vector<std::pair<int32_t, int32_t>> fused_soft_pairs_;
     int last_n_conflicts_ = 0;
     std::vector<std::pair<std::string, double>> last_stages_;
     // Per-attempt scratch for parallel coloring (one colors vector per
@@ -1779,6 +2105,19 @@ PYBIND11_MODULE(_impl, m) {
              "chamfer kernels (no Python-level padding): L1 ~1.1× std,\n"
              "L2 ~1.4-1.6× std. Verified bit-equal to a np.pad reference\n"
              "on standard inputs.")
+        .def("expand_labels_bridge_free", &ExpandEngine::expand_labels_bridge_free,
+             py::arg("labels"), py::arg("p") = 2,
+             "Bridge-free Voronoi label expansion (2D only for now).\n"
+             "Identical to expand_labels except an antipodal-only bridge\n"
+             "test runs on the final 2D-Voronoi labels: pixels with\n"
+             "exactly two same-label neighbors arranged antipodally\n"
+             "(N-S, E-W, NE-SW, or NW-SE) are marked bg. Prevents 1-\n"
+             "pixel-wide bridges (face or corner) from connecting cells.\n"
+             "p=1 (L1, Saito-Toriwaki) tends to produce many more such\n"
+             "bridges than p=2 (L2, Felzenszwalb) — L1 is the metric\n"
+             "where the test actually changes the output materially.\n"
+             "ND > 2 falls back to standard expand_labels (no bridge\n"
+             "prevention) until 3D antipodal generalization lands.")
         .def("expand_labels_with_dist", &ExpandEngine::expand_labels_with_dist,
              py::arg("labels"), py::arg("p") = 2, py::arg("wrap") = false,
              "Same as expand_labels but also returns the distance field.\n"
@@ -1848,6 +2187,12 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("despur_remove_thin") = false,
              py::arg("expand_spur_free") = false,
              py::arg("spur_free_max_rounds") = 1,
+             py::arg("min_contact") = 1,
+             py::arg("expand_mode") = "bridge_free",
+             py::arg("soft_extra_edges") = py::none(),
+             py::arg("soft_conn") = 2,
+             py::arg("soft_radius") = 2,
+             py::arg("clean_mask") = false,
              "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
              "Any ndim ≥ 2; conn ∈ [1, ndim].\n"
              "p selects the expand metric: p=1 (Saito-Toriwaki sweep,\n"
@@ -1893,7 +2238,12 @@ PYBIND11_MODULE(_impl, m) {
         .def("get_last_n_conflicts", &Solver::get_last_n_conflicts,
              "Number of adjacent same-color pairs in the most recent\n"
              "label() output. 0 means the coloring is valid; nonzero\n"
-             "means the solver bailed out without finding a clean coloring.");
+             "means the solver bailed out without finding a clean coloring.")
+        .def("get_last_n_soft_violations", &Solver::get_last_n_soft_violations,
+             "Total weight (or count if unit weights) of soft_extra_edges\n"
+             "whose endpoints share a color after the post-solve local\n"
+             "search. 0 means all soft preferences satisfied. Only nonzero\n"
+             "when soft_extra_edges was passed to label().");
 
     m.def("cc_label",
           [](py::array mask, int conn) -> std::pair<py::array_t<int32_t>, int32_t> {

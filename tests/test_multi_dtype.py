@@ -68,13 +68,26 @@ def _balls_3d(D, H, W, n, dtype, seed=0):
 
 def _is_valid_coloring_2d(colored, mask):
     """Every adjacent pair of distinct nonzero labels in `mask` must have
-    different colors in `colored`."""
+    different colors in `colored`.
+
+    Bridge_free (the default expand) may zero some fg pixels at bridge/
+    stub locations as barriers. Such pixels have ``colored == 0`` even
+    though ``mask != 0``; we treat them as removed for the purpose of
+    this adjacency check (a zeroed pixel can't conflict with anything).
+    """
     nz_right = (mask[:, :-1] != 0) & (mask[:, 1:] != 0)
     nz_down = (mask[:-1, :] != 0) & (mask[1:, :] != 0)
     diff_right = mask[:, :-1] != mask[:, 1:]
     diff_down = mask[:-1, :] != mask[1:, :]
-    bad_right = (colored[:, :-1] == colored[:, 1:]) & nz_right & diff_right
-    bad_down = (colored[:-1, :] == colored[1:, :]) & nz_down & diff_down
+    # Require both colored values > 0; otherwise this is a barrier
+    # (legitimate bridge_free removal) and the "same color (=0)" match
+    # is spurious.
+    both_col_right = (colored[:, :-1] > 0) & (colored[:, 1:] > 0)
+    both_col_down = (colored[:-1, :] > 0) & (colored[1:, :] > 0)
+    bad_right = ((colored[:, :-1] == colored[:, 1:]) & both_col_right
+                  & nz_right & diff_right)
+    bad_down = ((colored[:-1, :] == colored[1:, :]) & both_col_down
+                  & nz_down & diff_down)
     return not (bad_right.any() or bad_down.any())
 
 
@@ -114,7 +127,7 @@ def test_label_matches_int32_reference(solver, dtype):
     m_int = m.astype(np.int32)
     assert _is_valid_coloring_2d(out_dtype, m_int)
     assert _is_valid_coloring_2d(out_int32, m_int)
-    # Bg pattern must match exactly across dtypes.
+    # Bg pattern must match exactly across dtypes (clean_mask=False).
     assert np.array_equal((out_dtype == 0), (m == 0))
 
 
@@ -195,8 +208,9 @@ def test_label_expand_false_keeps_bg(solver):
     m = _circles_2d(64, 64, 6, np.int32)
     out_with_expand, _ = solver.label(m, conn=2, expand=True)
     out_no_expand, _ = solver.label(m, conn=2, expand=False)
-    # bg mask matches input bg mask in both cases (we always do
-    # bg-masking based on the original input).
+    # bg mask matches input bg mask in both cases (clean_mask=False
+    # default keeps original-fg pixels colored even when bridge_free
+    # zeros them internally).
     assert np.array_equal((out_with_expand == 0), (m == 0))
     assert np.array_equal((out_no_expand == 0), (m == 0))
     # When expand=True every fg pixel ends up with one of the

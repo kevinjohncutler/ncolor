@@ -657,7 +657,7 @@ inline void expand_labels_inplace(
         // vectorization, so transpose+contig wins by ~25%.
         //
         // Threshold: A >= 2 (have a slab axis) AND B*C <= 4M ints (~16
-        // MiB ≤ M2 shared L2). Tuned on M2 / AMD Ryzen / Threadripper.
+        // MiB ≤ M1 Ultra shared L2). Tuned on M1 Ultra / AMD Ryzen / Threadripper.
         constexpr int64_t STRIDED_SLAB_LIMIT = 4 * 1024 * 1024;
         const bool use_strided = (A >= 2) && (B * C <= STRIDED_SLAB_LIMIT);
         if (use_strided) {

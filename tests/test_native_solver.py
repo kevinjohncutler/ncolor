@@ -122,7 +122,7 @@ def test_label_assigns_color_per_label():
     out, _ = sv.label(mask)
     # Background pixels (where mask==0) should be 0 in output.
     assert (out[mask == 0] == 0).all()
-    # Foreground pixels should be > 0.
+    # Foreground pixels should be > 0 (clean_mask=False default).
     assert (out[mask > 0] > 0).all()
 
 
@@ -173,13 +173,26 @@ def _coloring_is_valid(mask, colored, conn):
     labels = labels[labels > 0]
     color_of = {}
     for l in labels:
-        coords = np.nonzero(mask == l)
-        color_of[int(l)] = int(colored[tuple(c[0] for c in coords)])
+        # Pick the most common NONZERO color in this label's region.
+        # Picking the first pixel arbitrarily can hit a bridge_free
+        # barrier (colored == 0), which would falsely report a "shared
+        # color of 0" conflict against any other label that also has a
+        # barrier at its first pixel.
+        region_colors = colored[mask == l]
+        region_colors = region_colors[region_colors > 0]
+        if region_colors.size == 0:
+            # Whole region zeroed out — skip (treat as removed).
+            continue
+        vals, counts = np.unique(region_colors, return_counts=True)
+        color_of[int(l)] = int(vals[counts.argmax()])
     for l in labels:
+        if int(l) not in color_of:
+            continue
         m = (mask == l)
         d = snd.binary_dilation(m, structure=struct) & ~m
         for t in np.unique(mask[d]):
-            if t > 0 and t != l and color_of[int(t)] == color_of[int(l)]:
+            if t > 0 and t != l and int(t) in color_of \
+                    and color_of[int(t)] == color_of[int(l)]:
                 return False, (int(l), int(t), color_of[int(l)])
     return True, None
 

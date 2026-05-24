@@ -89,43 +89,98 @@ struct BBDSatur {
         }
     }
 
-    // Recursive backtracking. Returns true on success.
+    // Iterative backtracking. Recursion depth = N, which blows past
+    // worker-thread stack limits (512KB on macOS) once N > ~3000;
+    // using an explicit heap-allocated stack instead keeps the
+    // algorithm safe for graphs of any size. Behaviour matches the
+    // original recursive search node-for-node.
     bool recurse() {
-        // Sibling-cancel: check every recurse() so a winner found by
-        // another worker terminates the entire search tree quickly.
-        // Checking only every N nodes is WRONG: when cancel returns
-        // false from a deep child, the parent's `for c=1..k` loop
-        // moves on to the next color and re-descends — without an
-        // entry-point check, unwinding the recursion stack would
-        // take O(depth × k) extra mod-N intervals (~10 ms for our
-        // graphs). Relaxed-load on x86 is essentially free with
-        // branch prediction once the flag flips.
-        // Wall-clock deadline: same logic — per-node cost is O(N)
-        // (pick_next is a linear scan), so even checking every 1024
-        // nodes is too rare when N is in the thousands (a fixed node
-        // budget at large N translates to seconds). Check every
-        // recurse() when a deadline is set. Steady-clock cost is
-        // ~50-100 ns per call vs ~5 µs per recurse at N=5000 —
-        // negligible overhead in the regime where deadlines matter.
-        if (cancel && cancel->load(std::memory_order_relaxed)) return false;
-        if (deadline_ns > 0 &&
-            std::chrono::steady_clock::now()
-                .time_since_epoch().count() > deadline_ns) return false;
-        ++node_count;
-        if (node_budget > 0 && node_count > node_budget) return false;
-        const int32_t u = pick_next();
-        if (u < 0) return true;  // all colored
+        // Per-level state. ``next_c`` is the next color to try
+        // (1..k+1); the color currently applied to ``u`` (if any) is
+        // ``next_c - 1`` whenever it is in [1, k].
+        struct Frame {
+            int32_t u;
+            uint8_t next_c;
+            std::vector<int32_t> touched;
+        };
+        std::vector<Frame> stack;
+        stack.reserve(64);
 
-        const uint8_t forb = forbidden[u];
-        // Try colors in 1..k order.
-        std::vector<int32_t> touched;
-        touched.reserve(32);
-        for (int32_t c = 1; c <= k; ++c) {
-            if (forb & (1u << c)) continue;
-            touched.clear();
-            apply(u, (uint8_t)c, touched);
-            if (recurse()) return true;
-            unapply(u, (uint8_t)c, touched);
+        // Per-node bookkeeping. Returns:
+        //   PUSHED   → frame pushed for a freshly-picked u, keep searching
+        //   COMPLETE → all vertices coloured; return true with colors[]
+        //              intact (do NOT unwind — that would undo the answer)
+        //   LIMIT    → cancel/deadline/budget hit; unwind and return false
+        enum DResult : int { PUSHED = 0, COMPLETE = 1, LIMIT = 2 };
+        auto descend = [&]() -> DResult {
+            // Sibling-cancel: check on every descent so a winner from
+            // a sibling worker terminates the entire search tree
+            // promptly. Relaxed-load is essentially free with branch
+            // prediction once the flag flips.
+            if (cancel && cancel->load(std::memory_order_relaxed)) return LIMIT;
+            // Wall-clock deadline: per-node cost is O(N) (pick_next is
+            // a linear scan), so a fixed node budget can translate to
+            // seconds on large graphs. Check every descent when a
+            // deadline is set — steady_clock cost (~50-100 ns) is
+            // negligible vs the ~5 µs per descent at N=5000.
+            if (deadline_ns > 0 &&
+                std::chrono::steady_clock::now()
+                    .time_since_epoch().count() > deadline_ns) return LIMIT;
+            ++node_count;
+            if (node_budget > 0 && node_count > node_budget) return LIMIT;
+            const int32_t u = pick_next();
+            if (u < 0) return COMPLETE;
+            Frame f;
+            f.u = u;
+            f.next_c = 1;
+            f.touched.reserve(32);
+            stack.push_back(std::move(f));
+            return PUSHED;
+        };
+
+        // Undo every still-applied color (only used when a limit fires).
+        auto unwind_all = [&]() {
+            while (!stack.empty()) {
+                Frame& cur = stack.back();
+                const uint8_t applied = (uint8_t)(cur.next_c - 1);
+                if (applied >= 1 && applied <= (uint8_t)k) {
+                    unapply(cur.u, applied, cur.touched);
+                }
+                stack.pop_back();
+            }
+        };
+
+        DResult r = descend();
+        if (r == COMPLETE) return true;
+        if (r == LIMIT)    { unwind_all(); return false; }
+
+        while (!stack.empty()) {
+            Frame& f = stack.back();
+            // Try the next allowed color on this frame.
+            bool applied_one = false;
+            while (f.next_c <= (uint8_t)k) {
+                const uint8_t c = f.next_c++;
+                if (forbidden[f.u] & (1u << c)) continue;
+                f.touched.clear();
+                apply(f.u, c, f.touched);
+                applied_one = true;
+                break;
+            }
+            if (applied_one) {
+                // "Recursive call" → push a new frame for the next vertex.
+                DResult rr = descend();
+                if (rr == COMPLETE) return true;
+                if (rr == LIMIT)    { unwind_all(); return false; }
+                continue;  // PUSHED: keep going
+            }
+            // Exhausted all colors for f.u → backtrack.
+            stack.pop_back();
+            if (stack.empty()) return false;
+            Frame& parent = stack.back();
+            const uint8_t parent_c = (uint8_t)(parent.next_c - 1);
+            unapply(parent.u, parent_c, parent.touched);
+            // parent.next_c is already past parent_c, so the outer
+            // loop will try parent_c + 1 on the next iteration.
         }
         return false;
     }

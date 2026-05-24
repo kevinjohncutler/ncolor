@@ -30,11 +30,11 @@ Two motivations:
    seconds while numba compiles.
 
 A long-running diagnostic earlier in this repo's history reported
-"700 ms" wall times for `ncolor.label` on a Threadripper PRO 3995WX and
+"700 ms" wall times for `ncolor.label` on a 64-core x86 Linux host and
 attributed it to libgomp's per-parallel-region launch cost. **That turned
 out to be wrong** — the actual cause was ~75 cores' worth of orphan
-multiprocessing workers spinning on the host. With a clean machine,
-numba's `omp` layer on the same threadripper completes the small-image
+multiprocessing workers spinning on the host. On the same hardware with
+a clean machine, numba's `omp` layer completes the small-image
 case in ≈1 ms (with `OMP_PROC_BIND=spread OMP_PLACES=cores`); the
 prototype shaves ~10–50% on top of that for small/medium sizes and ties
 at 2048².
@@ -64,7 +64,7 @@ Not ported (rarely needed in practice):
 ## Build
 
 ```bash
-cd <ncolor>/cpp_proto
+cd ncolor/cpp_proto    # or wherever the repo is checked out
 python setup.py build_ext --inplace
 ```
 
@@ -202,8 +202,8 @@ C++-side wins applied to `expand.hpp`:
    for the per-segment fill that the original interleaved while form blocked.
 4. **Persistent threadpool**: workers live for the engine lifetime, so per
    call we pay only `enqueue + condition_variable::notify` (microseconds),
-   not pthread_create. Critical on threadripper where every parallel
-   region in numba would otherwise pay 14–43 ms of fan-out.
+   not pthread_create. Critical on high-thread-count x86 hosts where every
+   parallel region in numba would otherwise pay 14–43 ms of fan-out.
 5. **Persistent scratch buffers** on `ExpandBuffers` (envelope stack +
    double-stack + transpose buffers): expand_labels gets called with the
    same shape repeatedly, so allocations amortize to zero.

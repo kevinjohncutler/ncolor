@@ -235,7 +235,8 @@ inline int64_t count_forward_neighbors(int ndim, int conn, int radius = 1) {
 }
 
 // Generate the forward-neighbor set's (dc[0..ndim-1], flat_offset) tuples.
-// Used by find_pairs_unpadded_impl.
+// Used by find_pairs_unpadded_impl. For the dual base+soft scan (the
+// soft_extra_edges auto-builder), see build_forward_neighbors_dual.
 inline void build_forward_neighbors(
         const std::vector<int64_t>& shape, int conn,
         std::vector<int64_t>& strides_out,
@@ -334,6 +335,105 @@ static inline void scan_inner_axis_fast(
     }
 }
 
+// Dual-emit per-pixel inner-axis scan. ``vi`` is loaded ONCE per pixel,
+// then BOTH the base offsets (0..N_BASE-1) and the delta offsets
+// (N_BASE..N_BASE+N_DELTA-1) are checked in the same iteration. Loads of
+// pixel data stay in registers/L1 for both checks. Templated on both
+// counts so each loop body unrolls separately. Used by the soft
+// auto-builder's fused dual scan; Mode=Off only.
+template <typename T, int N_BASE, int N_DELTA>
+static inline void scan_inner_axis_dual_fast(
+        const T* row, int64_t x_start, int64_t x_end,
+        const int64_t* nb_flat,
+        uint64_t* ht_base, uint64_t base_mask,
+        uint64_t* ht_soft, uint64_t soft_mask) {
+    int64_t nb_b[N_BASE];
+    int64_t nb_s[N_DELTA];
+    for (int i = 0; i < N_BASE;  ++i) nb_b[i] = nb_flat[i];
+    for (int i = 0; i < N_DELTA; ++i) nb_s[i] = nb_flat[N_BASE + i];
+    for (int64_t x = x_start; x < x_end; ++x) {
+        const T vi = row[x];
+        if (vi == 0) continue;
+        const T* p = row + x;
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC unroll 16
+#endif
+        for (int k = 0; k < N_BASE; ++k) {
+            const T vj = p[nb_b[k]];
+            if (vj == 0 || vj == vi) continue;
+            const T lo = vi < vj ? vi : vj;
+            const T hi = vi < vj ? vj : vi;
+            ht_insert(ht_base, base_mask,
+                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+        }
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC unroll 16
+#endif
+        for (int k = 0; k < N_DELTA; ++k) {
+            const T vj = p[nb_s[k]];
+            if (vj == 0 || vj == vi) continue;
+            const T lo = vi < vj ? vi : vj;
+            const T hi = vi < vj ? vj : vi;
+            ht_insert(ht_soft, soft_mask,
+                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+        }
+    }
+}
+
+// Runtime-N variant for (N_BASE, N_DELTA) combinations not in the
+// dispatch table.
+template <typename T>
+static inline void scan_inner_axis_dual_runtime(
+        const T* row, int64_t x_start, int64_t x_end,
+        int n_base, int n_delta, const int64_t* nb_flat,
+        uint64_t* ht_base, uint64_t base_mask,
+        uint64_t* ht_soft, uint64_t soft_mask) {
+    for (int64_t x = x_start; x < x_end; ++x) {
+        const T vi = row[x];
+        if (vi == 0) continue;
+        const T* p = row + x;
+        for (int k = 0; k < n_base; ++k) {
+            const T vj = p[nb_flat[k]];
+            if (vj == 0 || vj == vi) continue;
+            const T lo = vi < vj ? vi : vj;
+            const T hi = vi < vj ? vj : vi;
+            ht_insert(ht_base, base_mask,
+                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+        }
+        for (int k = 0; k < n_delta; ++k) {
+            const T vj = p[nb_flat[n_base + k]];
+            if (vj == 0 || vj == vi) continue;
+            const T lo = vi < vj ? vi : vj;
+            const T hi = vi < vj ? vj : vi;
+            ht_insert(ht_soft, soft_mask,
+                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+        }
+    }
+}
+
+// Dispatch table for common (N_BASE, N_DELTA) pairings.
+template <typename T>
+static inline void scan_inner_axis_dual_dispatch(
+        const T* row, int64_t x_start, int64_t x_end,
+        int n_base, int n_delta, const int64_t* nb_flat,
+        uint64_t* ht_base, uint64_t base_mask,
+        uint64_t* ht_soft, uint64_t soft_mask) {
+    // 2D conn=1 r=1 base (N_BASE=2) is the dominant case; delta sizes
+    // 2/8/10 cover the realistic soft kernels (conn=1 r=2, conn=2 r=1,
+    // conn=2 r=2). 2D conn=2 r=1 base (N_BASE=4) with delta=8 covers
+    // the conn=2 r=1 → conn=2 r=2 path.
+    if (n_base == 2 && n_delta == 2)
+        scan_inner_axis_dual_fast<T, 2, 2>(row, x_start, x_end, nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+    else if (n_base == 2 && n_delta == 8)
+        scan_inner_axis_dual_fast<T, 2, 8>(row, x_start, x_end, nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+    else if (n_base == 2 && n_delta == 10)
+        scan_inner_axis_dual_fast<T, 2, 10>(row, x_start, x_end, nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+    else if (n_base == 4 && n_delta == 8)
+        scan_inner_axis_dual_fast<T, 4, 8>(row, x_start, x_end, nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+    else
+        scan_inner_axis_dual_runtime<T>(row, x_start, x_end, n_base, n_delta, nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+}
+
 // Runtime-N_NBS fallback for cases that don't hit the dispatch table
 // (e.g. ndim ≥ 5 with custom conn). Identical body, just no unroll.
 template <typename T, ReduceMode Mode = ReduceMode::Off>
@@ -382,6 +482,14 @@ static inline void scan_inner_axis_dispatch(
         // n_nbs=6: 2D conn=1 radius=2 (cross-shape gap-bridging).
         case 6:  scan_inner_axis_fast<T, 6,  Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
         case 9:  scan_inner_axis_fast<T, 9,  Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
+        // n_nbs=8 / n_nbs=10: 2D auto-soft delta scans. When the soft
+        // kernel is one step richer than the base kernel, the delta
+        // offset set typically has 8 (single-step extension) or 10
+        // (conn=1 r=1 → conn=2 r=2) forward neighbors. Without these
+        // cases the delta scan fell into the runtime fallback and ran
+        // slower than the full-kernel scan it was meant to replace.
+        case 8:  scan_inner_axis_fast<T, 8,  Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
+        case 10: scan_inner_axis_fast<T, 10, Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
         // n_nbs=12: 2D conn=2 radius=2 (square-shape gap-bridging) —
         // the default `connect_radius=2` augmented-graph path. Without
         // this case the inner-axis kernel fell into the runtime-N_NBS
@@ -707,6 +815,345 @@ find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
                                               nullptr, nullptr, nullptr, radius, ht_scratch);
 }
 
+// =============================================================================
+// Dual-emit variant for the soft_extra_edges auto-builder.
+//
+// Walks the image ONCE and emits two pair lists in a single pass:
+//   - base pairs from forward neighbors at (base_conn, base_radius)
+//   - delta pairs from forward neighbors at (soft_conn, soft_radius)
+//     EXCLUDING the base offsets — i.e. the soft-only set.
+//
+// Replaces the older "two separate find_pairs scans + set_difference"
+// path used by the soft_extra_edges feature. Saves the second pixel walk
+// and the second HT init/merge/extract pass.
+//
+// Implementation: build_forward_neighbors_dual builds one combined offset
+// list at (soft_conn, soft_radius). build_forward_neighbors guarantees
+// stable_sort by Chebyshev distance — but offsets in the base kernel can
+// interleave with delta offsets (e.g. axial r=1 in base, axial r=2 in
+// delta, diagonals r=1 also in delta). So we *partition* the combined
+// list explicitly: base offsets first (n_base count), delta after, then
+// run two inner-axis dispatch calls per row interval — first for base,
+// second for delta. Pixel data stays in L1 between the two calls (rows
+// are at most ~8 KB on our test images).
+
+namespace detail {
+
+// Build combined forward-neighbor list at (soft_conn, soft_radius),
+// partitioned: base offsets (in (base_conn, base_radius)) first, then
+// the delta offsets. Returns n_base via out param.
+inline void build_forward_neighbors_dual(
+        const std::vector<int64_t>& shape,
+        int base_conn, int base_radius,
+        int soft_conn, int soft_radius,
+        std::vector<int64_t>& strides_out,
+        std::vector<int64_t>& nb_flat_out,
+        std::vector<int8_t>& nb_dc_out,
+        int& n_base_out) {
+    const int ndim = static_cast<int>(shape.size());
+    strides_out.assign(ndim, 1);
+    for (int d = ndim - 2; d >= 0; --d) strides_out[d] = strides_out[d + 1] * shape[d + 1];
+    nb_flat_out.clear();
+    nb_dc_out.clear();
+    n_base_out = 0;
+    if (soft_radius < 1) return;
+    // Group 0 = base, group 1 = delta. cands[k] = (group, cheb, off, dc).
+    // Sort by (group, cheb) so all base offsets precede all delta offsets,
+    // and within each group, lower Chebyshev distance comes first.
+    std::vector<std::tuple<int, int, int64_t, std::vector<int8_t>>> cands;
+    std::vector<int8_t> dc(ndim, (int8_t)-soft_radius);
+    while (true) {
+        int n_nz = 0, first_nz = -1, cheb = 0;
+        for (int d = 0; d < ndim; ++d) {
+            const int a = dc[d] < 0 ? -dc[d] : dc[d];
+            if (a > cheb) cheb = a;
+            if (dc[d] != 0) {
+                if (first_nz < 0) first_nz = d;
+                ++n_nz;
+            }
+        }
+        if (n_nz > 0 && n_nz <= soft_conn && first_nz >= 0 && dc[first_nz] > 0) {
+            const bool in_base = (base_conn > 0 && base_radius >= 1 &&
+                                   n_nz <= base_conn && cheb <= base_radius);
+            int64_t off = 0;
+            for (int d = 0; d < ndim; ++d) off += static_cast<int64_t>(dc[d]) * strides_out[d];
+            cands.emplace_back(in_base ? 0 : 1, cheb, off, dc);
+        }
+        int d = ndim - 1;
+        while (d >= 0) {
+            ++dc[d];
+            if (dc[d] <= soft_radius) break;
+            dc[d] = (int8_t)-soft_radius;
+            --d;
+        }
+        if (d < 0) break;
+    }
+    std::stable_sort(cands.begin(), cands.end(),
+        [](const auto& a, const auto& b) {
+            if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) < std::get<0>(b);
+            return std::get<1>(a) < std::get<1>(b);
+        });
+    for (auto& c : cands) {
+        if (std::get<0>(c) == 0) ++n_base_out;
+        nb_flat_out.push_back(std::get<2>(c));
+        for (int8_t v : std::get<3>(c)) nb_dc_out.push_back(v);
+    }
+}
+
+}  // namespace detail
+
+// Band scan emitting to two hashtables. Offsets 0..n_base-1 emit to
+// ht_base, n_base..n_nbs-1 emit to ht_soft. Mode=Off only; weighted
+// reducers are not supported on the dual path (not needed for soft).
+template <typename T, bool Wrap = false>
+inline void scan_band_unpadded_dual(
+        const T* lbl, const std::vector<int64_t>& shape,
+        const int64_t* strides, const int64_t* nb_flat,
+        const int8_t* nb_dc, int n_base, int n_nbs,
+        int64_t outer_start, int64_t outer_end,
+        uint64_t* ht_base, uint64_t* ht_soft,
+        uint64_t base_mask, uint64_t soft_mask,
+        int radius) {
+    const int ndim = static_cast<int>(shape.size());
+    const int n_delta = n_nbs - n_base;
+    auto emit = [](uint64_t* h, uint64_t mask, T vi, T vj) {
+        if (vj == 0 || vj == vi) return;
+        const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
+        const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
+        ht_insert(h, mask, (lo << 32) | hi);
+    };
+    auto scan_pixel_checked = [&](const int64_t* coords, uint32_t bnd_mask, int64_t flat) {
+        const T vi = lbl[flat];
+        if (vi == 0) return;
+        for (int k = 0; k < n_nbs; ++k) {
+            const int8_t* dc = nb_dc + k * ndim;
+            const bool is_base = (k < n_base);
+            uint64_t* h = is_base ? ht_base : ht_soft;
+            const uint64_t mask = is_base ? base_mask : soft_mask;
+            if constexpr (Wrap) {
+                int64_t neigh_flat = 0;
+                for (int d = 0; d < ndim; ++d) {
+                    int64_t nc = coords[d] + dc[d];
+                    if (nc < 0) nc += shape[d];
+                    else if (nc >= shape[d]) nc -= shape[d];
+                    neigh_flat += nc * strides[d];
+                }
+                emit(h, mask, vi, lbl[neigh_flat]);
+            } else {
+                bool valid = true;
+                uint32_t m = bnd_mask;
+                while (m) {
+                    const int d = ctz32(m);
+                    m &= m - 1;
+                    const int64_t nc = coords[d] + dc[d];
+                    if (nc < 0 || nc >= shape[d]) { valid = false; break; }
+                }
+                if (valid) emit(h, mask, vi, lbl[flat + nb_flat[k]]);
+            }
+        }
+    };
+    const int inner = ndim - 1;
+    const int64_t W = shape[inner];
+    const uint32_t inner_bit = 1u << inner;
+    int64_t coords[FIND_PAIRS_MAX_NDIM] = {0};
+    coords[0] = outer_start;
+    uint32_t outer_bnd = 0;
+    for (int d = 0; d < inner; ++d) {
+        if (coords[d] < radius || coords[d] >= shape[d] - radius) outer_bnd |= (1u << d);
+    }
+    int64_t row_base = 0;
+    for (int d = 0; d < inner; ++d) row_base += coords[d] * strides[d];
+    const int64_t end_outer = outer_end;
+    while (coords[0] < end_outer) {
+        if (outer_bnd != 0 || W < 2 * radius + 1) {
+            for (int64_t x = 0; x < W; ++x) {
+                const uint32_t bnd = outer_bnd |
+                    ((x < radius || x >= W - radius) ? inner_bit : 0u);
+                coords[inner] = x;
+                scan_pixel_checked(coords, bnd, row_base + x);
+            }
+        } else {
+            for (int64_t x = 0; x < radius; ++x) {
+                coords[inner] = x;
+                scan_pixel_checked(coords, inner_bit, row_base + x);
+            }
+            // Fast inner-axis interval: single per-pixel walk that
+            // checks base offsets AND delta offsets in one loop body
+            // (vi loaded once, both inner sub-loops fully unrolled).
+            // Saves one full pixel walk vs two separate dispatch calls.
+            if (n_base > 0 && n_delta > 0) {
+                scan_inner_axis_dual_dispatch<T>(
+                    lbl + row_base, radius, W - radius, n_base, n_delta,
+                    nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+            } else if (n_base > 0) {
+                scan_inner_axis_dispatch<T>(
+                    lbl + row_base, radius, W - radius, n_base,
+                    nb_flat, ht_base, base_mask);
+            } else if (n_delta > 0) {
+                scan_inner_axis_dispatch<T>(
+                    lbl + row_base, radius, W - radius, n_delta,
+                    nb_flat, ht_soft, soft_mask);
+            }
+            for (int64_t x = W - radius; x < W; ++x) {
+                coords[inner] = x;
+                scan_pixel_checked(coords, inner_bit, row_base + x);
+            }
+        }
+        if (ndim == 1) break;
+        int d = inner - 1;
+        ++coords[d];
+        row_base += strides[d];
+        while (coords[d] >= shape[d] && d > 0) {
+            row_base -= coords[d] * strides[d];
+            coords[d] = 0;
+            outer_bnd |= (1u << d);
+            --d;
+            ++coords[d];
+            row_base += strides[d];
+        }
+        if (coords[d] >= shape[d]) break;
+        const bool is_bnd = (coords[d] < radius || coords[d] >= shape[d] - radius);
+        if (is_bnd) outer_bnd |= (1u << d);
+        else outer_bnd &= ~(1u << d);
+    }
+}
+
+// Driver: same parallel structure as find_pairs_unpadded_impl but with
+// two hashtables per thread. Mode=Off only.
+template <typename T, bool Wrap = false>
+inline void find_pairs_dual_unpadded_impl(
+        const T* lbl, const std::vector<int64_t>& shape,
+        int base_conn, int base_radius, int soft_conn, int soft_radius,
+        uint64_t base_ht_size, uint64_t soft_ht_size,
+        int n_threads, ForkJoinPool& pool,
+        std::vector<std::pair<int32_t, int32_t>>& out_base,
+        std::vector<std::pair<int32_t, int32_t>>& out_soft,
+        std::vector<uint64_t>* base_ht_scratch,
+        std::vector<uint64_t>* soft_ht_scratch) {
+    out_base.clear();
+    out_soft.clear();
+    if (n_threads < 1) n_threads = 1;
+    std::vector<int64_t> strides;
+    std::vector<int64_t> nb_flat;
+    std::vector<int8_t> nb_dc;
+    int n_base = 0;
+    detail::build_forward_neighbors_dual(
+        shape, base_conn, base_radius, soft_conn, soft_radius,
+        strides, nb_flat, nb_dc, n_base);
+    const int n_nbs = static_cast<int>(nb_flat.size());
+    if (n_nbs == 0) return;
+    const int radius = std::max(1, soft_radius);
+    const uint64_t base_mask = base_ht_size - 1;
+    const uint64_t soft_mask = soft_ht_size - 1;
+
+    const size_t base_total = (size_t)n_threads * base_ht_size;
+    const size_t soft_total = (size_t)n_threads * soft_ht_size;
+    std::vector<uint64_t> base_local, soft_local;
+    uint64_t* base_hts;
+    uint64_t* soft_hts;
+    if (base_ht_scratch) {
+        if (base_ht_scratch->size() < base_total) base_ht_scratch->resize(base_total);
+        base_hts = base_ht_scratch->data();
+    } else { base_local.resize(base_total); base_hts = base_local.data(); }
+    if (soft_ht_scratch) {
+        if (soft_ht_scratch->size() < soft_total) soft_ht_scratch->resize(soft_total);
+        soft_hts = soft_ht_scratch->data();
+    } else { soft_local.resize(soft_total); soft_hts = soft_local.data(); }
+
+    if (n_threads == 1 || shape[0] < 2) {
+        std::fill_n(base_hts, base_ht_size, HT_EMPTY);
+        std::fill_n(soft_hts, soft_ht_size, HT_EMPTY);
+        scan_band_unpadded_dual<T, Wrap>(
+            lbl, shape, strides.data(), nb_flat.data(),
+            nb_dc.data(), n_base, n_nbs, 0, shape[0],
+            base_hts, soft_hts, base_mask, soft_mask, radius);
+    } else {
+        std::atomic<int> next{0};
+        const int64_t per = (shape[0] + n_threads - 1) / n_threads;
+        pool.parallel([&]() {
+            int t;
+            while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_threads) {
+                uint64_t* hb = base_hts + (size_t)t * base_ht_size;
+                uint64_t* hs = soft_hts + (size_t)t * soft_ht_size;
+                std::fill_n(hb, base_ht_size, HT_EMPTY);
+                std::fill_n(hs, soft_ht_size, HT_EMPTY);
+                const int64_t z0 = (int64_t)t * per;
+                const int64_t z1 = std::min(z0 + per, shape[0]);
+                if (z0 < z1) {
+                    scan_band_unpadded_dual<T, Wrap>(
+                        lbl, shape, strides.data(), nb_flat.data(),
+                        nb_dc.data(), n_base, n_nbs, z0, z1,
+                        hb, hs, base_mask, soft_mask, radius);
+                }
+            }
+        });
+        // Tree-merge each HT family separately.
+        int stride = 1;
+        while (stride < n_threads) {
+            const int n_pairs = (n_threads + 2 * stride - 1) / (2 * stride);
+            std::atomic<int> nx{0};
+            pool.parallel([&]() {
+                int p;
+                while ((p = nx.fetch_add(1, std::memory_order_relaxed)) < n_pairs) {
+                    const int dst = p * 2 * stride;
+                    const int src = dst + stride;
+                    if (src >= n_threads) continue;
+                    ht_merge(base_hts + (size_t)src * base_ht_size,
+                              base_hts + (size_t)dst * base_ht_size, base_ht_size);
+                    ht_merge(soft_hts + (size_t)src * soft_ht_size,
+                              soft_hts + (size_t)dst * soft_ht_size, soft_ht_size);
+                }
+            });
+            stride *= 2;
+        }
+    }
+    out_base.reserve(64);
+    for (uint64_t h = 0; h < base_ht_size; ++h) {
+        const uint64_t key = base_hts[h];
+        if (key == HT_EMPTY) continue;
+        out_base.emplace_back((int32_t)(key >> 32),
+                               (int32_t)(key & 0xFFFFFFFFull));
+    }
+    out_soft.reserve(64);
+    for (uint64_t h = 0; h < soft_ht_size; ++h) {
+        const uint64_t key = soft_hts[h];
+        if (key == HT_EMPTY) continue;
+        out_soft.emplace_back((int32_t)(key >> 32),
+                               (int32_t)(key & 0xFFFFFFFFull));
+    }
+}
+
+// Public entry — wraps Wrap dispatch.
+template <typename T>
+inline void find_pairs_dual_nd_unpadded(
+        const T* lbl, const std::vector<int64_t>& shape,
+        int base_conn, int base_radius, int soft_conn, int soft_radius,
+        uint64_t base_ht_size, uint64_t soft_ht_size,
+        int n_threads, ForkJoinPool& pool, bool wrap,
+        std::vector<std::pair<int32_t, int32_t>>& out_base,
+        std::vector<std::pair<int32_t, int32_t>>& out_soft,
+        std::vector<uint64_t>* base_ht_scratch = nullptr,
+        std::vector<uint64_t>* soft_ht_scratch = nullptr) {
+    out_base.clear();
+    out_soft.clear();
+    const int ndim = static_cast<int>(shape.size());
+    if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM) return;
+    if (base_conn < 1 || base_conn > ndim) return;
+    if (soft_conn < 1 || soft_conn > ndim) return;
+    if (wrap) {
+        find_pairs_dual_unpadded_impl<T, true>(
+            lbl, shape, base_conn, base_radius, soft_conn, soft_radius,
+            base_ht_size, soft_ht_size, n_threads, pool,
+            out_base, out_soft, base_ht_scratch, soft_ht_scratch);
+    } else {
+        find_pairs_dual_unpadded_impl<T, false>(
+            lbl, shape, base_conn, base_radius, soft_conn, soft_radius,
+            base_ht_size, soft_ht_size, n_threads, pool,
+            out_base, out_soft, base_ht_scratch, soft_ht_scratch);
+    }
+}
+
+// =============================================================================
 // Weighted variant: returns adjacency pairs AND per-pair reducer
 // values, computed in the SAME parallel scan as find_pairs (no extra
 // traversal). ``Mode`` picks which reducer:
@@ -722,6 +1169,7 @@ find_pairs_weighted_nd_unpadded(const T* lbl, const int32_t* dist,
                                 ForkJoinPool& pool, bool wrap,
                                 std::vector<double>& out_primary,
                                 std::vector<int32_t>& out_counts,
+                                int radius = 1,
                                 std::vector<uint64_t>* ht_scratch = nullptr,
                                 std::vector<double>*  primary_scratch = nullptr,
                                 std::vector<int32_t>* counts_scratch = nullptr) {
@@ -731,14 +1179,15 @@ find_pairs_weighted_nd_unpadded(const T* lbl, const int32_t* dist,
         out_counts.clear();
         return {};
     }
+    if (radius < 1) radius = 1;
     return wrap
         ? find_pairs_unpadded_impl<T, true,  Mode>(
               lbl, shape, conn, ht_size, n_threads, pool, dist,
-              &out_primary, &out_counts, /*radius=*/1,
+              &out_primary, &out_counts, radius,
               ht_scratch, primary_scratch, counts_scratch)
         : find_pairs_unpadded_impl<T, false, Mode>(
               lbl, shape, conn, ht_size, n_threads, pool, dist,
-              &out_primary, &out_counts, /*radius=*/1,
+              &out_primary, &out_counts, radius,
               ht_scratch, primary_scratch, counts_scratch);
 }
 

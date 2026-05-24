@@ -36,6 +36,17 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
       toroidal: opposite image edges are treated as adjacent, so a
       seed near one edge competes for territory with seeds near the
       opposite edge. ~1.1× cost for L1, ~1.4-1.6× for L2.
+    * ``"bridge_free"`` — Same separable Voronoi expansion as
+      ``"voronoi"`` (selectable via ``p`` / ``metric``: ``p=1``
+      Saito-Toriwaki L1, ``p=2`` Felzenszwalb L2), with an antipodal-
+      only bridge test run on the final 2D-Voronoi labels: pixels
+      with exactly two same-label neighbors arranged antipodally
+      (N-S, E-W, NE-SW, or NW-SE) are marked bg-barriers. Prevents
+      1-pixel-wide bridges (face or corner) between Voronoi cells.
+      L1 typically produces an order of magnitude more antipodal
+      bridges than L2 — this is the metric where the test
+      changes the output materially. 2D only for now — ND > 2
+      falls back to standard expand (no bridge prevention).
     * ``"spur_free"`` — BFS dilation with a connectivity check. A bg
       pixel is claimed by a cell only if at least
       ``connectivity_threshold + 1`` of its face-neighbors share that
@@ -48,9 +59,10 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
       bounds the BFS (default 100; in practice 1-3 rounds suffice).
       ``p`` / ``metric`` / ``wrap`` are ignored in this mode.
     """
-    if mode not in ("voronoi", "spur_free"):
+    if mode not in ("voronoi", "spur_free", "bridge_free"):
         raise ValueError(
-            f"mode must be 'voronoi' or 'spur_free', got {mode!r}")
+            f"mode must be 'voronoi', 'spur_free', or 'bridge_free', "
+            f"got {mode!r}")
     if mode == "voronoi":
         if metric is not None:
             if metric == "l2":
@@ -72,6 +84,18 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
     arr32 = arr.astype(np.int32, copy=False)
     if mode == "voronoi":
         return _get_engine().expand_labels(arr32, p=p, wrap=bool(wrap))
+    if mode == "bridge_free":
+        if metric is not None:
+            if metric == "l2":
+                p = 2
+            elif metric == "l1":
+                p = 1
+            else:
+                raise ValueError(
+                    f"Unknown metric: {metric!r} (use 'l1' or 'l2')")
+        if p not in (1, 2):
+            raise ValueError(f"p must be 1 or 2, got {p!r}")
+        return _get_engine().expand_labels_bridge_free(arr32, p=int(p))
     # spur_free
     from ._backend import _impl as _b
     out, _n_claimed = _b.expand_spur_free(

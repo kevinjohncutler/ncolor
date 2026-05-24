@@ -185,17 +185,22 @@ def test_label_wrap_returns_valid_coloring(p):
     assert conflicts == 0
     assert out.shape == m.shape
     assert out.dtype == np.uint8
-    # bg pattern preserved.
+    # bg pattern preserved (clean_mask=False is the default).
     assert np.array_equal(out == 0, m == 0)
 
 
 def test_label_wrap_output_differs_from_non_wrap():
     """wrap=True should generally produce a different coloring than the
     non-wrap path (because the adjacency graph gains wrap-around edges).
-    Asserts there's *some* difference rather than a specific permutation."""
+    Asserts there's *some* difference rather than a specific permutation.
+
+    Uses expand_spur_free=False so the test inputs (interior-placed
+    circles) actually develop wrap-around adjacencies — spur-free expand
+    leaves the image border bg unfilled, which suppresses those edges
+    by design."""
     m = _circles_2d_dense(seed=42)
-    no_wrap = ncolor.label(m, p=1, wrap=False)
-    yes_wrap = ncolor.label(m, p=1, wrap=True)
+    no_wrap = ncolor.label(m, p=1, wrap=False, expand_spur_free=False)
+    yes_wrap = ncolor.label(m, p=1, wrap=True, expand_spur_free=False)
     # Both valid, both compact 0..n_colors.
     assert no_wrap.max() <= 4 and yes_wrap.max() <= 4
     # Foreground bg patterns identical (only the colors change).
@@ -241,6 +246,10 @@ def test_expand_labels_wrap_changes_extent(p):
 def _assert_valid_coloring(out, mask, expected_n_max=8):
     assert out.shape == mask.shape
     assert out.dtype == np.uint8
+    # By default (clean_mask=False) the output preserves the input
+    # mask's fg/bg pattern exactly — bridge_free's internal barrier
+    # removal is graph-only and never strips colors from original-fg
+    # pixels. So bg patterns match exactly.
     assert np.array_equal(out == 0, mask == 0)
 
 

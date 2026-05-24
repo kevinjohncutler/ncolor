@@ -26,9 +26,12 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
           check_conflicts=False, return_conflicts=False, format_input=True,
           out=None, p=1, wrap=False, balance=True, first_seen=False,
           weight_objective=0, de_table=None, weight_mode="min",
-          optimize=None, extra_edges=None, connect_radius=1, despur_iters=2,
+          optimize=None, extra_edges=None, connect_radius=1, despur_iters=0,
           despur_remove_thin=False,
-          expand_spur_free=False, spur_free_max_rounds=1):
+          expand_spur_free=False, spur_free_max_rounds=1,
+          min_contact=1, expand_mode="bridge_free",
+          soft_extra_edges=None, soft_conn=2, soft_radius=2,
+          clean_mask=False):
     """4-color graph coloring of a label image.
 
     Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
@@ -162,6 +165,13 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
             raise ValueError(
                 f"extra_edges must be an (E, 2) int array of 1-indexed "
                 f"cell-pair constraints; got shape {extra_arr.shape}")
+    soft_extra_arr = None
+    if soft_extra_edges is not None:
+        soft_extra_arr = np.ascontiguousarray(soft_extra_edges, dtype=np.int32)
+        if soft_extra_arr.ndim != 2 or soft_extra_arr.shape[1] != 2:
+            raise ValueError(
+                f"soft_extra_edges must be an (E, 2) int array of 1-indexed "
+                f"cell-pair preferences; got shape {soft_extra_arr.shape}")
 
     out_array, n_used = solver.label(
         lab_arr,
@@ -175,7 +185,13 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
         despur_iters=int(despur_iters),
         despur_remove_thin=bool(despur_remove_thin),
         expand_spur_free=bool(expand_spur_free),
-        spur_free_max_rounds=int(spur_free_max_rounds))
+        spur_free_max_rounds=int(spur_free_max_rounds),
+        min_contact=int(min_contact),
+        expand_mode=str(expand_mode),
+        soft_extra_edges=soft_extra_arr,
+        soft_conn=int(soft_conn),
+        soft_radius=int(soft_radius),
+        clean_mask=bool(clean_mask))
     out = out_array
 
     if optimize is not None:
