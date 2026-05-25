@@ -3,6 +3,14 @@
 build
 docs/
 
+# Scratch + benchmark scaffolding (per-session experiments).
+# These accumulate fast during dev; commit promoted/cleaned versions
+# under bench/ or tests/ rather than letting _tmp_/bench output dirs
+# pollute git status.
+_tmp_*
+bench_outputs/
+bench_outputs_old/
+
 # Byte-compiled / optimized / DLL files
 !**/__pycache__/
 *.py[cod]
