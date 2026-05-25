@@ -564,7 +564,14 @@ public:
             int weight_mode = 1 /* ReduceMode::Min */,
             py::object extra_edges_obj = py::none(),
             int connect_radius = 1,
-            int despur_iters = 2,
+            // despur_iters / despur_remove_thin default to 0/false:
+            // bridge_free (the default expand_mode) already subsumes
+            // the bridge + stub removal, so running an additional despur
+            // pass on top is a no-op-but-still-O(N) pass. The Python
+            // public ``ncolor.label()`` API dropped these kwargs in 2.0;
+            // they remain on the C++ binding only for the niche callers
+            // who use expand_mode="voronoi" + want explicit despur.
+            int despur_iters = 0,
             bool despur_remove_thin = false,
             bool expand_spur_free = false,
             int spur_free_max_rounds = 1,
@@ -2183,7 +2190,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("weight_mode") = 1,
              py::arg("extra_edges") = py::none(),
              py::arg("connect_radius") = 1,
-             py::arg("despur_iters") = 2,
+             py::arg("despur_iters") = 0,
              py::arg("despur_remove_thin") = false,
              py::arg("expand_spur_free") = false,
              py::arg("spur_free_max_rounds") = 1,
