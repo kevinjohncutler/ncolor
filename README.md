@@ -7,7 +7,22 @@
 
 Fast remapping of instance labels 1,2,3,...,M to a smaller set of repeating, disjoint labels, 1,2,...,N. The [four color theorem](https://en.wikipedia.org/wiki/Four_color_theorem) guarantees that at most four colors are required for any 2D segmentation/map, but the stochastic algorithms of `ncolor` will opt for 5 or 6 to give an acceptable result if it fails to find a 4-color mapping quickly. Also works for 3D labels (&lt;8 colors typically required) and perhaps higher dimensions as well.
 
-Versions prior to 2.0 used a numba implementation. **v2.0 is a complete C++ rewrite** that's roughly **5–30× faster** on the core labeling pipeline (`label`, `expand_labels`) and **60–180× faster** on the cleanup helpers (`format_labels(clean=True)`, `delete_spurs`), with runtime dependencies shrunk to just `numpy` + `platformdirs`.
+Versions prior to 2.0 used a numba implementation. **v2.0 is a complete C++ rewrite** with new defaults (`bridge_free` Voronoi expand, auto-soft constraint post-pass) that 4-color real microscopy data the numba pipeline can't, while running 7–12× faster end-to-end.
+
+## v2.0 vs v1.5.3 on `ncolor.label()`
+
+Best-of-12 wall times on M1 Ultra. `n=4` means request a 4-coloring; `n_used` is what the picker actually used (≤ requested = success).
+
+| image | cells | n | PyPI 1.5.3 (numba) | **v2.0 (C++ + auto-soft)** | speedup |
+|---|--:|--:|--:|--:|--:|
+| logo (Cellpose example)      |  160 | 4 | 2.61 ms · `n_used=4` ✓ | **1.99 ms · `n_used=4` ✓** | 1.3× |
+| logo                         |  160 | 5 | 2.62 ms                | **1.90 ms**                | 1.4× |
+| synthetic bacteria 900²       |  682 | 4 | 39 ms  · `n_used=4` ✓  | **5.5 ms · `n_used=4` ✓**  | **7.2×** |
+| synthetic bacteria 900²       |  682 | 5 | 39 ms                  | **4.7 ms**                 | **8.3×** |
+| MM-class microscopy 2k²       | 5128 | 4 | 216 ms · `n_used=5` ✗  | **25 ms · `n_used=4` ✓**   | **8.6× + 4-color win** |
+| MM-class microscopy 2k²       | 5128 | 5 | 204 ms                 | **17 ms**                  | **11.8×** |
+
+The mm-class row at `n=4` is the headline: the numba pipeline can't find a valid 4-coloring on dense microscopy and falls back to `n=5`, while v2.0's bridge_free expand + auto-soft constraints both reach `n_used=4` *and* do it 8.6× faster. See `bench/bench_vs_pypi.py`.
 
 ## Install
 
