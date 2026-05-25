@@ -32,14 +32,98 @@ def label(lab, n=4, conn=2, max_depth=30, expand=True,
           clean_mask=False):
     """4-color graph coloring of a label image.
 
+    Returns a uint8 image where every foreground pixel of ``lab`` has
+    been assigned a color in ``1..n`` such that adjacent cells receive
+    different colors. Background (``lab == 0``) stays 0.
+
+    Default behavior (call with no kwargs beyond ``lab``):
+        4-color, 8-connectivity, ``bridge_free`` Voronoi expand with
+        L1 metric, Welsh-Powell balanced picker, auto-soft constraints
+        at ``conn=2 r=2``, and output that preserves the input fg/bg
+        pattern exactly.
+
     Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
     across calls.
+
+    ``n`` is the *maximum* color budget. The picker tries ``cur_n``
+    starting at the minimum needed (clique lower bound) and increments
+    up to ``n``. If the graph is genuinely (n+1)-chromatic, the call
+    returns with ``n_used == n+1`` and may not satisfy the coloring
+    constraint — check ``return_n=True`` or ``check_conflicts=True``.
+
+    ``conn`` is the connectivity for the *hard* adjacency graph:
+        conn=1: face-only (4-conn in 2D, 6-conn in 3D)
+        conn=2: face + edge (8-conn in 2D, 18-conn in 3D)
+        conn=3: face + edge + corner (only meaningful in 3D+, 26-conn)
+
+    ``connect_radius`` widens the neighbor offset window (Chebyshev
+    distance) beyond r=1. ``r=2`` catches near-adjacent cells through
+    1-pixel gaps. Combined with ``conn=2``, this picks up diagonal
+    leak adjacencies. Larger r→ more edges → harder picker problem.
+
+    ``expand_mode`` selects the Voronoi-expand kernel:
+        "bridge_free" (default) — ND Lp Voronoi + antipodal-bridge
+            test + despur peel-back cascade in one fused pass.
+            Internally zeros bridge/stub pixels as graph barriers
+            (these don't appear in the final output unless
+            ``clean_mask=True``).
+        "voronoi" — plain Lp Voronoi sweep without bridge/despur
+            cleanup. Faster but graphs may contain K_5 obstructions
+            at thin-cell convergences.
+        "spur_free" — BFS dilation with connectivity check. Naturally
+            avoids creating starfish-shaped convergence pixels but
+            leaves the image border bg unfilled and is slower for
+            small/medium inputs.
 
     ``p`` selects the Voronoi expand metric:
         p=1: Saito-Toriwaki separable sweep (Manhattan; default)
         p=2: Felzenszwalb parabolic envelope (Euclidean²)
     L1 is faster and produces a different (but equally valid) coloring
     at boundary tie-break regions; both satisfy the 4-coloring constraint.
+
+    ``min_contact`` filters edges in the hard graph by their boundary
+    pixel-pair count. When ``connect_radius>1``, r=2-only edges (1-pixel
+    leaks across bg gaps) typically have ~2-pixel contact while
+    legitimate r=1 face-adjacent pairs have ~44. Setting ``min_contact=4``
+    drops the spurious leaks, restoring 4-colorability on data where
+    they create Mycielski-like obstructions. Default 1 keeps everything.
+
+    ``extra_edges`` adds *hard* adjacency edges between specific
+    cell pairs beyond the geometric graph. ``(E, 2) int32`` array,
+    1-indexed by cell label. Use case: forcing specific cells to be
+    differently colored regardless of whether they touch geometrically.
+
+    ``soft_conn`` / ``soft_radius`` enable an auto-built soft-constraint
+    post-pass (default ``2`` / ``2``, on). After the hard 4-coloring,
+    a local search recolors vertices (without breaking the hard graph)
+    to minimize the number of edges in the soft ``(soft_conn,
+    soft_radius)`` kernel whose endpoints share a color. The auto-build
+    scans the image *once* via a fused dual-emit kernel that emits both
+    hard and delta-soft pairs in one pixel walk. Set either to 0 to
+    disable. Use case: catch edges that would create K_5 obstructions
+    as hard constraints, but should still be discouraged from sharing
+    a color when possible.
+
+    ``soft_extra_edges`` is the explicit alternative to ``soft_conn`` /
+    ``soft_radius``: pass a ``(E, 2)`` int32 array of 1-indexed cell pair
+    IDs to use directly as soft constraints. When set, the auto-build
+    path is bypassed.
+
+    ``clean_mask``:
+        False (default) — apply the color LUT to the *original*
+            foreground labels, so cells in the input mask always
+            retain their color in the output even when bridge_free
+            zeroed them internally as graph barriers. Output fg/bg
+            pattern exactly matches input.
+        True — apply the LUT to the post-expand buffer instead, so
+            bridge_free's barrier zeros surface in the output too.
+            Useful as a "clean + label" combined operation when the
+            barrier-removed mask is also wanted downstream.
+
+    ``verbose=True`` prints a one-line stage-breakdown summary
+    (shape, n_used, residual soft violations, total ms, per-stage
+    timings) to stderr after the call. Useful for "why is this slow?"
+    debugging.
 
     ``wrap=True`` treats the image as a torus: opposite edges are
     treated as adjacent. Useful when the cells of interest are crammed
