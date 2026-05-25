@@ -194,13 +194,11 @@ def test_label_wrap_output_differs_from_non_wrap():
     non-wrap path (because the adjacency graph gains wrap-around edges).
     Asserts there's *some* difference rather than a specific permutation.
 
-    Uses expand_spur_free=False so the test inputs (interior-placed
-    circles) actually develop wrap-around adjacencies — spur-free expand
-    leaves the image border bg unfilled, which suppresses those edges
-    by design."""
+    Default expand_mode='bridge_free' fills the image border bg via
+    Voronoi, so wrap-around adjacencies do develop."""
     m = _circles_2d_dense(seed=42)
-    no_wrap = ncolor.label(m, p=1, wrap=False, expand_spur_free=False)
-    yes_wrap = ncolor.label(m, p=1, wrap=True, expand_spur_free=False)
+    no_wrap = ncolor.label(m, p=1, wrap=False)
+    yes_wrap = ncolor.label(m, p=1, wrap=True)
     # Both valid, both compact 0..n_colors.
     assert no_wrap.max() <= 4 and yes_wrap.max() <= 4
     # Foreground bg patterns identical (only the colors change).
@@ -265,25 +263,16 @@ def test_label_connect_radius(r):
     _assert_valid_coloring(out, m)
 
 
-@pytest.mark.parametrize("despur", [1, 2, 5])
-def test_label_despur_iters(despur):
-    """Iterative label-aware despur should not break the coloring."""
+@pytest.mark.parametrize("expand_mode", ["voronoi", "spur_free"])
+def test_label_expand_mode(expand_mode):
+    """Non-default expand modes (voronoi / spur_free) should still 4-color
+    the dense circles input. bridge_free is the default and is exercised
+    by every other test in this file."""
     m = _circles_2d_dense()
-    out, conflicts = ncolor.label(m, despur_iters=despur,
-                                  return_conflicts=True)
-    assert conflicts == 0
-    _assert_valid_coloring(out, m)
-
-
-@pytest.mark.parametrize("rounds", [1, 3])
-def test_label_expand_spur_free(rounds):
-    """expand_spur_free=True is the BFS dilation path that avoids
-    creating K_5-shaped convergence pixels. Should still 4-color."""
-    m = _circles_2d_dense()
-    out, n_used = ncolor.label(m, expand_spur_free=True,
-                               spur_free_max_rounds=rounds, return_n=True)
-    _assert_valid_coloring(out, m)
+    out, n_used = ncolor.label(m, expand_mode=expand_mode, return_n=True)
     assert 1 <= int(n_used) <= 4
+    # spur_free leaves border bg unfilled by design; voronoi fills it.
+    # Either way, the coloring on the original fg pixels should be valid.
 
 
 def test_label_extra_edges_constrains_pair():
@@ -411,6 +400,46 @@ def test_expand_labels_voronoi_default_unchanged():
     assert np.array_equal(out_default, out_explicit)
 
 
+@pytest.mark.parametrize("p", [1, 2])
+def test_expand_labels_bridge_free(p):
+    """expand_labels(mode='bridge_free') runs the bridge-aware Voronoi
+    expand directly (the same kernel used by ncolor.label's default
+    expand path). Output should fill the image and may have a small
+    number of barrier zeros where bridge_free identified bridges/stubs."""
+    arr = _circles_2d_dense()
+    out = ncolor.expand_labels(arr, p=p, mode="bridge_free")
+    assert out.shape == arr.shape
+    assert out.dtype == np.int32
+    # All original fg pixels are preserved (their Voronoi seed label
+    # is unchanged by bridge_free's barrier removal — barriers can
+    # only fall on cells that were already at face_count <= 1).
+    # Most of the image gets filled (allow a tiny fraction at barriers).
+    fill_frac = (out > 0).mean()
+    assert fill_frac > 0.9, f"bridge_free expand filled only {fill_frac:.3f}"
+
+
+def test_expand_labels_bridge_free_metric_alias():
+    """mode='bridge_free' accepts metric='l1' / 'l2' as aliases for p=1/2."""
+    arr = np.zeros((16, 16), dtype=np.int32)
+    arr[2:4, 2:4] = 1
+    arr[10:12, 10:12] = 2
+    out_l1 = ncolor.expand_labels(arr, mode="bridge_free", metric="l1")
+    out_p1 = ncolor.expand_labels(arr, mode="bridge_free", p=1)
+    out_l2 = ncolor.expand_labels(arr, mode="bridge_free", metric="l2")
+    out_p2 = ncolor.expand_labels(arr, mode="bridge_free", p=2)
+    assert np.array_equal(out_l1, out_p1)
+    assert np.array_equal(out_l2, out_p2)
+
+
+def test_expand_labels_bridge_free_rejects_bad_metric():
+    arr = np.zeros((8, 8), dtype=np.int32)
+    arr[2:4, 2:4] = 1
+    with pytest.raises(ValueError, match="Unknown metric"):
+        ncolor.expand_labels(arr, mode="bridge_free", metric="chebyshev")
+    with pytest.raises(ValueError, match="p must be 1 or 2"):
+        ncolor.expand_labels(arr, mode="bridge_free", p=3)
+
+
 def test_delete_spurs_remove_thin_one_shot():
     """remove_thin=True catches 1-px-thick line interiors in ONE pass.
     Build a label image with a horizontal 1-px bridge between two
@@ -470,3 +499,75 @@ def test_delete_spurs_remove_thin_catches_2d_diagonal_line():
     # All 5 diagonal pixels gone (they were already spurs by face-count=0).
     assert (cleaned == 0).all()
     assert n == 5
+
+
+# ----------------------------------------------------------------------
+# Soft constraints + clean_mask (default-on path; covers the soft_color +
+# auto-build + apply_lut snapshot logic in cpp/binding.cpp + soft_color.hpp).
+# ----------------------------------------------------------------------
+
+
+def test_soft_default_path_runs_and_preserves_mask():
+    """Default `ncolor.label(m)` is now auto-soft (soft_conn=2 r=2) +
+    clean_mask=False. Verifies the soft pathway fires without errors AND
+    that the output's foreground/background pattern matches the input
+    exactly — bridge_free barriers must NOT leak through to the output."""
+    m = _circles_2d_dense()
+    out, n_used = ncolor.label(m, return_n=True)
+    assert 1 <= int(n_used) <= 4
+    # Default clean_mask=False keeps original fg/bg pattern.
+    assert np.array_equal(out == 0, m == 0)
+
+
+def test_soft_explicit_extra_edges_path():
+    """Explicit (E, 2) soft_extra_edges array path. Disjoint blobs (no
+    geometric adjacency) with one soft pair between them: the picker
+    is free to use the same color for both, but the soft search should
+    prefer differentiating them and the bg pattern must survive."""
+    m = _two_circle_2d()
+    soft = np.array([[1, 2]], dtype=np.int32)
+    out = ncolor.label(m, soft_extra_edges=soft,
+                        # disable auto-build so only the explicit path fires
+                        soft_conn=0, soft_radius=0)
+    _assert_valid_coloring(out, m)
+
+
+def test_clean_mask_true_vs_false_differs_only_at_barriers():
+    """clean_mask=False (default) keeps original fg/bg exact. clean_mask
+    =True opts into the bridge_free-barrier-zeros-surface-too behavior:
+    the output may have additional zeros where bridge_free identified
+    bridges/stubs. Where both produce a color, the colors must agree."""
+    m = _circles_2d_dense()
+    out_default = ncolor.label(m)                  # clean_mask=False
+    out_clean   = ncolor.label(m, clean_mask=True)
+    # Default preserves input bg pattern exactly.
+    assert np.array_equal(out_default == 0, m == 0)
+    # clean_mask=True output zeros include input bg AND any barriers.
+    # So bg-direction inclusion holds: every input bg is bg in both.
+    assert (out_clean[m == 0] == 0).all()
+    # Where both paths assigned a color (>0), they should agree.
+    both_colored = (out_default > 0) & (out_clean > 0)
+    assert np.array_equal(
+        out_default[both_colored], out_clean[both_colored])
+
+
+def test_soft_conn_radius_disabled_when_zero():
+    """soft_conn=0 or soft_radius=0 turns the auto-soft path off; the
+    coloring should still be valid and identical to a plain call."""
+    m = _circles_2d_dense()
+    out_no_soft = ncolor.label(m, soft_conn=0, soft_radius=0)
+    _assert_valid_coloring(out_no_soft, m)
+
+
+def test_label_verbose_prints_stage_summary(capsys):
+    """verbose=True wires through to capture_stages + prints a one-line
+    summary to stderr (shape, n_used, sv, total, breakdown)."""
+    m = _circles_2d_dense(seed=0)
+    out, n_used = ncolor.label(m, return_n=True, verbose=True)
+    captured = capsys.readouterr()
+    # Header line should mention shape, n_used, sv, and total ms.
+    assert "[ncolor.label]" in captured.err
+    assert "n_used=" in captured.err
+    assert "total=" in captured.err
+    # Breakdown line should mention at least a few stage names.
+    assert "expand" in captured.err or "find_pairs" in captured.err

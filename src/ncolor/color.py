@@ -21,14 +21,12 @@ def _get_solver():
     return _SOLVER
 
 
-def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
+def label(lab, n=4, conn=2, max_depth=30, expand=True,
           return_n=False, return_lut=False, verbose=False,
           check_conflicts=False, return_conflicts=False, format_input=True,
           out=None, p=1, wrap=False, balance=True, first_seen=False,
           weight_objective=0, de_table=None, weight_mode="min",
-          optimize=None, extra_edges=None, connect_radius=1, despur_iters=0,
-          despur_remove_thin=False,
-          expand_spur_free=False, spur_free_max_rounds=1,
+          optimize=None, extra_edges=None, connect_radius=1,
           min_contact=1, expand_mode="bridge_free",
           soft_extra_edges=None, soft_conn=2, soft_radius=2,
           clean_mask=False):
@@ -132,8 +130,6 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
     mode produces fully symmetric output. ``optimize="two_hop"`` at
     least guarantees all 4 colors appear wherever the graph allows.
     """
-    del verbose  # accepted for back-compat; cpp pipeline doesn't trace stages
-
     lab_arr = np.asarray(lab)
     solver = _get_solver()
 
@@ -182,17 +178,30 @@ def label(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
         weight_objective=wobj, de_table=de_arr,
         weight_mode=wmode_int, extra_edges=extra_arr,
         connect_radius=int(connect_radius),
-        despur_iters=int(despur_iters),
-        despur_remove_thin=bool(despur_remove_thin),
-        expand_spur_free=bool(expand_spur_free),
-        spur_free_max_rounds=int(spur_free_max_rounds),
         min_contact=int(min_contact),
         expand_mode=str(expand_mode),
         soft_extra_edges=soft_extra_arr,
         soft_conn=int(soft_conn),
         soft_radius=int(soft_radius),
-        clean_mask=bool(clean_mask))
+        clean_mask=bool(clean_mask),
+        capture_stages=bool(verbose))
     out = out_array
+
+    if verbose:
+        # Stage-level diagnostic summary. Activated by passing
+        # verbose=True; reads the stage timings captured by the cpp
+        # solver via capture_stages and prints a one-line shape +
+        # stage breakdown to stderr.
+        import sys as _sys
+        stages = solver.get_last_stages()
+        total = sum(ms for _, ms in stages) if stages else 0.0
+        sv = solver.get_last_n_soft_violations()
+        _shape = "x".join(str(s) for s in lab_arr.shape)
+        _cells = int(lab_arr.max()) if lab_arr.size else 0
+        head = (f"[ncolor.label] ({_shape}, {_cells} cells)  n_used={n_used}"
+                f"  sv={int(sv)}  total={total:.1f} ms")
+        breakdown = "  ".join(f"{name}={ms:.1f}" for name, ms in stages)
+        _sys.stderr.write(head + "\n               " + breakdown + "\n")
 
     if optimize is not None:
         opt_kind = str(optimize).lower()
@@ -304,11 +313,11 @@ def regionprops(labels, n_labels=0):
     return _b.regionprops(labels, int(n_labels))
 
 
-def get_lut(lab, n=4, conn=2, max_depth=30, offset=0, expand=True,
+def get_lut(lab, n=4, conn=2, max_depth=30, expand=True,
             return_n=False, verbose=False, check_conflicts=False,
             return_conflicts=False, format_input=True):
     """Return the label→color LUT used by :func:`label`."""
-    return label(lab, n=n, conn=conn, max_depth=max_depth, offset=offset,
+    return label(lab, n=n, conn=conn, max_depth=max_depth,
                  expand=expand, return_n=return_n, return_lut=True,
                  verbose=verbose, check_conflicts=check_conflicts,
                  return_conflicts=return_conflicts,
