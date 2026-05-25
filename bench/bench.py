@@ -2,9 +2,8 @@
 
 Run after building the C++ extension::
 
-    cd <ncolor>/cpp_proto
-    python setup.py build_ext --inplace
-    python bench.py
+    pip install -e . --no-build-isolation   # from the repo root
+    python bench/bench.py
 
 The script:
   1. Reuses ncolor's `neighbors()` so connectivity offsets match exactly.

@@ -18,12 +18,14 @@ import subprocess
 import sys
 import textwrap
 import time
+from pathlib import Path
 import numpy as np
 import skimage.io
 import ncolor as ncolor_local
 
-REPO = "<ncolor>"
-PYPI_PATH = "/tmp/ncolor_pypi/install"
+# Script-relative repo root so the bench is portable across checkouts.
+REPO = str(Path(__file__).resolve().parent.parent)
+PYPI_PATH = os.environ.get("NCOLOR_PYPI_PATH", "/tmp/ncolor_pypi/install")
 
 
 def load_logo():
@@ -41,7 +43,13 @@ def load_synth():
 
 
 def load_mm():
-    p = "<microscopy-fixture-path>"
+    """Load a dense 2k^2-class microscopy segmentation if the user has
+    one. Set ``NCOLOR_MM_FIXTURE=/path/to/seg.npy`` (uint16/int32 label
+    image with thousands of cells; see README for the kind of image
+    used in the reported benchmark)."""
+    p = os.environ.get("NCOLOR_MM_FIXTURE")
+    if not p or not os.path.exists(p):
+        return None
     img = np.load(p).astype(np.int32)
     _, inv = np.unique(img, return_inverse=True)
     return inv.reshape(img.shape).astype(np.int32)
@@ -102,8 +110,12 @@ def main():
     targets = [
         ("logo",      load_logo()),
         ("synth_800", load_synth()),
-        ("mm 2k^2",   load_mm()),
     ]
+    mm = load_mm()
+    if mm is not None:
+        targets.append(("mm 2k^2", mm))
+    else:
+        print("# NCOLOR_MM_FIXTURE not set or path missing; skipping mm row.")
     print()
     for n in (4, 5):
         print(f"## n={n}")

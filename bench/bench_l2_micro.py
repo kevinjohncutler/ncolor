@@ -4,10 +4,13 @@ Isolates the parabolic-envelope sweep cost from the surrounding ncolor.label
 pipeline so we can iterate on Phase-1 (envelope build) optimisations and
 measure the impact directly. Both 2D and 3D shapes; uint16 input.
 """
+import os
 import sys
 import time
 import statistics as st
-sys.path.insert(0, "<ncolor>/src")
+from pathlib import Path
+# Script-relative src path so the bench runs from any checkout location.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import numpy as np
 import ncolor
 from ncolor._backend import ExpandEngine

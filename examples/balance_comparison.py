@@ -50,14 +50,17 @@ for p in (1, 2):
         cpp_outputs[(p, balance)] = (out, lut)
 
 
-# Numba outputs (subprocess so NCOLOR_BACKEND=numba reloads cleanly)
+# Numba outputs (subprocess so NCOLOR_BACKEND=numba reloads cleanly).
+# Path is templated in by the parent (uses script-relative resolution
+# rather than a hardcoded checkout location).
+_NCOLOR_SRC = str(Path(__file__).resolve().parent.parent / "src")
 NUMBA_SCRIPT = textwrap.dedent(r'''
     import sys, os
-    sys.path.insert(0, '<ncolor>/src')
+    sys.path.insert(0, {ncolor_src!r})
     import numpy as np
     from pathlib import Path
     import skimage.io as skio
-    import ncolor
+    import ncolor''').format(ncolor_src=_NCOLOR_SRC) + textwrap.dedent(r'''
 
     repo_root = Path(ncolor.__file__).resolve().parents[2]
     masks = skio.imread(repo_root / 'test_files' / 'example.png')
