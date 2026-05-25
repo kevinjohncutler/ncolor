@@ -1,25 +1,25 @@
 /*
 Fork-Join Thread Pool for parallel dispatch.
 
-Sense-reversing centralized barrier with platform-specific idle fallback:
+Sense-reversing centralized barrier with a wait-on-address idle path:
   * **Spin** (FORKJOIN_SPIN_PAUSES pauses) catches tight back-to-back
-    fork-join cycles within microseconds. Cross-platform.
-  * After the spin window expires:
-      - On **Linux/Windows**: interspersed spin + ``sched_yield``
-        (matches pre-patch behavior). ``sched_yield`` is cheap here, so
-        an idle pool burns low single-digit %% CPU and a warm pool
-        wakes in ~us.
-      - On **macOS**: ``std::this_thread::sleep_for(FORKJOIN_SLEEP_US)``
-        in a loop. macOS ``yield()`` was causing a ``swtch_pri`` storm
-        (~1700-1800 %% CPU across 19 idle workers); sleep avoids that.
+    fork-join cycles within microseconds.
+  * After the spin window expires, workers wait on the barrier sense
+    via a kernel wait-on-address primitive:
+      - macOS:  ``__ulock_wait(UL_COMPARE_AND_WAIT, ...)``
+      - Linux:  ``futex(FUTEX_WAIT_PRIVATE, ...)``
+      - Windows:``WaitOnAddress``
+    The last participant to arrive at the barrier wakes all sleeping
+    workers via the matching wake primitive. Wake latency is ~µs on
+    all platforms.
 
-Why ifdef-scoped rather than uniform: the original macOS storm is a
-macOS-scheduler-specific behavior. A uniform sleep fallback regresses
-Linux fork-join workloads 50-200 %% at multi-T on a 64-core x86 host
-(measured during the edt port, 2026-05-23) because ``sleep_for`` is too
-coarse for tight loops. A uniform condvar park (alternative also tested)
-costs ~25 %% on nd_profile p=16. Pre-patch ``yield()`` was already
-perf-correct on Linux; only the macOS path needed the fix.
+Why wait-on-address rather than the older ``sleep_for(5ms)`` macOS
+fallback or ``yield`` Linux loop: the sleep path regressed small-job
+multi-T perf 60-100× on macOS (each ``parallel()`` had to pay ~2.5 ms
+mean wake delay because nanosleep below the ~10 ms scheduler tick is
+clamped); the yield path caused a ``swtch_pri`` storm (~1700%% CPU
+across 19 idle workers). wait-on-address gives the µs-class wake of
+spin/yield AND the ~0%% idle CPU of sleep — strictly better.
 
 Original ThreadPool: Copyright (c) 2012 Jakob Progsch, Václav Zeman (zlib license).
 Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
@@ -29,11 +29,72 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 #define NCOLOR_THREADPOOL_H
 
 #include <atomic>
-#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <thread>
 #include <vector>
+
+// ---- Platform wait-on-address primitives ---------------------------------
+#if defined(__APPLE__)
+  // Darwin private but ABI-stable since macOS 10.12. Used by libc's
+  // os_unfair_lock and friends. xnu source defines the codes; we
+  // forward-declare here.
+  extern "C" {
+    int __ulock_wait(uint32_t operation, void* addr, uint64_t value,
+                     uint32_t timeout_us);
+    int __ulock_wake(uint32_t operation, void* addr, uint64_t wake_value);
+  }
+  // UL_COMPARE_AND_WAIT = 1; ULF_WAKE_ALL = 0x100.
+  #define FORKJOIN_UL_COMPARE_AND_WAIT 1
+  #define FORKJOIN_ULF_WAKE_ALL        0x00000100
+#elif defined(__linux__)
+  #include <linux/futex.h>
+  #include <sys/syscall.h>
+  #include <unistd.h>
+  #include <climits>
+#elif defined(_WIN32)
+  #include <windows.h>
+  #pragma comment(lib, "Synchronization.lib")
+#endif
+
+namespace ncolor_threadpool_detail {
+
+// Sleep until the value at *addr is no longer equal to ``expected``.
+// Spurious wake-ups are allowed; the caller must re-check the value.
+inline void wait_on_value(int* addr, int expected) {
+#if defined(__APPLE__)
+    __ulock_wait(FORKJOIN_UL_COMPARE_AND_WAIT,
+                  reinterpret_cast<void*>(addr),
+                  static_cast<uint64_t>(static_cast<uint32_t>(expected)),
+                  /*timeout_us=*/0);
+#elif defined(__linux__)
+    ::syscall(SYS_futex, reinterpret_cast<int*>(addr),
+              FUTEX_WAIT_PRIVATE, expected, nullptr, nullptr, 0);
+#elif defined(_WIN32)
+    int local_expected = expected;
+    WaitOnAddress(reinterpret_cast<volatile void*>(addr),
+                   &local_expected, sizeof(int), INFINITE);
+#else
+    // Fallback: tight spin (shouldn't happen on any supported platform).
+    while (*reinterpret_cast<volatile int*>(addr) == expected) {}
+#endif
+}
+
+// Wake every waiter on this address.
+inline void wake_all(int* addr) {
+#if defined(__APPLE__)
+    __ulock_wake(FORKJOIN_UL_COMPARE_AND_WAIT | FORKJOIN_ULF_WAKE_ALL,
+                  reinterpret_cast<void*>(addr), 0);
+#elif defined(__linux__)
+    ::syscall(SYS_futex, reinterpret_cast<int*>(addr),
+              FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+#elif defined(_WIN32)
+    WakeByAddressAll(reinterpret_cast<volatile void*>(addr));
+#endif
+}
+
+}  // namespace ncolor_threadpool_detail
 
 // Cross-platform spin-pause hint
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -50,29 +111,13 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
   #define FORKJOIN_PAUSE() ((void)0)
 #endif
 
-// How many CPU pauses to spin before falling back to the platform
-// idle path. ~10 ns/pause on Apple Silicon, ~30 ns on x86_64 --
-// long enough to cover tight back-to-back fork-join cycles, short
-// enough that an idle pool quickly hands off to the OS scheduler.
+// How many CPU pauses to spin before falling back to the kernel
+// wait-on-address. ~10 ns/pause on Apple Silicon, ~30 ns on x86_64 --
+// long enough to cover tight back-to-back fork-join cycles within
+// microseconds, short enough that genuinely idle pools fall through
+// to the kernel wait (which costs ~0%% CPU once parked).
 #ifndef FORKJOIN_SPIN_PAUSES
 #define FORKJOIN_SPIN_PAUSES 8192
-#endif
-
-#if defined(__APPLE__)
-// macOS-only: sleep granularity once the spin window expires. 5 ms
-// keeps idle 19-worker pools at < 1 %% total CPU. nanosleep below
-// ~500 us degrades into a kernel busy-wait on macOS, so 5 ms is the
-// practical floor.
-#ifndef FORKJOIN_SLEEP_US
-#define FORKJOIN_SLEEP_US 5000
-#endif
-#else
-// Linux/Windows: yield is cheap, so we use the pre-patch interspersed
-// spin + yield loop (unbounded, exits as soon as sense flips).
-// FORKJOIN_INNER_SPIN sets pauses-per-yield in that loop.
-#ifndef FORKJOIN_INNER_SPIN
-#define FORKJOIN_INNER_SPIN 1024
-#endif
 #endif
 
 class ForkJoinPool {
@@ -127,17 +172,24 @@ private:
         }
     }
 
-    // Sense-reversing centralized barrier with platform-scoped idle path.
-    // Spin window is cross-platform; the post-spin idle behavior differs
-    // because Linux/macOS scheduler costs for ``yield`` differ by ~100x.
+    // Sense-reversing centralized barrier with kernel wait-on-address
+    // idle path. Spin covers tight back-to-back fork-join cycles; once
+    // the spin window expires, workers park in the kernel until the
+    // last participant arrives and calls wake_all.
     void barrier_wait_() {
         const int local_sense = 1 - bar_sense_.load(std::memory_order_relaxed);
         const size_t arrived = bar_count_.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (arrived == num_participants_) {
-            // Last to arrive: reset count and flip sense to release everyone.
+            // Last to arrive: reset count, flip sense, wake any sleepers.
+            // wake_all is cheap when no one is waiting (just a syscall
+            // that returns immediately); cheap enough to call
+            // unconditionally rather than tracking a "someone is parked"
+            // flag.
             bar_count_.store(0, std::memory_order_relaxed);
             bar_sense_.store(local_sense, std::memory_order_release);
+            ncolor_threadpool_detail::wake_all(
+                reinterpret_cast<int*>(&bar_sense_));
             return;
         }
 
@@ -149,34 +201,19 @@ private:
             FORKJOIN_PAUSE();
         }
 
-#if defined(__APPLE__)
-        // macOS: sleep. ``yield`` here caused a ``swtch_pri`` storm
-        // (~1700-1800 %% CPU across 19 idle workers); sleep avoids it.
-        // Wake-up after a true idle period costs up to one
-        // FORKJOIN_SLEEP_US interval (~5 ms); the spin window above
-        // covers warm/tight back-to-back cycles before any sleep happens.
+        // Phase 2: park in the kernel until the sense flips. Spurious
+        // wake-ups are possible (wait returns "earlier than expected"
+        // is documented behavior on every platform), so re-check in a
+        // loop. The wait primitive does its own compare-then-park
+        // atomically, so it's race-free: if the sense already flipped
+        // after the spin loop, wait returns immediately (EAGAIN /
+        // ERROR_TIMEOUT-equivalent), and we exit on the next load.
         while (bar_sense_.load(std::memory_order_acquire) != local_sense) {
-            std::this_thread::sleep_for(std::chrono::microseconds(FORKJOIN_SLEEP_US));
+            // Wait while sense is still the OLD value (1 - local_sense).
+            ncolor_threadpool_detail::wait_on_value(
+                reinterpret_cast<int*>(&bar_sense_),
+                1 - local_sense);
         }
-#else
-        // Linux/Windows: interspersed spin + yield (matches pre-patch
-        // behavior). ``sched_yield`` is cheap on Linux (~1 us syscall,
-        // no swtch_pri equivalent), so unbounded yielding is fine --
-        // idle pools tick at low CPU and a warm pool wakes in ~us.
-        // Sleep-based or cv-based fallbacks both regress real workloads
-        // (sleep: 50-200 %% on nd_profile p=8/16/32; cv: 20-35 %% same)
-        // because their fixed per-wait overhead is large relative to
-        // small ``parallel()`` calls.
-        while (bar_sense_.load(std::memory_order_acquire) != local_sense) {
-            for (int i = 0; i < FORKJOIN_INNER_SPIN; ++i) {
-                if (bar_sense_.load(std::memory_order_acquire) == local_sense) {
-                    return;
-                }
-                FORKJOIN_PAUSE();
-            }
-            std::this_thread::yield();
-        }
-#endif
     }
 
     const size_t num_participants_;  // workers + 1 (main thread)
