@@ -1,5 +1,5 @@
 """Coverage for ncolor public-API combinatorics: return_n / return_lut /
-return_conflicts flag combos, get_lut, and 2D / expand toggles.
+return_conflicts flag combos and 2D / expand toggles.
 
 Companion to tests/test_ncolor_3d.py (3D smoke) and test_files/test_ncolor.py
 (parametrized mask-kind coverage)."""
@@ -103,11 +103,13 @@ def test_label_return_conflicts_only():
     assert out.shape == arr.shape
 
 
-def test_get_lut_matches_label_lut():
-    arr = _adjacent_strips()
-    lut_a = ncolor.get_lut(arr, expand=False)
-    lut_b = ncolor.label(arr, expand=False, return_lut=True)
-    np.testing.assert_array_equal(lut_a, lut_b)
+def test_get_lut_removed_from_public_api():
+    """``get_lut`` was a 1.x convenience that fell out of sync with
+    ``label()``'s defaults (it shipped 2.0-pre with stale ``conn=2``
+    and no ``p`` kwarg, producing different LUTs than
+    ``label(..., return_lut=True)``). Dropped in 2.0; use
+    ``label(..., return_lut=True)`` directly."""
+    assert not hasattr(ncolor, "get_lut")
 
 
 def test_label_single_component_uses_one_color():
@@ -263,16 +265,23 @@ def test_label_connect_radius(r):
     _assert_valid_coloring(out, m)
 
 
-@pytest.mark.parametrize("expand_mode", ["voronoi", "spur_free"])
-def test_label_expand_mode(expand_mode):
-    """Non-default expand modes (voronoi / spur_free) should still 4-color
-    the dense circles input. bridge_free is the default and is exercised
-    by every other test in this file."""
+def test_label_expand_mode_voronoi():
+    """Non-default expand mode 'voronoi' should still 4-color the dense
+    circles input. bridge_free is the default and is exercised by every
+    other test in this file."""
     m = _circles_2d_dense()
-    out, n_used = ncolor.label(m, expand_mode=expand_mode, return_n=True)
+    out, n_used = ncolor.label(m, expand_mode="voronoi", return_n=True)
     assert 1 <= int(n_used) <= 4
-    # spur_free leaves border bg unfilled by design; voronoi fills it.
-    # Either way, the coloring on the original fg pixels should be valid.
+
+
+def test_label_expand_mode_invalid():
+    """Unknown expand_mode raises ValueError. 'spur_free' was removed in
+    2.0; verify the legacy name now errors instead of silently routing."""
+    m = _circles_2d_dense()
+    with pytest.raises(Exception):
+        ncolor.label(m, expand_mode="spur_free")
+    with pytest.raises(Exception):
+        ncolor.label(m, expand_mode="bogus_mode")
 
 
 def test_label_extra_edges_constrains_pair():
@@ -300,14 +309,41 @@ def test_label_weight_objective_modes(mode):
     _assert_valid_coloring(out, m)
 
 
-def test_label_optimize_two_hop():
-    """optimize='two_hop' post-processes the BFS coloring via a 2-hop
-    SA optimizer. Exercises ncolor._optimize.optimize_two_hop."""
+def test_label_user_de_table():
+    """User-supplied de_table must not segfault. Regression for a bug
+    where py::array_t::ensure() was called inside the GIL-released
+    block; now parsed pre-release like extra_edges / soft_extra_edges.
+
+    Verifies:
+      - user-supplied palette matching the built-in viridis values
+        produces the same coloring as the default de_table path;
+      - a different user palette produces a different coloring (i.e.
+        the override is actually consumed by the picker);
+      - de_table is silently ignored when weight_objective=0.
+    """
     m = _circles_2d_dense()
-    out, conflicts = ncolor.label(m, optimize="two_hop",
-                                  return_conflicts=True)
-    assert conflicts == 0
-    _assert_valid_coloring(out, m)
+    viridis = np.array([
+        [0.0,    0.0,   0.0,   0.0,   0.0],
+        [0.0,    0.0,  52.0, 104.74, 133.36],
+        [0.0,   52.0,   0.0,  56.28, 100.98],
+        [0.0,  104.74, 56.28,  0.0,  62.58],
+        [0.0,  133.36,100.98, 62.58,  0.0],
+    ], dtype=np.float64)
+    out_user_viridis = ncolor.label(m, weight_objective=1, de_table=viridis)
+    out_default = ncolor.label(m, weight_objective=1)
+    assert np.array_equal(out_user_viridis, out_default)
+
+    # Different palette -> different coloring.
+    alt = np.full((5, 5), 0.5, dtype=np.float64)
+    np.fill_diagonal(alt, 0.0)
+    out_alt = ncolor.label(m, weight_objective=1, de_table=alt)
+    assert not np.array_equal(out_alt, out_default)
+
+    # de_table is silently ignored when weight_objective=0 (no contrast
+    # objective active).
+    out_ignored = ncolor.label(m, de_table=alt)
+    out_plain = ncolor.label(m)
+    assert np.array_equal(out_ignored, out_plain)
 
 
 # ----------------------------------------------------------------------
@@ -361,25 +397,8 @@ def test_delete_spurs_rejects_unknown_kind():
 
 
 # ----------------------------------------------------------------------
-# expand_labels mode kwarg: voronoi vs spur_free
+# expand_labels mode kwarg: voronoi vs bridge_free
 # ----------------------------------------------------------------------
-
-
-def test_expand_labels_spur_free_mode():
-    """mode='spur_free' runs the BFS dilation path. Output is a label
-    image of the same shape with seeds preserved. Growth requires a
-    bg pixel to have ≥ threshold+1 = 2 face-neighbors of the same
-    label, which happens naturally in concave geometry / dense packings
-    but NOT along a single flat seed boundary (each bg pixel sees only
-    one seed face there). _circles_2d_dense gives the right geometry."""
-    m = _circles_2d_dense()
-    out = ncolor.expand_labels(m, mode="spur_free", max_rounds=3)
-    assert out.shape == m.shape
-    # Original seeds preserved.
-    fg = m > 0
-    assert np.array_equal(out[fg], m[fg])
-    # Some bg got claimed (BFS dilated into concavities).
-    assert (out[m == 0] != 0).any()
 
 
 def test_expand_labels_rejects_unknown_mode():
@@ -387,6 +406,8 @@ def test_expand_labels_rejects_unknown_mode():
     arr[2:4, 2:4] = 1
     with pytest.raises(ValueError, match="mode must be"):
         ncolor.expand_labels(arr, mode="chamfer")
+    with pytest.raises(ValueError, match="mode must be"):
+        ncolor.expand_labels(arr, mode="spur_free")
 
 
 def test_expand_labels_voronoi_default_unchanged():

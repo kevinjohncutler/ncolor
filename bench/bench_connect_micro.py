@@ -53,7 +53,7 @@ shapes = [
 ]
 
 # Fully expand first so connect operates on a dense (no zeros) image.
-expanded = [(name, ncolor.label(m, p=1, expand=True, balance=True)) for name, m in shapes]
+expanded = [(name, ncolor.label(m, p=1, expand=True)) for name, m in shapes]
 
 print(f"{'shape':<14} {'connect best':>14} {'med':>8} {'stdev':>8}")
 for name, m in expanded:

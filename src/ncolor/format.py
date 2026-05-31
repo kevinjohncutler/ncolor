@@ -20,7 +20,9 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
 
     ``clean=True`` splits disjoint components per label and drops
     components below ``min_area``. ``despur=True`` additionally runs
-    :func:`delete_spurs` on each label's mask before splitting.
+    :func:`delete_spurs_labels` (label-aware C++ despur kernel) as a
+    pre-pass to remove spur pixels and 1-voxel-thick interior bridges
+    before component splitting.
 
     ``ignore=True`` keeps ``0`` as an "ignore" marker and treats ``1``
     as background (the input min-shift is skipped).
@@ -58,7 +60,7 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
     labels = labels.astype('uint32')
 
     if clean:
-        from .color import connected_components, regionprops as _regionprops
+        from .color import regionprops as _regionprops
         from ._backend import _impl as _b
 
         ndim = labels.ndim
@@ -69,70 +71,24 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                      else labels.astype(np.int32, copy=False)
         nmax = int(labels.max()) if labels.size else 0
 
-        if despur:
-            # Fast label-aware pre-pass: wipe spurs AND 1-voxel-thick
-            # straight interior pixels (axis-aligned + 2D diagonals)
-            # in a single mark-and-apply over the whole image. Catches
-            # 1-px inter-cell bridges that the per-label binary despur
-            # below would otherwise eat one ring at a time. The result
-            # is bit-equivalent to running the per-label loop to
-            # convergence, just produced in one pass.
-            if nmax > 0:
-                labels_i32_pre, _n_pre = _b.delete_spurs_labels(
-                    np.ascontiguousarray(labels_i32),
-                    threshold=1, max_iters=20, remove_thin=True)
-                labels_i32 = labels_i32_pre
-                labels = labels_i32.view(np.uint32) \
-                    if labels_i32.dtype == np.int32 \
-                    else labels_i32.astype(np.uint32, copy=False)
-                nmax = int(labels.max()) if labels.size else 0
-            # delete_spurs mutates the per-label mask between rounds, so
-            # the despur path stays per-label (bbox-cropped).
-            global_props = _regionprops(np.ascontiguousarray(labels_i32), nmax) if nmax > 0 else None
-            bbox_min_all = global_props['bbox_min'] if global_props else None
-            bbox_max_all = global_props['bbox_max'] if global_props else None
-            areas_all    = global_props['area']     if global_props else None
-            cur_max = nmax
-            for j in range(1, nmax + 1):
-                if areas_all[j - 1] == 0:
-                    continue
-                bb_lo = bbox_min_all[j - 1]; bb_hi = bbox_max_all[j - 1]
-                slc = tuple(slice(int(bb_lo[d]), int(bb_hi[d])) for d in range(ndim))
-                crop_view = labels[slc]
-                mask = (crop_view == j)
-                crop_view[mask] = 0
-                mask = delete_spurs(mask)
-                crop_view[mask] = j
+        if despur and nmax > 0:
+            # Label-aware despur pre-pass in C++ (delete_spurs_labels).
+            # Wipes spurs AND 1-voxel-thick straight interior pixels
+            # (axis-aligned + 2D diagonals) in a single mark-and-apply
+            # over the whole image, catching 1-px inter-cell bridges.
+            # Falls through to the cc_label_per_label branch below,
+            # which handles disjoint-component splitting and area
+            # filtering with the same numpy-vectorized logic.
+            labels_i32_pre, _n_pre = _b.delete_spurs_labels(
+                np.ascontiguousarray(labels_i32),
+                threshold=1, max_iters=20, remove_thin=True)
+            labels_i32 = labels_i32_pre
+            labels = labels_i32.view(np.uint32) \
+                if labels_i32.dtype == np.int32 \
+                else labels_i32.astype(np.uint32, copy=False)
+            nmax = int(labels.max()) if labels.size else 0
 
-                lbl, n_comp = connected_components(mask.astype(np.uint8), conn=ndim)
-                if n_comp == 0:
-                    continue
-                sub = _regionprops(lbl, n_comp)
-                sub_areas = sub['area']; sub_bb_lo = sub['bbox_min']; sub_bb_hi = sub['bbox_max']
-                order = np.argsort(-sub_areas, kind='stable')
-                if n_comp > 1 and verbose:
-                    print('Warning - found mask with disjoint label.')
-                for rank, comp_idx in enumerate(order):
-                    comp_id = int(comp_idx) + 1
-                    area = int(sub_areas[comp_idx])
-                    cb_lo = sub_bb_lo[comp_idx]; cb_hi = sub_bb_hi[comp_idx]
-                    sub_slc = tuple(slice(int(cb_lo[d]), int(cb_hi[d])) for d in range(ndim))
-                    local = np.argwhere(lbl[sub_slc] == comp_id)
-                    offset = bb_lo + cb_lo
-                    global_t = tuple((local + offset).T)
-                    if rank == 0:
-                        if area <= min_area:
-                            labels[global_t] = background
-                            if verbose:
-                                print('Warning - found mask area less than', min_area)
-                                print('Removing it.')
-                    else:
-                        if area < min_area:
-                            labels[global_t] = background
-                        else:
-                            cur_max += 1
-                            labels[global_t] = cur_max
-        elif nmax > 0:
+        if nmax > 0:
             # One label-aware CCL pass yields every component of every
             # input label, plus the source label of each component.
             comp_labels, n_total, source_per_comp = _b.cc_label_per_label(

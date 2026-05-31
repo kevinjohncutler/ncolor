@@ -1,4 +1,4 @@
-"""Invariants every ncolor.label output must satisfy, for any input/p/balance.
+"""Invariants every ncolor.label output must satisfy, for any input/p.
 
 This test exists because we once had a debate about whether two visually-
 adjacent yellow cells in a viridis-rendered figure were a real coloring
@@ -63,24 +63,22 @@ def _make_packed_circles(size: int, n: int, seed: int) -> np.ndarray:
 
 
 @pytest.mark.parametrize("p", [1, 2])
-@pytest.mark.parametrize("balance", [True, False])
 @pytest.mark.parametrize("seed", range(8))
-def test_no_adjacent_same_color(p, balance, seed):
-    """For every (p, balance, image-seed), ncolor.label must produce a
+def test_no_adjacent_same_color(p, seed):
+    """For every (p, image-seed), ncolor.label must produce a
     coloring with zero adjacent same-color cell pairs in the unexpanded
     input mask. This is the ground-truth correctness invariant."""
     img = _make_packed_circles(256, 60, seed)
-    out = ncolor.label(img, p=p, balance=balance, expand=True)
+    out = ncolor.label(img, p=p, expand=True)
     bad = _adj_same_color_pairs(img, out)
     assert bad == 0, (
-        f"ncolor.label(p={p}, balance={balance}, seed={seed}) produced "
+        f"ncolor.label(p={p}, seed={seed}) produced "
         f"{bad} adjacent same-color pixel-pairs — coloring is invalid."
     )
 
 
 @pytest.mark.parametrize("p", [1, 2])
-@pytest.mark.parametrize("balance", [True, False])
-def test_no_adjacent_same_color_under_label_permutation(p, balance):
+def test_no_adjacent_same_color_under_label_permutation(p):
     """Permuting the input label IDs must preserve the no-conflict
     invariant. The graph topology is identical, only node IDs change —
     the algorithm should still find a valid coloring."""
@@ -92,10 +90,10 @@ def test_no_adjacent_same_color_under_label_permutation(p, balance):
         lut = np.zeros(n_cells + 1, dtype=base.dtype)
         lut[1:] = perm
         permuted = lut[base]
-        out = ncolor.label(permuted, p=p, balance=balance, expand=True)
+        out = ncolor.label(permuted, p=p, expand=True)
         bad = _adj_same_color_pairs(permuted, out)
         assert bad == 0, (
-            f"ncolor.label(p={p}, balance={balance}) on permuted labels "
+            f"ncolor.label(p={p}) on permuted labels "
             f"(perm_seed={perm_seed}) produced {bad} adjacent same-color "
             f"pixel-pairs."
         )

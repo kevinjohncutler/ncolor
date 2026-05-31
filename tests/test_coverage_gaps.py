@@ -3,7 +3,7 @@ end-to-end coverage in the other test modules — chiefly format_labels'
 ``clean`` / ``despur`` paths, the dtype-downcast picker, _smt's
 calibration + cache plumbing, the _backend extension loader's
 network-mount fallback, and the small helpers in expand / color /
-_optimize / the package __init__.
+the package __init__.
 """
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def test_expand_labels_empty_or_all_zero_short_circuits():
 
 @pytest.mark.parametrize("alias,wobj_int",
                           [("max", 1), ("MIN", -1), ("off", 0),
-                           ("sharp", 1), ("soft", -1), ("balance", 0),
+                           ("sharp", 1), ("soft", -1),
                            ("not-a-mode", 0)])
 def test_label_weight_objective_str_alias(alias, wobj_int):
     """String aliases for weight_objective map to the int values; the
@@ -144,22 +144,6 @@ def test_label_check_conflicts_passes_silently():
     m[1:3, 1:3] = 1
     out = ncolor.label(m, check_conflicts=True)
     assert out.shape == m.shape
-
-
-def test_label_unknown_optimize_mode_raises():
-    m = np.zeros((8, 8), dtype=np.int32)
-    m[1:3, 1:3] = 1
-    with pytest.raises(ValueError, match="unknown optimize mode"):
-        ncolor.label(m, optimize="not-a-mode")
-
-
-def test_label_optimize_empty_lut_returns_unchanged():
-    """If the picker emits an empty LUT (degenerate input), the optimize
-    path returns ``out`` without touching it."""
-    m = np.zeros((4, 4), dtype=np.int32)  # all bg → trivial output
-    out = ncolor.label(m, optimize="two_hop")
-    assert out.shape == m.shape
-    assert (out == 0).all()
 
 
 # ----------------------------------------------------------------------
@@ -302,52 +286,6 @@ def test_delete_spurs_total_mode_and_threshold():
     out = delete_spurs(m, mode="total", threshold=2, max_iter=1,
                        hole_threshold=0)
     assert out.shape == m.shape
-
-
-# ----------------------------------------------------------------------
-# ncolor/_optimize.py — small branches
-# ----------------------------------------------------------------------
-
-
-def test_optimize_two_hop_diagnostic_loss():
-    """``two_hop_loss`` is the standalone diagnostic counterpart."""
-    from ncolor._optimize import two_hop_loss, build_adjacency_from_label
-    m = np.zeros((16, 16), dtype=np.int32)
-    m[2:5, 2:5] = 1
-    m[2:5, 8:11] = 2
-    m[10:13, 5:8] = 3
-    adj, N, _ = build_adjacency_from_label(m, p=1, conn=2)
-    # Build a trivial LUT with everyone the same color — must have ≥0
-    # 2-hop violations.
-    lut = [0] + [1] * N
-    loss = two_hop_loss(lut, adj, N)
-    assert loss >= 0
-
-
-def test_optimize_two_hop_no_pairs_short_circuits():
-    """If the 2-hop pair set is empty the optimizer returns the input
-    LUT and loss 0 without iterating."""
-    from ncolor._optimize import optimize_two_hop
-    # Single isolated cell: no neighbors → no 2-hop pairs.
-    adj = {1: set()}
-    lut, loss = optimize_two_hop([0, 1], adj, N=1, n_iters=100)
-    assert loss == 0
-    assert lut == [0, 1]
-
-
-def test_optimize_two_hop_ignores_bg_label_slot():
-    """Label slot 0 (lut[0] == 0) must be skipped — exercises the
-    ``cu == 0`` branch in the Kempe-swap loop."""
-    from ncolor._optimize import optimize_two_hop
-    # Build a tiny path of 3 cells. lut[0] is bg.
-    adj = {1: {2}, 2: {1, 3}, 3: {2}}
-    lut_in = [0, 1, 2, 1]  # valid 2-coloring
-    lut_out, loss = optimize_two_hop(lut_in, adj, N=3,
-                                      n_iters=200, rng_seed=0)
-    # The 2-hop pair {1, 3} share color 1 → loss == 1 initially.
-    # Optimizer may or may not improve at 3 cells; just check return.
-    assert lut_out[0] == 0
-    assert loss >= 0
 
 
 # ----------------------------------------------------------------------
@@ -562,17 +500,6 @@ def test_label_return_conflicts_only_branch():
     assert out.shape == m.shape
 
 
-def test_label_optimize_two_hop_expand_false():
-    """``optimize='two_hop'`` with ``expand=False`` exercises the
-    non-expand branch (LUT applied directly to lab_arr)."""
-    m = np.zeros((16, 16), dtype=np.int32)
-    m[2:6, 2:6] = 1
-    m[8:12, 8:12] = 2
-    out = ncolor.label(m, expand=False, optimize="two_hop")
-    assert out.shape == m.shape
-    assert (out[m == 0] == 0).all()
-
-
 # ----------------------------------------------------------------------
 # format.py — clean/despur deeper branches.
 # ----------------------------------------------------------------------
@@ -623,23 +550,6 @@ def test_format_labels_clean_non_despur_secondary_dropped_silently():
     out = format_labels(arr, clean=True, min_area=4)
     unique = sorted(int(v) for v in np.unique(out) if v != 0)
     assert unique == [1]
-
-
-# ----------------------------------------------------------------------
-# _optimize.py — Kempe-swap micro-branches.
-# ----------------------------------------------------------------------
-
-
-def test_kempe_component_returns_empty_for_off_palette_seed():
-    """``_kempe_component`` returns the empty set when the seed's
-    color isn't in the (c1, c2) pair. Hits the early-return branch."""
-    from ncolor._optimize import _kempe_component
-    # Seed=1 has color 3; asking for the (1, 2) swap from this seed →
-    # empty component.
-    lut = [0, 3, 1, 2]
-    adj = {1: {2}, 2: {1, 3}, 3: {2}}
-    comp = _kempe_component(lut, adj, seed=1, c1=1, c2=2)
-    assert comp == set()
 
 
 # ----------------------------------------------------------------------
@@ -991,21 +901,6 @@ def test_maybe_calibrate_skips_when_numpy_missing(monkeypatch):
             sys.modules["numpy"] = saved_numpy
         else:
             sys.modules.pop("numpy", None)
-
-
-def test_optimize_two_hop_skips_zero_label_slot():
-    """In the SA loop, if the randomly-picked vertex u has ``lut[u] == 0``
-    the iteration continues without attempting a Kempe swap. Force that
-    by seeding most slots to 0 and verify the optimizer still terminates."""
-    from ncolor._optimize import optimize_two_hop
-    # 5 cells, only two have non-zero colors.
-    adj = {i: set() for i in range(1, 6)}
-    adj[1] = {2}; adj[2] = {1, 3}; adj[3] = {2, 4}; adj[4] = {3, 5}; adj[5] = {4}
-    lut_in = [0, 1, 0, 0, 0, 2]
-    lut_out, loss = optimize_two_hop(lut_in, adj, N=5,
-                                      n_iters=500, rng_seed=1)
-    assert lut_out[0] == 0
-    assert loss >= 0
 
 
 def test_format_labels_clean_despur_disjoint_verbose(capsys):

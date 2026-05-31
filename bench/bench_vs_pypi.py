@@ -56,10 +56,12 @@ def load_mm():
 
 
 def time_local(lab, n, reps=12, warmup=4):
-    """Local HEAD: conn=1 + p=2 (L2 / Felzenszwalb) — the path the
-    soft/bridge_free stack was designed around. p=1 (Manhattan, current
-    default) leaves K_5 obstructions on mm-class data; p=2 places
-    Voronoi boundaries to avoid them. Default auto-soft + bridge_free."""
+    """Local HEAD: bare defaults (conn=1, p=2 L2/Felzenszwalb + bridge_free
+    expand + auto-soft). conn=1, p=2 are the 2.0 defaults and the path the
+    soft/bridge_free stack was designed around — L2 places Voronoi
+    boundaries that avoid K_5 obstructions on mm-class data. conn=1 and
+    p=2 are passed explicitly here for documentation; they match the
+    function defaults."""
     for _ in range(warmup):
         ncolor_local.label(lab, n=n, conn=1, p=2)
     ts = []

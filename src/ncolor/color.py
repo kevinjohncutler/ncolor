@@ -21,12 +21,12 @@ def _get_solver():
     return _SOLVER
 
 
-def label(lab, n=4, conn=2, max_depth=30, expand=True,
+def label(lab, n=4, conn=1, max_depth=30, expand=True,
           return_n=False, return_lut=False, verbose=False,
           check_conflicts=False, return_conflicts=False, format_input=True,
-          out=None, p=1, wrap=False, balance=True, first_seen=False,
+          out=None, p=2, wrap=False, first_seen=False,
           weight_objective=0, de_table=None, weight_mode="min",
-          optimize=None, extra_edges=None, connect_radius=1,
+          extra_edges=None, connect_radius=1,
           min_contact=1, expand_mode="bridge_free",
           soft_extra_edges=None, soft_conn=2, soft_radius=2,
           clean_mask=False):
@@ -37,10 +37,11 @@ def label(lab, n=4, conn=2, max_depth=30, expand=True,
     different colors. Background (``lab == 0``) stays 0.
 
     Default behavior (call with no kwargs beyond ``lab``):
-        4-color, 8-connectivity, ``bridge_free`` Voronoi expand with
-        L1 metric, Welsh-Powell balanced picker, auto-soft constraints
-        at ``conn=2 r=2``, and output that preserves the input fg/bg
-        pattern exactly.
+        4-color, 4-connectivity (face-only), ``bridge_free`` Voronoi
+        expand with L2 metric, auto-soft constraint post-pass at
+        ``conn=2 r=2``, and output that preserves the input fg/bg
+        pattern exactly. These defaults match ncolor 1.x and reliably
+        4-color the reference logo / synth / mm fixtures.
 
     Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
     across calls.
@@ -70,16 +71,14 @@ def label(lab, n=4, conn=2, max_depth=30, expand=True,
         "voronoi" — plain Lp Voronoi sweep without bridge/despur
             cleanup. Faster but graphs may contain K_5 obstructions
             at thin-cell convergences.
-        "spur_free" — BFS dilation with connectivity check. Naturally
-            avoids creating starfish-shaped convergence pixels but
-            leaves the image border bg unfilled and is slower for
-            small/medium inputs.
 
     ``p`` selects the Voronoi expand metric:
-        p=1: Saito-Toriwaki separable sweep (Manhattan; default)
-        p=2: Felzenszwalb parabolic envelope (Euclidean²)
-    L1 is faster and produces a different (but equally valid) coloring
-    at boundary tie-break regions; both satisfy the 4-coloring constraint.
+        p=1: Saito-Toriwaki separable sweep (Manhattan)
+        p=2: Felzenszwalb parabolic envelope (Euclidean²; default)
+    L2 places Voronoi boundaries that avoid K_5 obstructions on
+    dense-cell data (e.g. microscopy segmentations); L1 is ~1.5× faster
+    on the envelope step but can leave thin-cell convergences that
+    force n=5. Both produce valid colorings.
 
     ``min_contact`` filters edges in the hard graph by their boundary
     pixel-pair count. When ``connect_radius>1``, r=2-only edges (1-pixel
@@ -128,17 +127,10 @@ def label(lab, n=4, conn=2, max_depth=30, expand=True,
     ``wrap=True`` treats the image as a torus: opposite edges are
     treated as adjacent. Useful when the cells of interest are crammed
     near the image borders (tight crops); the wrap-around adjacency
-    adds constraint pressure on perimeter cells and tightens the color
-    distribution. For interior-clustered inputs it can *worsen* balance
-    by over-constraining the graph, and for non-periodic data it bakes
-    in a false adjacency. Runtime cost: ~5-15% extra in 2D, ~15-35%
-    in 3D.
-
-    ``balance=True`` uses the Welsh-Powell heuristic: cells are
-    visited in descending-degree order so the most-constrained cells
-    get colored first. Spreads color usage more evenly than the
-    default label-ID order at ~zero runtime cost. Recommended with
-    p=1, where BFS would otherwise concentrate color 4 unevenly.
+    adds constraint pressure on perimeter cells. For interior-clustered
+    inputs it can over-constrain the graph, and for non-periodic data
+    it bakes in a false adjacency. Runtime cost: ~5-15% extra in 2D,
+    ~15-35% in 3D.
 
     ``first_seen=True`` numbers cells in raster-scan first-encounter
     order (matching ``fastremap.renumber`` from the pre-cpp pipeline)
@@ -151,9 +143,9 @@ def label(lab, n=4, conn=2, max_depth=30, expand=True,
     The BFS uses Σ_v w(u,v) × ΔE(c, color(v)) as a soft objective and
     picks colors that maximize or minimize this score.
 
-      0 / "off" / "balance"  (default) → ignore weights, behave as before
-      +1 / "max" / "sharp"             → maximize Σ w × ΔE on heavy edges
-      -1 / "min" / "soft"              → minimize Σ w × ΔE
+      0 / "off"            (default) → ignore weights, behave as before
+      +1 / "max" / "sharp"           → maximize Σ w × ΔE on heavy edges
+      -1 / "min" / "soft"            → minimize Σ w × ΔE
 
     ``weight_mode`` selects the per-pair reducer that defines w. All
     reducers operate on (d_i + d_j) at boundary pixels, where d is the
@@ -180,39 +172,8 @@ def label(lab, n=4, conn=2, max_depth=30, expand=True,
                            penalized; per-pixel inverse-distance only.
 
     ``de_table`` lets you override the default viridis-ΔE palette table;
-    pass an ``(n+1) × (n+1)`` float array. Requires ``balance=True``.
+    pass an ``(n+1) × (n+1)`` float array.
 
-    ``optimize`` enables a post-greedy GLOBAL optimization of the color
-    LUT. The greedy WP picker commits cell-by-cell and can leave local
-    minima (e.g. a ring whose cells use only 3 of 4 colors even though
-    a 4-color assignment exists). The optimizer sees the whole graph
-    and finds a near-optimum under a label-equivariant loss — no
-    colormap / ΔE information enters.
-
-      None (default)   no optimization; pure greedy output
-      "two_hop"        Simulated annealing minimizing same-color
-                       2-hop pairs (cells at graph-distance 2). All
-                       moves are Kempe swaps, so the result is always
-                       a valid 4-coloring. Runtime ≈ tens of ms to a
-                       few seconds for hundreds of cells; pure Python,
-                       slows on very large graphs.
-
-    ⚠ When to use ``optimize="two_hop"``: irregular inputs (real cell
-    segmentations, blob fields). It improves "all 4 colors used
-    uniformly" without hurting validity.
-
-    ⚠ When NOT to use it: regular tilings (square grids, hex grids).
-    The 2-hop objective penalizes the tight 2-period tile that those
-    inputs naturally produce — same color repeats every 2 cells along
-    each row, which IS the visually uniform tiling but registers as
-    many 2-hop violations. ``optimize="two_hop"`` will trade that for
-    a 4-cycle-per-row that uses all 4 colors but breaks the 2-period
-    pattern. Stick with the default greedy for those inputs.
-
-    Symmetric synthetic inputs (e.g. radial spokes) are an in-between
-    case: the rasterisation breaks the geometric symmetry, so neither
-    mode produces fully symmetric output. ``optimize="two_hop"`` at
-    least guarantees all 4 colors appear wherever the graph allows.
     """
     lab_arr = np.asarray(lab)
     solver = _get_solver()
@@ -221,7 +182,7 @@ def label(lab, n=4, conn=2, max_depth=30, expand=True,
     if isinstance(weight_objective, str):
         wobj = {"max": 1, "max_contrast": 1, "sharp": 1,
                 "min": -1, "min_contrast": -1, "soft": -1,
-                "off": 0, "balance": 0, "none": 0,
+                "off": 0, "none": 0,
                 }.get(weight_objective.lower(), 0)
     else:
         wobj = int(weight_objective)
@@ -258,7 +219,7 @@ def label(lab, n=4, conn=2, max_depth=30, expand=True,
         n_colors=int(n), max_depth=int(max_depth),
         conn=int(conn), p=int(p), format_input=bool(format_input),
         expand=bool(expand), out=out, wrap=bool(wrap),
-        balance=bool(balance), first_seen=bool(first_seen),
+        first_seen=bool(first_seen),
         weight_objective=wobj, de_table=de_arr,
         weight_mode=wmode_int, extra_edges=extra_arr,
         connect_radius=int(connect_radius),
@@ -286,46 +247,6 @@ def label(lab, n=4, conn=2, max_depth=30, expand=True,
                 f"  sv={int(sv)}  total={total:.1f} ms")
         breakdown = "  ".join(f"{name}={ms:.1f}" for name, ms in stages)
         _sys.stderr.write(head + "\n               " + breakdown + "\n")
-
-    if optimize is not None:
-        opt_kind = str(optimize).lower()
-        if opt_kind in ("two_hop", "twohop", "2hop", "2-hop"):
-            from ._optimize import optimize_two_hop, build_adjacency_from_label
-            # Recover the per-label LUT used by the greedy picker: the
-            # value at any pixel with label L is color LUT[L]. The
-            # input ``lab_arr`` may have non-contiguous labels (compacted
-            # by format_input=True inside the solver); reconstruct the
-            # LUT from ``solver.get_last_lut`` when available.
-            lut = solver.get_last_lut()
-            if lut is None or len(lut) == 0:
-                return out  # nothing to optimize
-            # Build the same adjacency graph the picker used.
-            adj, N, _ = build_adjacency_from_label(lab_arr, p=int(p),
-                                                    conn=int(conn))
-            new_lut, _ = optimize_two_hop(list(lut), adj, N,
-                                           n_colors=int(n_used) if n_used else int(n))
-            # Apply optimized LUT back to the output image.
-            lut_arr = np.array(new_lut, dtype=out.dtype)
-            # ``out`` was produced via the same LUT indexing pipeline,
-            # so we need to remap based on label positions. Rebuild
-            # ``out`` from the (possibly relabeled) input.
-            # The expanded image is the same one the picker used; we
-            # already build it inside build_adjacency_from_label, but
-            # we can simply remap ``lab_arr`` (or its expanded variant
-            # when expand=True).
-            if expand:
-                from .expand import expand_labels
-                expanded = expand_labels(lab_arr, p=int(p))
-                out = lut_arr[expanded].astype(out.dtype)
-            else:
-                out = lut_arr[lab_arr].astype(out.dtype)
-            # Mirror the cpp pipeline: zero out pixels that were bg in
-            # the original input. Without this the optimize path emits
-            # color at expanded-bg pixels, breaking parity with the
-            # non-optimize path.
-            out[lab_arr == 0] = 0
-        else:
-            raise ValueError(f"unknown optimize mode: {optimize!r}")
 
     if return_lut or check_conflicts or return_conflicts:
         lut = solver.get_last_lut() if return_lut else None
@@ -397,12 +318,3 @@ def regionprops(labels, n_labels=0):
     return _b.regionprops(labels, int(n_labels))
 
 
-def get_lut(lab, n=4, conn=2, max_depth=30, expand=True,
-            return_n=False, verbose=False, check_conflicts=False,
-            return_conflicts=False, format_input=True):
-    """Return the label→color LUT used by :func:`label`."""
-    return label(lab, n=n, conn=conn, max_depth=max_depth,
-                 expand=expand, return_n=return_n, return_lut=True,
-                 verbose=verbose, check_conflicts=check_conflicts,
-                 return_conflicts=return_conflicts,
-                 format_input=format_input)

@@ -1,8 +1,8 @@
-"""A/B benchmark: wrap=False vs wrap=True (both with balance=True).
+"""A/B benchmark: wrap=False vs wrap=True.
 
-Same interleaved-pair pattern as bench_balance_ab.py — calls alternate
-between modes so thermal/scheduler noise averages out. Reports median +
-p10/p90 wall-clock per call alongside slot-cell-count balance.
+Interleaved-pair pattern — calls alternate between modes so thermal/
+scheduler noise averages out. Reports median + p10/p90 wall-clock per
+call alongside slot-cell-count balance.
 
 Usage:
   python bench_wrap_ab.py [--quick]
@@ -93,14 +93,14 @@ def time_call(fn, *args, **kwargs):
 
 def bench_one(label, m, runs, warmup):
     for _ in range(warmup):
-        ncolor.label(m, balance=True, wrap=False)
-        ncolor.label(m, balance=True, wrap=True)
+        ncolor.label(m, wrap=False)
+        ncolor.label(m, wrap=True)
     t_off, t_on = [], []
     last_off = last_on = None
     for _ in range(runs):
-        dt, out = time_call(ncolor.label, m, balance=True, wrap=False)
+        dt, out = time_call(ncolor.label, m, wrap=False)
         t_off.append(dt); last_off = out
-        dt, out = time_call(ncolor.label, m, balance=True, wrap=True)
+        dt, out = time_call(ncolor.label, m, wrap=True)
         t_on.append(dt);  last_on = out
     return {
         "label": label,

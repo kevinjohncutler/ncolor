@@ -27,7 +27,6 @@
 #include "delete_spurs_labels.hpp"
 #include "fast_despur.hpp"
 #include "connect_with_face_count.hpp"
-#include "expand_spur_free.hpp"
 #include "expand_lp.hpp"
 #include "bridge_free.hpp"
 #include "soft_color.hpp"
@@ -554,10 +553,10 @@ public:
     std::pair<py::array_t<uint8_t>, int> label(
             py::array mask,
             int n_colors = 4, int max_depth = 30, int rand_period = 10,
-            int conn = 2, int p = 2, bool capture_stages = false,
+            int conn = 1, int p = 2, bool capture_stages = false,
             bool format_input = true, bool expand = true,
             py::object out_arg = py::none(),
-            int color_mode = -1, bool wrap = false, bool balance = false,
+            int color_mode = -1, bool wrap = false,
             bool first_seen = false,
             int weight_objective = 0,
             py::object de_table_obj = py::none(),
@@ -573,8 +572,6 @@ public:
             // who use expand_mode="voronoi" + want explicit despur.
             int despur_iters = 0,
             bool despur_remove_thin = false,
-            bool expand_spur_free = false,
-            int spur_free_max_rounds = 1,
             int min_contact = 1,
             std::string expand_mode = "bridge_free",
             py::object soft_extra_edges_obj = py::none(),
@@ -663,6 +660,25 @@ public:
                 }
             }
         }
+        // Same pre-release parse for de_table (user-supplied (n+1)x(n+1)
+        // perceptual-distance palette override). Calling py::array_t::ensure
+        // inside the GIL-released block was the cause of a hard segfault
+        // when users passed a custom palette; copy here, use the data
+        // pointer below.
+        const double* user_de_ptr = nullptr;
+        int32_t user_de_dim = 0;
+        py::array_t<double> de_arr_holder;
+        if (!de_table_obj.is_none()) {
+            de_arr_holder = py::array_t<double,
+                py::array::c_style | py::array::forcecast>::ensure(de_table_obj);
+            if (de_arr_holder) {
+                const auto db = de_arr_holder.request();
+                if (db.ndim == 2 && db.shape[0] == db.shape[1]) {
+                    user_de_dim = static_cast<int32_t>(db.shape[0]);
+                    user_de_ptr = static_cast<const double*>(db.ptr);
+                }
+            }
+        }
 
         bool early_exit_empty = false;
         {
@@ -726,15 +742,12 @@ public:
             // envelope. Result lands in expand_bufs_.lbl(); the
             // ``input == output`` self-copy guards inside LpExpand
             // variants make this a no-op when expand_input == expanded.
-            // Resolve expand strategy. `expand_spur_free=true` is a legacy
-            // alias for `expand_mode="spur_free"`; explicit `expand_mode`
-            // wins when both are set. Default is "bridge_free": ND Lp
+            // Resolve expand strategy. Default is "bridge_free": ND Lp
             // Voronoi expand fused with an antipodal-bridge test and a
             // despur peel-back cascade in one pass (subsumes despur, so
             // despur_iters is unused on that path).
             std::string em = expand_mode;
             if (em.empty()) em = "bridge_free";
-            if (expand_spur_free && em == "bridge_free") em = "spur_free";
             // When `clean_mask=false` (default) and bridge_free is in
             // use, the output LUT should be applied to the ORIGINAL
             // foreground labels (before bridge_free zeros bridge/stub
@@ -756,26 +769,6 @@ public:
                     ncolor_cpp::expand_labels_bridge_free_inplace(
                         expand_input, expand_bufs_, shape,
                         *pool_, n_threads_, p);
-                } else if (em == "spur_free") {
-                    // Spur-free expand: BFS dilation with connectivity
-                    // check. Naturally avoids K_5-creating "starfish"
-                    // convergence patterns by refusing to claim bg
-                    // pixels that would have ≤1 same-label face-
-                    // neighbor. Slower than Voronoi expand for
-                    // small/medium inputs (3-4× on bact/synth) but
-                    // same speed as expand+despur on large dense
-                    // inputs where the K_5 prevention matters most.
-                    // max_rounds=spur_free_max_rounds bounds the BFS;
-                    // 3 is empirically enough to prevent all K_5
-                    // formations on real microscopy data.
-                    if (expand_input != expanded) {
-                        std::memcpy(expanded, expand_input,
-                                    (size_t)total * sizeof(int32_t));
-                    }
-                    ncolor_cpp::expand_spur_free_nd_inplace<int32_t>(
-                        expanded, shape, spur_free_max_rounds,
-                        /*connectivity_threshold=*/1,
-                        pool_.get(), n_threads_);
                 } else if (em == "voronoi") {
                     if (p == 2) {
                         ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
@@ -784,8 +777,8 @@ public:
                     }
                 } else {
                     throw std::invalid_argument(
-                        "expand_mode must be 'bridge_free', 'spur_free', "
-                        "or 'voronoi'; got '" + em + "'");
+                        "expand_mode must be 'bridge_free' or 'voronoi'; "
+                        "got '" + em + "'");
                 }
             }
             // (Suppress unused-var warning when expand=false — expanded
@@ -816,9 +809,9 @@ public:
             // on MM-class data). Off by default in the labeling pipeline
             // because removing those edges triggers the same picker
             // heuristic failure as the iter-30 cliff, just earlier (at
-            // iter 2 instead of iter 30). The principled fix is to use
-            // expand_spur_free=True so the thin bridges never appear;
-            // remove_thin then has nothing to do.
+            // iter 2 instead of iter 30). The principled fix is the
+            // default ``expand_mode="bridge_free"``, which never creates
+            // the thin bridges in the first place.
             // ``lut_lbl_ptr`` is the buffer apply_color_lut_ reads at the
             // end: by default that's the post-expand ``expanded`` buffer.
             // When despur runs we want to keep coloring the spur pixels
@@ -1064,23 +1057,14 @@ public:
             stage("build_csr");
 
             // Resolve de_table override or fall back to the viridis default.
+            // user_de_ptr / user_de_dim were parsed pre-GIL-release above.
             std::vector<double> de_table_vec;
             const double* de_ptr = nullptr;
             if (wobj != 0) {
-                if (!de_table_obj.is_none()) {
-                    auto arr = py::array_t<double,
-                        py::array::c_style | py::array::forcecast>::ensure(de_table_obj);
-                    if (arr) {
-                        const auto buf = arr.request();
-                        if (buf.ndim == 2 &&
-                            buf.shape[0] == n_colors + 1 &&
-                            buf.shape[1] == n_colors + 1) {
-                            const size_t total_de = static_cast<size_t>(n_colors + 1) * (n_colors + 1);
-                            de_table_vec.assign(static_cast<const double*>(buf.ptr),
-                                                static_cast<const double*>(buf.ptr) + total_de);
-                            de_ptr = de_table_vec.data();
-                        }
-                    }
+                if (user_de_ptr != nullptr && user_de_dim == n_colors + 1) {
+                    const size_t total_de = static_cast<size_t>(n_colors + 1) * (n_colors + 1);
+                    de_table_vec.assign(user_de_ptr, user_de_ptr + total_de);
+                    de_ptr = de_table_vec.data();
                 }
                 if (de_ptr == nullptr) {
                     de_table_vec.assign(static_cast<size_t>(n_colors + 1) * (n_colors + 1), 0.0);
@@ -1108,7 +1092,7 @@ public:
             // ``solve_coloring_`` for full algorithm + parallel-attempt
             // dispatch.
             n_used = solve_coloring_(N, M, n_colors, max_depth, rand_period,
-                                     balance, color_mode,
+                                     color_mode,
                                      static_cast<int>(shape.size()), wrap,
                                      edge_weights_ptr, de_ptr, wobj);
             stage("color");
@@ -1314,41 +1298,25 @@ private:
             &fp_ht_buf_, &fp_primary_buf_, &fp_counts_buf_);
     }
 
-    // Coloring loop: try the user-preferred algorithm first, switch to
-    // the alternate algorithm before bumping cur_n. Welsh-Powell and
-    // BFS-with-random-restarts have nearly disjoint failure modes on
-    // planar adjacency graphs — running both at each cur_n nearly
-    // eliminates the cur_n→cur_n+1 bump that was costing ~10% of L2
-    // colorings on hard inputs.
+    // Coloring loop: race ``attempts_per_n`` BFS-with-random-offset
+    // attempts in parallel at each cur_n; bb_dsatur takes the last slot
+    // as an exact-coloring race entry. The weighted-objective path
+    // (weight_obj != 0) substitutes weighted-WP for the BFS body in
+    // slots 0..N-2; otherwise WP is unused.
     //
-    // Slot assignment within attempts_per_n at each cur_n:
-    //   balance=True   slots: [WP,  BFS, BFS, BFS]
-    //                  WP first (uniform color distribution); on failure
-    //                  three BFS variants with offsets {1, 2, 3} as
-    //                  fallback before bumping cur_n.
-    //   balance=False  slots: [BFS, BFS, BFS, WP]
-    //                  BFS first (user-preferred ordering, deterministic
-    //                  ID-order visit); on failure WP with offset 3 as
-    //                  last-ditch alternative before bumping cur_n.
+    // Slot layout at each cur_n:
+    //   default          slots: [BFS+0, BFS+1, ..., BFS+(N-2), bb_dsatur]
+    //   weight_obj != 0  slots: [weighted-WP+0, ..., +(N-2), pure WP]
     //
-    // Lowest-index successful attempt wins, so the user-preferred algo
-    // is preserved whenever it succeeds. Big graphs (N+M ≥ 500) race
-    // the 4 attempts in parallel on the pool; small graphs run them
-    // serially (dispatch overhead would exceed BFS work).
-    //
-    // ``WP must be CLEAN to count`` rule is retained: a repaired WP
-    // coloring loses its uniform-distribution advantage, so we'd rather
-    // fall through to a clean BFS than accept a repaired WP. Under
-    // balance=False this means a conflicted-WP fallback doesn't save us
-    // from bumping cur_n — but in practice WP needing repair on the
-    // graphs that already failed three BFS attempts is vanishingly
-    // rare.
+    // Lowest-index successful attempt wins. Big graphs (N+M ≥ 500) race
+    // the attempts in parallel on the pool; small graphs run them
+    // serially.
     //
     // Side effects: writes the winning coloring into ``colors_`` and the
     // adjacency-conflict count into ``last_n_conflicts_``. Returns
     // ``n_used`` = max color value in the winning coloring.
     int solve_coloring_(int32_t N, int32_t M, int n_colors,
-                        int max_depth, int rand_period, bool balance,
+                        int max_depth, int rand_period,
                         int color_mode, int ndim, bool wrap,
                         const double* edge_weights = nullptr,
                         const double* de_table = nullptr,
@@ -1461,14 +1429,12 @@ private:
                     // exact search at cur_n > n_colors). Disabled
                     // when the user opted into a perceptual weight
                     // objective, since bb_dsatur doesn't honour
-                    // weights. Slot picked: the LAST one for
-                    // balance=True (free slot — slot 0 is the WP
-                    // warmup, slots 1..N-2 are BFS); not used for
-                    // balance=False (LAST slot is the WP fallback
-                    // there). Cancel propagation: bb_dsatur checks
-                    // the cancel flag every 1024 nodes.
+                    // weights. Slot picked: the LAST one (free slot —
+                    // slots 0..N-2 are BFS, slot N-1 is bb_dsatur).
+                    // Cancel propagation: bb_dsatur checks the cancel
+                    // flag every 1024 nodes.
                     const bool wobj_active = weight_obj != 0 && edge_weights != nullptr;
-                    const bool bb_slot = balance && !wobj_active
+                    const bool bb_slot = !wobj_active
                                          && (idx == attempts_per_n - 1)
                                          && local_cur_n == n_colors;
                     if (bb_slot) {
@@ -1485,14 +1451,12 @@ private:
                     // random offsets (algorithm-switching fallback).
                     // For the weighted opt-in, slots 0-(attempts-2)
                     // use weighted-WP with different offsets; the
-                    // LAST slot is a pure-balance WP fallback. If
-                    // all weighted attempts fail at n_colors, the
-                    // balance attempt can still produce a clean
-                    // 4-coloring before we bump cur_n.
-                    const bool wp = wobj_active
-                        ? true
-                        : (balance ? (idx == 0)
-                                   : (idx == attempts_per_n - 1));
+                    // LAST slot is a pure WP fallback. If all
+                    // weighted attempts fail at n_colors, the WP
+                    // attempt can still produce a clean 4-coloring
+                    // before we bump cur_n. With wobj off (default),
+                    // all slots run BFS; WP is never selected here.
+                    const bool wp = wobj_active;
                     const bool weighted_attempt = wobj_active &&
                                                   (idx < attempts_per_n - 1);
                     const double* w_ptr = weighted_attempt ? edge_weights : nullptr;
@@ -1540,60 +1504,21 @@ private:
                             a_ok = true;
                         }
                     }
-                    // WP must be clean for the balanced path — repair
-                    // would shadow its uniform-distribution promise.
                     // For the weighted path the user has opted in to
-                    // a perceptual objective and accepts repair.
+                    // a perceptual objective and accepts repair. With
+                    // wobj off there's no clean-WP gate (wp is false).
                     const bool clean_wp_required = wp && !weighted_attempt;
                     const bool slot_ok = a_ok && (!clean_wp_required || !conflict);
                     per_attempt_ok_[idx] = slot_ok ? 1 : 0;
                     return slot_ok;
                 };
 
-                // Conditional fan-out: try slot 0 sequentially first
-                // ONLY for small graphs where Welsh-Powell-without-
-                // tabucol stands a chance. Above ~1000 cells the
-                // warmup empirically fails 100% on real cell-adjacency
-                // graphs (verified on logo N=160 — even there the
-                // warmup misses) and the 1.1 ms it costs is pure
-                // waste before falling through to the race. The race
-                // pays a one-time ~0.5 ms dispatch but its bb_dsatur
-                // slot reliably converges in <3 ms on K_4-clean
-                // graphs of any size.
-                static const bool dbg_warmup = std::getenv("NCOLOR_WARMUP_DEBUG") != nullptr;
-                // Warmup empirically fails on all real cell-adjacency
-                // graphs we've measured (logo, synth, MM) — Welsh-
-                // Powell without tabucol just isn't strong enough.
-                // The race fanout pays a fixed ~0.5 ms dispatch but
-                // its tabucol-enabled slots reliably win in ~3 ms.
-                // Setting the threshold to 0 disables warmup entirely;
-                // wrapped in NCOLOR_WARMUP_ENABLE=<N> env in case a
-                // specific small input wants it back.
-                const char* warmup_env = std::getenv("NCOLOR_WARMUP_ENABLE");
-                const int warmup_max_n = warmup_env ? std::atoi(warmup_env) : 0;
-                const bool try_warmup = (N <= warmup_max_n);
-                bool warmup_ok = false;
-                if (try_warmup) {
-                    const auto warmup_t0 = std::chrono::steady_clock::now();
-                    warmup_ok = run_one_attempt(
-                        0, nullptr, /*allow_tabucol=*/false, /*race_deadline_ns=*/0);
-                    if (dbg_solve) {
-                        const double warmup_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - warmup_t0).count();
-                        std::fprintf(stderr, "  [warmup] %.1fms ok=%d\n", warmup_ms, (int)warmup_ok);
-                    }
-                    if (dbg_warmup) {
-                        std::fprintf(stderr,
-                            "[warmup] N=%d M=%d cur_n=%d depth=%d ok=%d\n",
-                            N, M, local_cur_n, local_depth, (int)warmup_ok);
-                    }
-                }
-
-                if (warmup_ok) {
-                    colors_.swap(per_attempt_colors_[0]);
-                    ok = true;
-                } else {
-                    std::atomic<int> next{1};
+                // All attempts go through the parallel race. The earlier
+                // WP-first warmup path was retired when the ``balance``
+                // kwarg was dropped — slot 0 is now a regular BFS+offset
+                // slot raced against the rest.
+                {
+                    std::atomic<int> next{0};
                     static const bool dbg_slots = std::getenv("NCOLOR_SLOT_DEBUG") != nullptr;
                     std::vector<double> slot_ms(attempts_per_n, -1.0);
                     std::vector<int> slot_done(attempts_per_n, 0);
@@ -1647,7 +1572,7 @@ private:
                         const auto race_t1 = std::chrono::steady_clock::now();
                         const double race_ms = std::chrono::duration<double, std::milli>(race_t1 - race_t0).count();
                         std::fprintf(stderr, "[race] total=%.3fms\n", race_ms);
-                        for (int a = 1; a < attempts_per_n; ++a) {
+                        for (int a = 0; a < attempts_per_n; ++a) {
                             const char* st = slot_done[a] == 1 ? "OK"
                                            : slot_done[a] == 2 ? "FAIL"
                                            : "skip";
@@ -1658,8 +1583,7 @@ private:
                     }
                     // Lowest-index successful attempt wins
                     // (deterministic preference for the first random
-                    // offset). Slot 0 already failed so it's skipped
-                    // by the per_attempt_ok_[a] check.
+                    // offset).
                     for (int a = 0; a < attempts_per_n; ++a) {
                         if (per_attempt_ok_[a]) {
                             colors_.swap(per_attempt_colors_[a]);
@@ -1672,14 +1596,12 @@ private:
                 for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
                     // When weight_obj != 0: slots 0..(attempts-2) run
                     // weighted-WP (different offsets); LAST slot is a
-                    // pure-balance WP fallback so a 4-colorable graph
-                    // doesn't get bumped to 5 colors when broad-support
+                    // pure WP fallback so a 4-colorable graph doesn't
+                    // get bumped to 5 colors when broad-support
                     // reducers (count, harmonic) over-constrain the BFS.
+                    // With wobj off, all slots run plain BFS.
                     const bool wobj_active = weight_obj != 0 && edge_weights != nullptr;
-                    const bool wp = wobj_active
-                        ? true
-                        : (balance ? (attempt == 0)
-                                   : (attempt == attempts_per_n - 1));
+                    const bool wp = wobj_active;
                     const bool weighted_attempt = wobj_active &&
                                                   (attempt < attempts_per_n - 1);
                     const double* w_ptr = weighted_attempt ? edge_weights : nullptr;
@@ -1694,12 +1616,12 @@ private:
                     bool a_ok = !conflict || ncolor_cpp::repair_coloring(
                         indptr_.data(), indices_.data(), N,
                         cur_n, std::max(4, max_depth), colors_);
-                    // "WP must be clean" enforces the uniform-distribution
-                    // promise for the balanced path. For the weighted path
-                    // the user has opted into a perceptual objective and
-                    // accepts repair as part of the deal — otherwise the
-                    // WP-weighted result is silently dropped in favor of a
-                    // non-WP, non-weighted fallback (which defeats the point).
+                    // For the weighted path the user has opted into a
+                    // perceptual objective and accepts repair as part of
+                    // the deal — otherwise the WP-weighted result is
+                    // silently dropped in favor of a non-WP, non-weighted
+                    // fallback (which defeats the point). With wobj off
+                    // wp is false and the gate doesn't fire.
                     const bool clean_wp_required = wp && !weighted_attempt;
                     if (a_ok && (!clean_wp_required || !conflict)) ok = true;
                 }
@@ -2179,11 +2101,11 @@ PYBIND11_MODULE(_impl, m) {
         .def("label", &Solver::label,
              py::arg("mask"), py::arg("n_colors") = 4,
              py::arg("max_depth") = 30, py::arg("rand_period") = 10,
-             py::arg("conn") = 2,
+             py::arg("conn") = 1,
              py::arg("p") = 2, py::arg("capture_stages") = false,
              py::arg("format_input") = true, py::arg("expand") = true,
              py::arg("out") = py::none(), py::arg("color_mode") = -1,
-             py::arg("wrap") = false, py::arg("balance") = false,
+             py::arg("wrap") = false,
              py::arg("first_seen") = false,
              py::arg("weight_objective") = 0,
              py::arg("de_table") = py::none(),
@@ -2192,8 +2114,6 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("connect_radius") = 1,
              py::arg("despur_iters") = 0,
              py::arg("despur_remove_thin") = false,
-             py::arg("expand_spur_free") = false,
-             py::arg("spur_free_max_rounds") = 1,
              py::arg("min_contact") = 1,
              py::arg("expand_mode") = "bridge_free",
              py::arg("soft_extra_edges") = py::none(),
@@ -2220,12 +2140,7 @@ PYBIND11_MODULE(_impl, m) {
              "around adjacencies between cells whose Voronoi territories\n"
              "land on opposite image edges. Useful for tile-equivalent or\n"
              "periodic-imaging assumptions; balances color frequencies on\n"
-             "tightly-cropped microcolony images at ~zero runtime cost.\n"
-             "balance=True visits cells in descending-degree order during\n"
-             "the BFS coloring (Welsh-Powell heuristic). High-degree (most\n"
-             "constrained) cells are colored first, which spreads color\n"
-             "usage more evenly across the graph. ~zero runtime cost\n"
-             "(O(N) bucket sort). Recommended for visual uniformity.")
+             "tightly-cropped microcolony images at ~zero runtime cost.")
         .def("connect", &Solver::connect,
              py::arg("mask"), py::arg("conn") = 1, py::arg("wrap") = false,
              "Adjacency pairs for a label image. Returns an (M, 2) int32\n"
@@ -2578,55 +2493,6 @@ PYBIND11_MODULE(_impl, m) {
           "Fused 2D connect+face_count scan. Returns (pairs[K,2],\n"
           "face_count[H,W]) in a single cache-warm pass — used to\n"
           "replace separate find_pairs + compute_face_count calls.");
-
-    m.def("expand_spur_free",
-          [](py::array labels_in, int max_rounds, int connectivity_threshold,
-             int n_threads) {
-              if (!(labels_in.flags() & py::array::c_style)) {
-                  labels_in = py::array::ensure(labels_in, py::array::c_style);
-              }
-              const auto buf = labels_in.request();
-              const int ndim = static_cast<int>(buf.ndim);
-              if (ndim < 1) throw std::invalid_argument(
-                  "expand_spur_free requires ndim >= 1");
-              std::vector<int64_t> shape(ndim);
-              std::vector<py::ssize_t> out_shape(ndim);
-              for (int d = 0; d < ndim; ++d) {
-                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
-                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
-              }
-              py::array out(labels_in.dtype(), out_shape);
-              std::memcpy(out.request().ptr, buf.ptr,
-                          (size_t)buf.size * (size_t)buf.itemsize);
-              int64_t n_claimed = 0;
-              const int nt = n_threads > 0 ? n_threads :
-                  (int)std::thread::hardware_concurrency();
-              {
-                  py::gil_scoped_release release;
-                  std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
-                  if (nt > 1) {
-                      pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
-                  }
-                  dispatch_int_dtype(buf.format, buf.itemsize, "expand_spur_free",
-                      [&](auto* tag) {
-                          using T = std::remove_pointer_t<decltype(tag)>;
-                          n_claimed = ncolor_cpp::expand_spur_free_nd_inplace<T>(
-                              static_cast<T*>(out.mutable_data()),
-                              shape, max_rounds, connectivity_threshold,
-                              pool.get(), nt);
-                      });
-              }
-              return std::make_pair(std::move(out), n_claimed);
-          },
-          py::arg("labels"), py::arg("max_rounds") = 100,
-          py::arg("connectivity_threshold") = 1,
-          py::arg("n_threads") = 0,
-          "Spur-free expand via BFS dilation. Bg pixels are claimed by\n"
-          "a cell only if ≥ connectivity_threshold+1 of their face-\n"
-          "neighbors share that label, so the claimed pixel won't be a\n"
-          "spur. Pixels that never accumulate enough same-label neighbors\n"
-          "stay bg, naturally avoiding K_5-creating starfish convergence\n"
-          "points. Returns (expanded_labels, n_claimed).");
 
     m.def("two_hop_csr",
           [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indptr,
