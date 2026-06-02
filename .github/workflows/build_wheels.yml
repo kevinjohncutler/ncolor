@@ -19,23 +19,24 @@ concurrency:
 
 jobs:
   build_wheels:
-    name: ${{ matrix.os }} ${{ matrix.archs_linux }}${{ matrix.archs_windows }}${{ matrix.archs_macos }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.cell.os }} ${{ matrix.cell.archs_linux }}${{ matrix.cell.archs_windows }}${{ matrix.cell.archs_macos }} · ${{ matrix.python }}
+    runs-on: ${{ matrix.cell.os }}
     strategy:
       fail-fast: false
+      # 5 archs × 4 Pythons = 20 parallel jobs. Each builds ONE wheel
+      # via CIBW_BUILD=${{ matrix.python }}-* (pattern borrowed from
+      # opencodecs), so cibuildwheel's per-cell 4-Python serial loop
+      # becomes 4-way parallel. Wall-clock per row drops by ~3-4×.
+      # Trade: 4× CI minutes (free on public repos). ncolor has no
+      # heavyweight BEFORE_ALL step, so no cache-warm complication.
       matrix:
-        include:
-          - os: ubuntu-latest
-            archs_linux: "x86_64"
-          - os: ubuntu-24.04-arm
-            archs_linux: "aarch64"
-          - os: windows-latest
-            archs_windows: "AMD64"
-          - os: windows-11-arm
-            archs_windows: "ARM64"
-            cibw_build: "cp311-* cp312-* cp313-* cp314-*"  # cp310 lacks win_arm64 support
-          - os: macos-latest
-            archs_macos: "arm64"
+        python: ["cp311", "cp312", "cp313", "cp314"]
+        cell:
+          - {os: ubuntu-latest,    archs_linux: "x86_64"}
+          - {os: ubuntu-24.04-arm, archs_linux: "aarch64"}
+          - {os: windows-latest,   archs_windows: "AMD64"}
+          - {os: windows-11-arm,   archs_windows: "ARM64"}
+          - {os: macos-latest,     archs_macos: "arm64"}
         # Skipped (covered by sdist):
         #   - macos-13 x86_64 — Apple stopped shipping Intel hardware in
         #                       2020; user base ≈ 0, GitHub's Intel
@@ -50,18 +51,16 @@ jobs:
         with:
           output-dir: ./wheelhouse
         env:
-          CIBW_ARCHS_LINUX: ${{ matrix.archs_linux }}
-          CIBW_ARCHS_WINDOWS: ${{ matrix.archs_windows }}
-          CIBW_ARCHS_MACOS: ${{ matrix.archs_macos }}
-          # Per-row override of the build list (used by win_arm64 to
-          # skip cp310, which has no win_arm64 binary distribution).
-          # When the row doesn't set it, cibuildwheel falls back to the
-          # default in pyproject.toml's [tool.cibuildwheel] build = "..."
-          CIBW_BUILD: ${{ matrix.cibw_build }}
+          CIBW_ARCHS_LINUX: ${{ matrix.cell.archs_linux }}
+          CIBW_ARCHS_WINDOWS: ${{ matrix.cell.archs_windows }}
+          CIBW_ARCHS_MACOS: ${{ matrix.cell.archs_macos }}
+          # One wheel per job — overrides the default in
+          # pyproject.toml's [tool.cibuildwheel] build = "...".
+          CIBW_BUILD: "${{ matrix.python }}-*"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.archs_linux }}${{ matrix.archs_windows }}${{ matrix.archs_macos }}
+          name: wheels-${{ matrix.cell.os }}-${{ matrix.cell.archs_linux }}${{ matrix.cell.archs_windows }}${{ matrix.cell.archs_macos }}-${{ matrix.python }}
           path: ./wheelhouse/*.whl
           if-no-files-found: error
 

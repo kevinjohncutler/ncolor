@@ -57,6 +57,11 @@ were removed; the major bump captures that surface change.
 
 ### Changed
 
+- **Dropped Python 3.10 support.** Python 3.10 reached EOL on
+  2025-10-31; NumPy 2.3+ already requires 3.11+ and the rest of the
+  scientific Python stack is following. The new floor is Python 3.11
+  (`requires-python = ">=3.11"`). 1.5.3 wheels remain available on
+  PyPI for users still on 3.10.
 - **Default `conn=1` and `p=2`** (were `conn=2, p=1`). These match the
   ncolor 1.x defaults and the configuration the clean-expand + auto-soft
   stack was designed around. At the old `conn=2, p=1` the picker hit

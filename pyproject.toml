@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ncolor"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dynamic = ["version", "description", "readme", "authors", "classifiers", "dependencies", "optional-dependencies", "license"]
 
 [project.scripts]
@@ -19,7 +19,9 @@ local_scheme = "no-local-version"
 
 [tool.cibuildwheel]
 # Supported stable CPython versions. Bump as new ones land / EOLs roll off.
-build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+# Python 3.10 dropped in v2.0 — it reached EOL on 2025-10-31 and the
+# ecosystem (NumPy 2.3+, SciPy) has already moved on.
+build = "cp311-* cp312-* cp313-* cp314-*"
 # Skip musl Linux (no numba wheel for musllinux at time of writing).
 skip = ["*-musllinux*"]
 # build is the modern PEP 517 frontend (replaces legacy setup.py bdist_wheel).
