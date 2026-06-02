@@ -461,6 +461,9 @@ def test_find_impl_raises_on_missing(tmp_path, monkeypatch):
         _backend._find_impl()
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                     reason="POSIX chmod semantics; Windows ignores the "
+                            "executable bit so mode never reaches 0o755.")
 def test_copy_off_remote_copies_and_chmods(tmp_path):
     src = tmp_path / "src.so"
     src.write_bytes(b"binary blob")
