@@ -178,8 +178,9 @@ def test_format_labels_clean_relabels_secondary_components():
 
 
 def test_format_labels_clean_drops_primary_below_min_area():
-    """When the largest component of a label is itself ≤ min_area, the
-    whole label is dropped (rank==0 uses ``area <= min_area``)."""
+    """When the largest component of a label is itself < min_area,
+    the whole label is dropped. Threshold is uniform across ranks
+    (strictly less than, so a component of exactly min_area survives)."""
     arr = np.zeros((8, 8), dtype=np.int32)
     arr[1:3, 1:2] = 1  # 2-pixel "primary" (no secondary)
     arr[4:8, 4:8] = 2  # large second cell
@@ -187,6 +188,23 @@ def test_format_labels_clean_drops_primary_below_min_area():
     # Only the large cell survives.
     unique = sorted(int(v) for v in np.unique(out) if v != 0)
     assert unique == [1]
+
+
+def test_format_labels_clean_min_area_boundary_is_symmetric():
+    """A component of exactly min_area pixels survives whether it's the
+    primary or a secondary part — the threshold is < min_area (strict)
+    uniformly. Regression for the pre-2.0 asymmetric threshold where
+    primary used <=min_area and secondary used <min_area.
+    """
+    arr = np.zeros((16, 16), dtype=np.int32)
+    arr[0:2, 0:2] = 1  # 4-pixel primary, exactly min_area
+    arr[4:6, 4:6] = 2  # 4-pixel primary, exactly min_area
+    arr[10:12, 10:12] = 2  # 4-pixel secondary of cell 2
+    out = format_labels(arr, clean=True, min_area=4)
+    # All three exactly-min_area components survive: primary 1, primary 2,
+    # and secondary-2 gets a fresh label. So three distinct nonzero labels.
+    unique = sorted(int(v) for v in np.unique(out) if v != 0)
+    assert len(unique) == 3
 
 
 def test_format_labels_clean_despur_path():
@@ -918,14 +936,15 @@ def test_format_labels_clean_despur_disjoint_verbose(capsys):
 
 def test_format_labels_clean_despur_drops_tiny_primary(capsys):
     """despur=True with a primary component that survives delete_spurs
-    but is still ≤ min_area gets dropped with a verbose warning. A
-    2×2 square (4 pixels) survives delete_spurs (each pixel has 2
-    same-label face-neighbors, the default threshold) so the
-    ``area <= min_area`` arm in the despur branch fires."""
+    but is still below min_area gets dropped with a verbose warning.
+    A 2×2 square (4 pixels) survives delete_spurs (each pixel has 2
+    same-label face-neighbors, the default threshold) so we can keep
+    the geometry simple and just set min_area=5 to land it below
+    the strict-less-than threshold."""
     arr = np.zeros((16, 16), dtype=np.int32)
     arr[1:3, 1:3] = 1     # 2×2 primary, area=4
     arr[6:10, 6:10] = 2   # large second cell
-    out = format_labels(arr, clean=True, despur=True, min_area=4,
+    out = format_labels(arr, clean=True, despur=True, min_area=5,
                          verbose=True)
     captured = capsys.readouterr().out
     unique = sorted(int(v) for v in np.unique(out) if v != 0)

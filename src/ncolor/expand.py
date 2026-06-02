@@ -20,12 +20,12 @@ def _get_engine():
 
 
 def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
-                  wrap: bool = False, mode: str = "voronoi"):
+                  wrap: bool = False, mode: str = "standard"):
     """Label expansion across background pixels.
 
     Two expansion algorithms are available, selected by ``mode``:
 
-    * ``"voronoi"`` (default) — Voronoi expansion under the L_p metric.
+    * ``"standard"`` (default) — Voronoi expansion under the L_p metric.
       ``p=2`` uses the Felzenszwalb-Huttenlocher parabolic envelope
       (any ndim, default). ``p=1`` uses the Saito-Toriwaki separable
       sweep (Manhattan distance, ~5× faster on 2D, slightly different
@@ -34,21 +34,21 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
       toroidal: opposite image edges are treated as adjacent, so a
       seed near one edge competes for territory with seeds near the
       opposite edge. ~1.1× cost for L1, ~1.4-1.6× for L2.
-    * ``"bridge_free"`` — Same separable Voronoi expansion as
-      ``"voronoi"`` (selectable via ``p`` / ``metric``: ``p=1``
-      Saito-Toriwaki L1, ``p=2`` Felzenszwalb L2), with an antipodal-
-      only bridge test run on the final 2D-Voronoi labels: pixels
-      with exactly two same-label neighbors arranged antipodally
-      (N-S, E-W, NE-SW, or NW-SE) are marked bg-barriers. Prevents
-      1-pixel-wide bridges (face or corner) between Voronoi cells.
-      L1 typically produces an order of magnitude more antipodal
-      bridges than L2 — this is the metric where the test
-      changes the output materially. 2D only for now — ND > 2
-      falls back to standard expand (no bridge prevention).
+    * ``"clean"`` — Same separable Voronoi expansion as ``"standard"``
+      (selectable via ``p`` / ``metric``: ``p=1`` Saito-Toriwaki L1,
+      ``p=2`` Felzenszwalb L2), with an antipodal-only bridge test run
+      on the final 2D-Voronoi labels: pixels with exactly two
+      same-label neighbors arranged antipodally (N-S, E-W, NE-SW, or
+      NW-SE) are marked bg-barriers. Prevents 1-pixel-wide bridges
+      (face or corner) between Voronoi cells. L1 typically produces an
+      order of magnitude more antipodal bridges than L2 — this is the
+      metric where the test changes the output materially. 2D only for
+      now — ND > 2 falls back to standard expand (no bridge
+      prevention).
     """
-    if mode not in ("voronoi", "bridge_free"):
+    if mode not in ("standard", "clean"):
         raise ValueError(
-            f"mode must be 'voronoi' or 'bridge_free', got {mode!r}")
+            f"mode must be 'standard' or 'clean', got {mode!r}")
     if metric is not None:
         if metric == "l2":
             p = 2
@@ -67,6 +67,6 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
         return arr.astype(np.int32, copy=True)
 
     arr32 = arr.astype(np.int32, copy=False)
-    if mode == "voronoi":
+    if mode == "standard":
         return _get_engine().expand_labels(arr32, p=p, wrap=bool(wrap))
-    return _get_engine().expand_labels_bridge_free(arr32, p=int(p))
+    return _get_engine().expand_labels_clean(arr32, p=int(p))

@@ -27,7 +27,7 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
           out=None, p=2, wrap=False, first_seen=False,
           weight_objective=0, de_table=None, weight_mode="min",
           extra_edges=None, connect_radius=1,
-          min_contact=1, expand_mode="bridge_free",
+          min_contact=1, expand_mode="clean",
           soft_extra_edges=None, soft_conn=2, soft_radius=2,
           clean_mask=False):
     """4-color graph coloring of a label image.
@@ -37,8 +37,8 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
     different colors. Background (``lab == 0``) stays 0.
 
     Default behavior (call with no kwargs beyond ``lab``):
-        4-color, 4-connectivity (face-only), ``bridge_free`` Voronoi
-        expand with L2 metric, auto-soft constraint post-pass at
+        4-color, 4-connectivity (face-only), ``clean`` Voronoi expand
+        with L2 metric, auto-soft constraint post-pass at
         ``conn=2 r=2``, and output that preserves the input fg/bg
         pattern exactly. These defaults match ncolor 1.x and reliably
         4-color the reference logo / synth / mm fixtures.
@@ -63,14 +63,14 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
     leak adjacencies. Larger r→ more edges → harder picker problem.
 
     ``expand_mode`` selects the Voronoi-expand kernel:
-        "bridge_free" (default) — ND Lp Voronoi + antipodal-bridge
-            test + despur peel-back cascade in one fused pass.
-            Internally zeros bridge/stub pixels as graph barriers
-            (these don't appear in the final output unless
-            ``clean_mask=True``).
-        "voronoi" — plain Lp Voronoi sweep without bridge/despur
+        "clean" (default) — ND Lp Voronoi + antipodal-bridge test +
+            despur peel-back cascade in one fused pass. Internally
+            zeros bridge/stub pixels as graph barriers (these don't
+            appear in the final output unless ``clean_mask=True``).
+        "standard" — plain Lp Voronoi sweep without bridge/despur
             cleanup. Faster but graphs may contain K_5 obstructions
-            at thin-cell convergences.
+            at thin-cell convergences; included primarily for
+            comparison / diagnostic use.
 
     ``p`` selects the Voronoi expand metric:
         p=1: Saito-Toriwaki separable sweep (Manhattan)
@@ -111,13 +111,13 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
     ``clean_mask``:
         False (default) — apply the color LUT to the *original*
             foreground labels, so cells in the input mask always
-            retain their color in the output even when bridge_free
-            zeroed them internally as graph barriers. Output fg/bg
-            pattern exactly matches input.
+            retain their color in the output even when the clean
+            expand zeroed them internally as graph barriers. Output
+            fg/bg pattern exactly matches input.
         True — apply the LUT to the post-expand buffer instead, so
-            bridge_free's barrier zeros surface in the output too.
-            Useful as a "clean + label" combined operation when the
-            barrier-removed mask is also wanted downstream.
+            the clean expand's barrier zeros surface in the output
+            too. Useful as a "clean + label" combined operation when
+            the barrier-removed mask is also wanted downstream.
 
     ``verbose=True`` prints a one-line stage-breakdown summary
     (shape, n_used, residual soft violations, total ms, per-stage

@@ -121,29 +121,28 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                         print('Warning - found mask with disjoint label.')
                     # Largest component keeps source label j; smaller disjoint
                     # parts get fresh labels (cur_max+1) or are dropped if too
-                    # small. Note the asymmetric threshold: rank==0 uses
-                    # area<=min_area, rank>0 uses area<min_area — matches the
-                    # original skimage+fastremap pipeline at exactly min_area.
+                    # small. Threshold is uniform across ranks: components with
+                    # area strictly less than min_area are dropped (i.e.
+                    # min_area=9 keeps 9-pixel components, drops 8-pixel ones).
                     for rank, k in enumerate(order):
                         ci = int(comp_indices[k])
                         area = int(areas_for_j[k])
-                        if rank == 0:
-                            if area <= min_area:
-                                if verbose:
+                        if area < min_area:
+                            if verbose:
+                                if rank == 0:
                                     print('Warning - found mask area less than', min_area)
                                     print('Removing it.')
-                            else:
-                                remap[ci + 1] = int(j)
-                        else:
-                            if area < min_area:
-                                if verbose:
+                                else:
                                     print('secondary disjoint part smaller than min_area. Removing it.')
-                            else:
-                                if verbose:
-                                    print('secondary disjoint part bigger than min_area, relabeling. Area:', area,
-                                          'Label value:', int(j))
-                                cur_max += 1
-                                remap[ci + 1] = cur_max
+                            continue
+                        if rank == 0:
+                            remap[ci + 1] = int(j)
+                        else:
+                            if verbose:
+                                print('secondary disjoint part bigger than min_area, relabeling. Area:', area,
+                                      'Label value:', int(j))
+                            cur_max += 1
+                            remap[ci + 1] = cur_max
 
                 labels = remap[comp_labels].astype(np.uint32, copy=False)
 

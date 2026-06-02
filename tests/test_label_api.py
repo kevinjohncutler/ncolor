@@ -196,7 +196,7 @@ def test_label_wrap_output_differs_from_non_wrap():
     non-wrap path (because the adjacency graph gains wrap-around edges).
     Asserts there's *some* difference rather than a specific permutation.
 
-    Default expand_mode='bridge_free' fills the image border bg via
+    Default expand_mode='clean' fills the image border bg via
     Voronoi, so wrap-around adjacencies do develop."""
     m = _circles_2d_dense(seed=42)
     no_wrap = ncolor.label(m, p=1, wrap=False)
@@ -247,7 +247,7 @@ def _assert_valid_coloring(out, mask, expected_n_max=8):
     assert out.shape == mask.shape
     assert out.dtype == np.uint8
     # By default (clean_mask=False) the output preserves the input
-    # mask's fg/bg pattern exactly — bridge_free's internal barrier
+    # mask's fg/bg pattern exactly — the clean expand's internal barrier
     # removal is graph-only and never strips colors from original-fg
     # pixels. So bg patterns match exactly.
     assert np.array_equal(out == 0, mask == 0)
@@ -265,23 +265,22 @@ def test_label_connect_radius(r):
     _assert_valid_coloring(out, m)
 
 
-def test_label_expand_mode_voronoi():
-    """Non-default expand mode 'voronoi' should still 4-color the dense
-    circles input. bridge_free is the default and is exercised by every
-    other test in this file."""
+def test_label_expand_mode_standard():
+    """Non-default expand mode 'standard' (plain Voronoi) should still
+    4-color the dense circles input. 'clean' is the default and is
+    exercised by every other test in this file."""
     m = _circles_2d_dense()
-    out, n_used = ncolor.label(m, expand_mode="voronoi", return_n=True)
+    out, n_used = ncolor.label(m, expand_mode="standard", return_n=True)
     assert 1 <= int(n_used) <= 4
 
 
 def test_label_expand_mode_invalid():
-    """Unknown expand_mode raises ValueError. 'spur_free' was removed in
-    2.0; verify the legacy name now errors instead of silently routing."""
+    """Unknown expand_mode raises. Verify the pre-2.0 names ('spur_free',
+    'bridge_free', 'voronoi') and arbitrary strings all error."""
     m = _circles_2d_dense()
-    with pytest.raises(Exception):
-        ncolor.label(m, expand_mode="spur_free")
-    with pytest.raises(Exception):
-        ncolor.label(m, expand_mode="bogus_mode")
+    for bad in ("spur_free", "bridge_free", "voronoi", "bogus_mode"):
+        with pytest.raises(Exception):
+            ncolor.label(m, expand_mode=bad)
 
 
 def test_label_extra_edges_constrains_pair():
@@ -397,68 +396,67 @@ def test_delete_spurs_rejects_unknown_kind():
 
 
 # ----------------------------------------------------------------------
-# expand_labels mode kwarg: voronoi vs bridge_free
+# expand_labels mode kwarg: standard vs clean
 # ----------------------------------------------------------------------
 
 
 def test_expand_labels_rejects_unknown_mode():
     arr = np.zeros((8, 8), dtype=np.int32)
     arr[2:4, 2:4] = 1
-    with pytest.raises(ValueError, match="mode must be"):
-        ncolor.expand_labels(arr, mode="chamfer")
-    with pytest.raises(ValueError, match="mode must be"):
-        ncolor.expand_labels(arr, mode="spur_free")
+    for bad in ("chamfer", "spur_free", "voronoi", "bridge_free"):
+        with pytest.raises(ValueError, match="mode must be"):
+            ncolor.expand_labels(arr, mode=bad)
 
 
-def test_expand_labels_voronoi_default_unchanged():
-    """The default mode='voronoi' must behave exactly like the pre-mode
+def test_expand_labels_standard_default_unchanged():
+    """The default mode='standard' must behave exactly like the pre-mode
     expand_labels (regression check on the existing API)."""
     arr = np.zeros((10, 10), dtype=np.int32)
     arr[2:4, 2:4] = 1
     arr[6:8, 6:8] = 2
     out_default = ncolor.expand_labels(arr)
-    out_explicit = ncolor.expand_labels(arr, mode="voronoi")
+    out_explicit = ncolor.expand_labels(arr, mode="standard")
     assert np.array_equal(out_default, out_explicit)
 
 
 @pytest.mark.parametrize("p", [1, 2])
-def test_expand_labels_bridge_free(p):
-    """expand_labels(mode='bridge_free') runs the bridge-aware Voronoi
-    expand directly (the same kernel used by ncolor.label's default
-    expand path). Output should fill the image and may have a small
-    number of barrier zeros where bridge_free identified bridges/stubs."""
+def test_expand_labels_clean(p):
+    """expand_labels(mode='clean') runs the bridge-aware Voronoi expand
+    directly (the same kernel used by ncolor.label's default expand
+    path). Output should fill the image and may have a small number of
+    barrier zeros where the clean pass identified bridges/stubs."""
     arr = _circles_2d_dense()
-    out = ncolor.expand_labels(arr, p=p, mode="bridge_free")
+    out = ncolor.expand_labels(arr, p=p, mode="clean")
     assert out.shape == arr.shape
     assert out.dtype == np.int32
-    # All original fg pixels are preserved (their Voronoi seed label
-    # is unchanged by bridge_free's barrier removal — barriers can
-    # only fall on cells that were already at face_count <= 1).
-    # Most of the image gets filled (allow a tiny fraction at barriers).
+    # All original fg pixels are preserved (their Voronoi seed label is
+    # unchanged by the barrier removal — barriers can only fall on
+    # cells that were already at face_count <= 1). Most of the image
+    # gets filled (allow a tiny fraction at barriers).
     fill_frac = (out > 0).mean()
-    assert fill_frac > 0.9, f"bridge_free expand filled only {fill_frac:.3f}"
+    assert fill_frac > 0.9, f"clean expand filled only {fill_frac:.3f}"
 
 
-def test_expand_labels_bridge_free_metric_alias():
-    """mode='bridge_free' accepts metric='l1' / 'l2' as aliases for p=1/2."""
+def test_expand_labels_clean_metric_alias():
+    """mode='clean' accepts metric='l1' / 'l2' as aliases for p=1/2."""
     arr = np.zeros((16, 16), dtype=np.int32)
     arr[2:4, 2:4] = 1
     arr[10:12, 10:12] = 2
-    out_l1 = ncolor.expand_labels(arr, mode="bridge_free", metric="l1")
-    out_p1 = ncolor.expand_labels(arr, mode="bridge_free", p=1)
-    out_l2 = ncolor.expand_labels(arr, mode="bridge_free", metric="l2")
-    out_p2 = ncolor.expand_labels(arr, mode="bridge_free", p=2)
+    out_l1 = ncolor.expand_labels(arr, mode="clean", metric="l1")
+    out_p1 = ncolor.expand_labels(arr, mode="clean", p=1)
+    out_l2 = ncolor.expand_labels(arr, mode="clean", metric="l2")
+    out_p2 = ncolor.expand_labels(arr, mode="clean", p=2)
     assert np.array_equal(out_l1, out_p1)
     assert np.array_equal(out_l2, out_p2)
 
 
-def test_expand_labels_bridge_free_rejects_bad_metric():
+def test_expand_labels_clean_rejects_bad_metric():
     arr = np.zeros((8, 8), dtype=np.int32)
     arr[2:4, 2:4] = 1
     with pytest.raises(ValueError, match="Unknown metric"):
-        ncolor.expand_labels(arr, mode="bridge_free", metric="chebyshev")
+        ncolor.expand_labels(arr, mode="clean", metric="chebyshev")
     with pytest.raises(ValueError, match="p must be 1 or 2"):
-        ncolor.expand_labels(arr, mode="bridge_free", p=3)
+        ncolor.expand_labels(arr, mode="clean", p=3)
 
 
 def test_delete_spurs_remove_thin_one_shot():
@@ -532,7 +530,7 @@ def test_soft_default_path_runs_and_preserves_mask():
     """Default `ncolor.label(m)` is now auto-soft (soft_conn=2 r=2) +
     clean_mask=False. Verifies the soft pathway fires without errors AND
     that the output's foreground/background pattern matches the input
-    exactly — bridge_free barriers must NOT leak through to the output."""
+    exactly — clean-expand barriers must NOT leak through to the output."""
     m = _circles_2d_dense()
     out, n_used = ncolor.label(m, return_n=True)
     assert 1 <= int(n_used) <= 4
@@ -555,8 +553,8 @@ def test_soft_explicit_extra_edges_path():
 
 def test_clean_mask_true_vs_false_differs_only_at_barriers():
     """clean_mask=False (default) keeps original fg/bg exact. clean_mask
-    =True opts into the bridge_free-barrier-zeros-surface-too behavior:
-    the output may have additional zeros where bridge_free identified
+    =True opts into the clean-expand-barrier-zeros-surface-too behavior:
+    the output may have additional zeros where the clean expand identified
     bridges/stubs. Where both produce a color, the colors must agree."""
     m = _circles_2d_dense()
     out_default = ncolor.label(m)                  # clean_mask=False

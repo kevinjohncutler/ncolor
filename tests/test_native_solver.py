@@ -174,7 +174,7 @@ def _coloring_is_valid(mask, colored, conn):
     color_of = {}
     for l in labels:
         # Pick the most common NONZERO color in this label's region.
-        # Picking the first pixel arbitrarily can hit a bridge_free
+        # Picking the first pixel arbitrarily can hit a clean-expand
         # barrier (colored == 0), which would falsely report a "shared
         # color of 0" conflict against any other label that also has a
         # barrier at its first pixel.

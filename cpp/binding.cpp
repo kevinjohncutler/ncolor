@@ -28,7 +28,7 @@
 #include "fast_despur.hpp"
 #include "connect_with_face_count.hpp"
 #include "expand_lp.hpp"
-#include "bridge_free.hpp"
+#include "expand_clean.hpp"
 #include "soft_color.hpp"
 #include "format_labels.hpp"
 #include "connect.hpp"
@@ -171,12 +171,12 @@ public:
     // in 2D) are marked as barriers (lbl=0) so the next axis sweep
     // can't refill them. Currently 2D L2 only — falls back to standard
     // L2 expand for ND > 2 until 3D antipodal generalization lands.
-    py::array_t<int32_t> expand_labels_bridge_free(
+    py::array_t<int32_t> expand_labels_clean(
             py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
             int p = 2) {
         if (p != 1 && p != 2) {
             throw std::invalid_argument(
-                "expand_labels_bridge_free: p must be 1 or 2");
+                "expand_labels_clean: p must be 1 or 2");
         }
         const auto buf = labels.request();
         std::vector<int64_t> shape(buf.ndim);
@@ -188,7 +188,7 @@ public:
 
         {
             py::gil_scoped_release release;
-            ncolor_cpp::expand_labels_bridge_free_inplace(
+            ncolor_cpp::expand_labels_clean_inplace(
                 input, bufs_, shape, *pool_, n_threads_, p);
             std::memcpy(out_ptr, bufs_.lbl(),
                         bufs_.size() * sizeof(int32_t));
@@ -564,16 +564,16 @@ public:
             py::object extra_edges_obj = py::none(),
             int connect_radius = 1,
             // despur_iters / despur_remove_thin default to 0/false:
-            // bridge_free (the default expand_mode) already subsumes
-            // the bridge + stub removal, so running an additional despur
-            // pass on top is a no-op-but-still-O(N) pass. The Python
-            // public ``ncolor.label()`` API dropped these kwargs in 2.0;
-            // they remain on the C++ binding only for the niche callers
-            // who use expand_mode="voronoi" + want explicit despur.
+            // the "clean" expand_mode (default) already subsumes the
+            // bridge + stub removal, so running an additional despur pass
+            // on top is a no-op-but-still-O(N) pass. The Python public
+            // ``ncolor.label()`` API dropped these kwargs in 2.0; they
+            // remain on the C++ binding only for the niche callers who
+            // use expand_mode="standard" + want explicit despur.
             int despur_iters = 0,
             bool despur_remove_thin = false,
             int min_contact = 1,
-            std::string expand_mode = "bridge_free",
+            std::string expand_mode = "clean",
             py::object soft_extra_edges_obj = py::none(),
             int soft_conn = 2,
             int soft_radius = 2,
@@ -742,34 +742,36 @@ public:
             // envelope. Result lands in expand_bufs_.lbl(); the
             // ``input == output`` self-copy guards inside LpExpand
             // variants make this a no-op when expand_input == expanded.
-            // Resolve expand strategy. Default is "bridge_free": ND Lp
-            // Voronoi expand fused with an antipodal-bridge test and a
-            // despur peel-back cascade in one pass (subsumes despur, so
+            // Resolve expand strategy. Default is "clean": ND Lp Voronoi
+            // expand fused with an antipodal-bridge test and a despur
+            // peel-back cascade in one pass (subsumes despur, so
             // despur_iters is unused on that path).
             std::string em = expand_mode;
-            if (em.empty()) em = "bridge_free";
-            // When `clean_mask=false` (default) and bridge_free is in
-            // use, the output LUT should be applied to the ORIGINAL
-            // foreground labels (before bridge_free zeros bridge/stub
-            // pixels as graph barriers). The picker's coloring is still
-            // built from the cleaned graph; we only redirect the final
-            // pixel-by-pixel LUT lookup. Snapshot the post-format /
-            // pre-expand labels here so apply_color_lut_ can use them.
+            if (em.empty()) em = "clean";
+            // When `clean_mask=false` (default) and the "clean" expand
+            // mode is in use, the output LUT should be applied to the
+            // ORIGINAL foreground labels (before the clean pass zeroes
+            // bridge/stub pixels as graph barriers). The picker's
+            // coloring is still built from the cleaned graph; we only
+            // redirect the final pixel-by-pixel LUT lookup. Snapshot the
+            // post-format / pre-expand labels here so apply_color_lut_
+            // can use them.
             const bool need_orig_snapshot = !clean_mask
-                && expand && em == "bridge_free";
+                && expand && em == "clean";
             if (need_orig_snapshot) {
                 orig_labels_.assign(expand_input, expand_input + total);
             }
             if (expand) {
-                if (em == "bridge_free") {
-                    // Bridge-free Voronoi expand (ND, Lp). Single pass
-                    // does the EDT sweep + antipodal bridge removal +
-                    // despur cascade; result lands in expand_bufs_.lbl()
-                    // which `expanded` already points to.
-                    ncolor_cpp::expand_labels_bridge_free_inplace(
+                if (em == "clean") {
+                    // Voronoi expand + antipodal-bridge test + despur
+                    // cascade (ND, Lp). Single pass does the EDT sweep +
+                    // antipodal bridge removal + despur cascade; result
+                    // lands in expand_bufs_.lbl() which `expanded`
+                    // already points to.
+                    ncolor_cpp::expand_labels_clean_inplace(
                         expand_input, expand_bufs_, shape,
                         *pool_, n_threads_, p);
-                } else if (em == "voronoi") {
+                } else if (em == "standard") {
                     if (p == 2) {
                         ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
                     } else {
@@ -777,7 +779,7 @@ public:
                     }
                 } else {
                     throw std::invalid_argument(
-                        "expand_mode must be 'bridge_free' or 'voronoi'; "
+                        "expand_mode must be 'clean' or 'standard'; "
                         "got '" + em + "'");
                 }
             }
@@ -810,7 +812,7 @@ public:
             // because removing those edges triggers the same picker
             // heuristic failure as the iter-30 cliff, just earlier (at
             // iter 2 instead of iter 30). The principled fix is the
-            // default ``expand_mode="bridge_free"``, which never creates
+            // default ``expand_mode="clean"``, which never creates
             // the thin bridges in the first place.
             // ``lut_lbl_ptr`` is the buffer apply_color_lut_ reads at the
             // end: by default that's the post-expand ``expanded`` buffer.
@@ -1152,9 +1154,9 @@ public:
             // 5. Build LUT (expanded[i] is in 1..N, so lut size = N+1) and
             // apply it to the fg-label buffer. Default (clean_mask=false)
             // uses the pre-expand snapshot ``orig_labels_`` so original-fg
-            // pixels keep their cell's color even if bridge_free zeroed
+            // pixels keep their cell's color even if the clean expand zeroed
             // them as barriers for graph cleanup. With clean_mask=true,
-            // the post-expand buffer (lut_lbl_ptr) is used and bridge_free
+            // the post-expand buffer (lut_lbl_ptr) is used and the clean expand
             // barriers surface as 0 in the output.
             lut_.assign(static_cast<size_t>(N) + 1, 0);
             for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
@@ -1859,7 +1861,7 @@ private:
         // mutual edges and merge them. O(M + cur_n²) per merge.
         //
         // This is a no-op when the (k+1)-coloring has all classes
-        // pairwise adjacent (e.g. mm 2k² p=2 bridge_free, where the
+        // pairwise adjacent (e.g. mm 2k² p=2 clean expand, where the
         // 5-coloring is "tight"); in those cases χ is still k but
         // recovering it from a fresh coloring would require Kempe-chain
         // recoloring or a stronger heuristic. We don't attempt that
@@ -1926,11 +1928,11 @@ private:
     // Apply LUT to fg pixels. bg pixels (bg_mask_[i] == 1) ALWAYS get
     // 0 in the output — `expand` is an internal graph-building thing,
     // not a visual fill. ``src`` provides the label for each fg pixel:
-    //   - default (clean_mask=false): a pre-bridge_free snapshot of the
+    //   - default (clean_mask=false): a pre-clean-expand snapshot of the
     //     fg labels, so original-fg pixels never lose their cell color
-    //     to a barrier zero from bridge_free.
+    //     to a barrier zero from the clean expand.
     //   - clean_mask=true OR no snapshot available: the post-expand
-    //     buffer (lut_lbl_ptr), which surfaces bridge_free's barriers
+    //     buffer (lut_lbl_ptr), which surfaces the clean expand's barriers
     //     as 0 in the output too.
     void apply_color_lut_(const int32_t* src, uint8_t* out_ptr,
                            int64_t total) {
@@ -1978,9 +1980,9 @@ private:
     // Snapshot of the post-format, pre-expand labels (just the original
     // foreground pixels with their 1..N IDs; bg is 0). Used by
     // apply_color_lut_ when clean_mask=false so original-fg pixels
-    // ALWAYS get their cell's color even when bridge_free zeroed them
+    // ALWAYS get their cell's color even when the clean expand zeroed them
     // as bridges/stubs for graph cleanup. Only populated when
-    // clean_mask=false AND expand_mode="bridge_free" AND expand=true.
+    // clean_mask=false AND expand_mode="clean" AND expand=true.
     std::vector<int32_t> orig_labels_;
     // Per-pixel same-label face-neighbour count, reused by fast_despur
     // (compute_face_count_nd + despur_via_face_count_nd). Only allocated
@@ -2034,7 +2036,7 @@ PYBIND11_MODULE(_impl, m) {
              "chamfer kernels (no Python-level padding): L1 ~1.1× std,\n"
              "L2 ~1.4-1.6× std. Verified bit-equal to a np.pad reference\n"
              "on standard inputs.")
-        .def("expand_labels_bridge_free", &ExpandEngine::expand_labels_bridge_free,
+        .def("expand_labels_clean", &ExpandEngine::expand_labels_clean,
              py::arg("labels"), py::arg("p") = 2,
              "Bridge-free Voronoi label expansion (2D only for now).\n"
              "Identical to expand_labels except an antipodal-only bridge\n"
@@ -2115,7 +2117,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("despur_iters") = 0,
              py::arg("despur_remove_thin") = false,
              py::arg("min_contact") = 1,
-             py::arg("expand_mode") = "bridge_free",
+             py::arg("expand_mode") = "clean",
              py::arg("soft_extra_edges") = py::none(),
              py::arg("soft_conn") = 2,
              py::arg("soft_radius") = 2,

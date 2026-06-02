@@ -56,9 +56,9 @@ def load_mm():
 
 
 def time_local(lab, n, reps=12, warmup=4):
-    """Local HEAD: bare defaults (conn=1, p=2 L2/Felzenszwalb + bridge_free
-    expand + auto-soft). conn=1, p=2 are the 2.0 defaults and the path the
-    soft/bridge_free stack was designed around — L2 places Voronoi
+    """Local HEAD: bare defaults (conn=1, p=2 L2/Felzenszwalb + clean
+    expand + auto-soft). conn=1, p=2 are the 2.0 defaults and the path
+    the soft/clean-expand stack was designed around — L2 places Voronoi
     boundaries that avoid K_5 obstructions on mm-class data. conn=1 and
     p=2 are passed explicitly here for documentation; they match the
     function defaults."""
@@ -74,7 +74,7 @@ def time_local(lab, n, reps=12, warmup=4):
 
 
 # PyPI numba ncolor matched at conn=1 for an apples-to-apples comparison
-# of the hard kernel. (PyPI 1.5.3 has no soft/bridge_free knobs.)
+# of the hard kernel. (PyPI 1.5.3 has no soft / clean-expand knobs.)
 PYPI_SCRIPT = textwrap.dedent("""
     import sys, time, json, numpy as np
     sys.path.insert(0, %r)

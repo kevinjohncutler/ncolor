@@ -107,9 +107,14 @@ def test_format_labels_first_seen_matches_fastremap_bit_for_bit():
 
 
 def _ref_clean_with_skimage(arr, min_area, background=0):
-    """Reference clean=True implementation using the original
-    skimage+fastremap pipeline. Used to lock the cpp rewrite to
-    bit-identical output."""
+    """Reference clean=True implementation using skimage+fastremap.
+    Used to verify the cpp rewrite matches the per-label disjoint-
+    component split + min_area drop semantics.
+
+    Note: the threshold is `area < min_area` uniformly across ranks.
+    The original skimage+fastremap pipeline used an asymmetric
+    `<=` for the primary; we fixed that in 2.0 and the reference
+    follows suit."""
     from skimage import measure
     import fastremap
 
@@ -137,7 +142,7 @@ def _ref_clean_with_skimage(arr, min_area, background=0):
                 else:
                     labels[tuple(rg.coords.T)] = np.max(labels) + 1
         rg0 = regions[0]
-        if rg0.area <= min_area:
+        if rg0.area < min_area:
             labels[tuple(rg0.coords.T)] = background
 
     fastremap.renumber(labels, in_place=True)

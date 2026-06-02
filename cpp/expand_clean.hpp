@@ -1,4 +1,4 @@
-// Bridge-free Voronoi expansion.
+// Voronoi expansion + bridge cleanup ("clean" expand mode).
 //
 // Adds an antipodal-bridge test to the L2 separable expand_labels: after
 // each EDT axis sweep, pixels that pass the local antipodal-only test are
@@ -23,8 +23,8 @@
 //   extra parallel scan per axis with all reads happening after the axis
 //   has fully committed. The cost is small relative to EDT itself.
 
-#ifndef NCOLOR_BRIDGE_FREE_HPP
-#define NCOLOR_BRIDGE_FREE_HPP
+#ifndef NCOLOR_EXPAND_CLEAN_HPP
+#define NCOLOR_EXPAND_CLEAN_HPP
 
 #include <algorithm>
 #include <atomic>
@@ -49,7 +49,7 @@ namespace ncolor_cpp {
 // INT32_MIN is impossible for a normal squared L2 distance (always >= 0).
 constexpr int32_t BRIDGE_BARRIER_DIST = INT32_MIN;
 
-namespace bridge_free_detail {
+namespace expand_clean_detail {
 
 // Antipodal-only same-label test for 2D 8-neighborhood. Returns true iff
 // labels[y*W + x] is non-zero AND has EXACTLY 2 same-label neighbors
@@ -132,7 +132,7 @@ inline bool is_antipodal_bridge_subspace(
     return pair_idx[match_a] == match_b;
 }
 
-}  // namespace bridge_free_detail
+}  // namespace expand_clean_detail
 
 
 // ND helper: compute the 3^k - 1 displacement offsets in the subspace
@@ -598,7 +598,7 @@ inline int64_t bridge_check_2d(
                            std::vector<int64_t>& out) {
         for (int64_t y = y_lo; y < y_hi; ++y) {
             for (int64_t x = 0; x < W; ++x) {
-                if (bridge_free_detail::is_antipodal_bridge_2d(
+                if (expand_clean_detail::is_antipodal_bridge_2d(
                         labels, y, x, H, W)) {
                     out.push_back(y * W + x);
                 }
@@ -792,7 +792,7 @@ inline void envelope_pass_barrier(
 // still used for axis 0 — it's a no-op when no barriers exist, but
 // keeps the code path uniform with the ND case (where intermediate
 // barriers do exist).
-inline void expand_labels_bridge_free_2d_inplace(
+inline void expand_labels_clean_2d_inplace(
     const int32_t* input, ExpandBuffers& bufs,
     int64_t H, int64_t W,
     ForkJoinPool& pool, int n_threads)
@@ -950,7 +950,7 @@ inline void chamfer_st_l1_axis(int32_t* lbl, int32_t* dist,
 
 
 // Per-axis L2 sweep driver, barrier-aware. Mirrors the inner loop body
-// of expand_labels_inplace for one axis, with the bridge_free_detail
+// of expand_labels_inplace for one axis, with the expand_clean_detail
 // barrier-aware envelope_pass when needed.
 inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
                                    int32_t* t_lbl, int32_t* t_dist,
@@ -998,7 +998,7 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
 // sweeps respect barriers (skip writes, refuse to propagate from them).
 //
 // p: 1 = L1 (Saito-Toriwaki), 2 = L2 (Felzenszwalb). Default 2.
-inline void expand_labels_bridge_free_nd_inplace(
+inline void expand_labels_clean_nd_inplace(
     const int32_t* input, ExpandBuffers& bufs,
     const std::vector<int64_t>& shape,
     ForkJoinPool& pool, int n_threads, int p = 2)
@@ -1062,7 +1062,7 @@ inline void expand_labels_bridge_free_nd_inplace(
 // boundaries are axis-aligned and create 1-wide diagonal strings where
 // two cells meet at a corner). This is the metric where the bridge
 // test actually changes the output visibly.
-inline void expand_labels_bridge_free_l1_2d_inplace(
+inline void expand_labels_clean_l1_2d_inplace(
     const int32_t* input, ExpandBuffers& bufs,
     int64_t H, int64_t W,
     ForkJoinPool& pool, int n_threads)
@@ -1096,15 +1096,15 @@ inline void expand_labels_bridge_free_l1_2d_inplace(
 // false-positives. Subsequent axes respect the barriers.
 //
 // p: integer Lp norm. 1 = L1 (Saito-Toriwaki), 2 = L2 (Felzenszwalb).
-inline void expand_labels_bridge_free_inplace(
+inline void expand_labels_clean_inplace(
     const int32_t* input, ExpandBuffers& bufs,
     const std::vector<int64_t>& shape,
     ForkJoinPool& pool, int n_threads, int p)
 {
-    expand_labels_bridge_free_nd_inplace(
+    expand_labels_clean_nd_inplace(
         input, bufs, shape, pool, n_threads, p);
 }
 
 }  // namespace ncolor_cpp
 
-#endif  // NCOLOR_BRIDGE_FREE_HPP
+#endif  // NCOLOR_EXPAND_CLEAN_HPP

@@ -80,7 +80,7 @@ def _is_valid_coloring_2d(colored, mask):
     diff_right = mask[:, :-1] != mask[:, 1:]
     diff_down = mask[:-1, :] != mask[1:, :]
     # Require both colored values > 0; otherwise this is a barrier
-    # (legitimate bridge_free removal) and the "same color (=0)" match
+    # (legitimate clean-expand removal) and the "same color (=0)" match
     # is spurious.
     both_col_right = (colored[:, :-1] > 0) & (colored[:, 1:] > 0)
     both_col_down = (colored[:-1, :] > 0) & (colored[1:, :] > 0)
@@ -209,7 +209,7 @@ def test_label_expand_false_keeps_bg(solver):
     out_with_expand, _ = solver.label(m, conn=2, expand=True)
     out_no_expand, _ = solver.label(m, conn=2, expand=False)
     # bg mask matches input bg mask in both cases (clean_mask=False
-    # default keeps original-fg pixels colored even when bridge_free
+    # default keeps original-fg pixels colored even when the clean expand
     # zeros them internally).
     assert np.array_equal((out_with_expand == 0), (m == 0))
     assert np.array_equal((out_no_expand == 0), (m == 0))

@@ -7,19 +7,19 @@ and versions follow [semantic versioning](https://semver.org/).
 
 ## [2.0.0] — unreleased
 
-The headline of 2.0 is a new default expand pipeline (`bridge_free`) and
-an opt-out auto-soft constraint post-pass that together produce cleaner
-4-colorings on real microscopy data. A small number of kwargs were
-removed; the major bump captures that surface change.
+The headline of 2.0 is a new default expand pipeline (`expand_mode="clean"`)
+and an opt-out auto-soft constraint post-pass that together produce
+cleaner 4-colorings on real microscopy data. A small number of kwargs
+were removed; the major bump captures that surface change.
 
 ### Added
 
-- **`bridge_free` expand mode** (now the default `expand_mode`). ND Lp
-  Voronoi sweep fused with an antipodal-bridge test and a despur
-  peel-back cascade in one pass. Subsumes the older expand + despur
-  chain; removes 1-pixel bridges and ≤1-face stubs as graph barriers
-  to prevent K_5-shaped convergence clusters that would otherwise
-  block 4-coloring.
+- **`expand_mode="clean"`** (now the default). ND Lp Voronoi sweep
+  fused with an antipodal-bridge test and a despur peel-back cascade
+  in one pass. Subsumes the older expand + despur chain; removes
+  1-pixel bridges and ≤1-face stubs as graph barriers to prevent
+  K_5-shaped convergence clusters that would otherwise block
+  4-coloring.
 - **Soft-constraint post-pass** for `ncolor.label()`. New kwargs
   `soft_conn`, `soft_radius`, `soft_extra_edges`:
   - `soft_conn=2, soft_radius=2` (new defaults) auto-build a soft
@@ -34,15 +34,16 @@ removed; the major bump captures that surface change.
   - `solver.get_last_n_soft_violations()` exposes the residual
     soft-violation count.
 - **`clean_mask` kwarg** (default `False`): output preserves the
-  input mask's foreground / background pattern exactly. Bridge_free's
-  internal barrier removal stays a graph-only step; the LUT is
-  applied to a pre-bridge_free snapshot of the foreground labels.
-  Set `clean_mask=True` for the old behavior where barrier zeros
-  surface in the output too (useful as a clean + label combined op).
-- **`verbose=True`** writes a one-line stage-breakdown summary
+  input mask's foreground / background pattern exactly. The clean
+  expand's internal barrier removal stays a graph-only step; the LUT
+  is applied to a pre-clean snapshot of the foreground labels. Set
+  `clean_mask=True` for the old behavior where barrier zeros surface
+  in the output too (useful as a clean + label combined op).
+- **`verbose=True`** writes a structured stage-breakdown summary
   (shape, n_used, residual soft violations, total ms, per-stage
-  timings) to stderr after the call. Replaces what was previously a
-  back-compat no-op slot.
+  timings) to stderr after the call. 1.5.x's `verbose=True` printed
+  a couple of ad-hoc progress lines to stdout — same intent, different
+  content and stream.
 - **Dual-emit `find_pairs`** kernel (`find_pairs_dual_nd_unpadded` in
   `cpp/connect.hpp`). Emits both base and delta pairs in a single
   pixel walk via a per-pixel routing inner loop. Drops the cost of
@@ -51,47 +52,65 @@ removed; the major bump captures that surface change.
 - **`bb_dsatur` is iterative.** Recursive backtracking blew past the
   512 KB macOS worker-thread stack at N≈3000+; the new explicit
   heap-allocated state stack is safe for graphs of any size.
-- **`expand_labels(mode="bridge_free")`** in the Python `expand.py`
+- **`expand_labels(mode="clean")`** in the Python `expand.py`
   wrapper for callers that want to expand without coloring.
 
 ### Changed
 
 - **Default `conn=1` and `p=2`** (were `conn=2, p=1`). These match the
-  ncolor 1.x defaults and the configuration the bridge_free + auto-soft
+  ncolor 1.x defaults and the configuration the clean-expand + auto-soft
   stack was designed around. At the old `conn=2, p=1` the picker hit
   K_5 obstructions on dense microscopy data and fell back to n=5 (62 ms
   on the mm 2k² fixture); the new defaults reach n=4 in ~25 ms and
   achieve K_4=4 on the logo without per-call tuning.
-- **Default `expand_mode` is now `"bridge_free"`** (was `"voronoi"`).
+- **Default `expand_mode` is now `"clean"`** (was the pre-2.0 numba
+  default, plain Voronoi expand — now selectable as
+  `expand_mode="standard"`).
 - **Default `soft_conn=2, soft_radius=2`** turns on the auto-soft
   post-pass. Set both to `0` to disable.
-- **Threadpool idle wait on macOS** uses `sleep_for(5ms)` after the
-  spin window, ported from edt. The earlier `yield()`-based loop
-  caused a `swtch_pri` storm consuming ~1700-1800% CPU across idle
-  worker threads. Linux and Windows keep the original yield path
-  (yield is cheap there; a uniform sleep regressed Linux multi-T
-  fork-join workloads 50-200%).
+- **Threadpool idle wait** now uses a kernel wait-on-address
+  primitive (`__ulock_wait` on macOS, `futex` on Linux, `WaitOnAddress`
+  on Windows) after a short spin window, replacing both the earlier
+  `yield()`-based loop (which caused a `swtch_pri` storm consuming
+  ~1700–1800% CPU across idle workers on macOS) and the intermediate
+  `sleep_for(5ms)` fallback (whose ~10 ms macOS scheduler-tick
+  rounding regressed small parallel jobs by 60–100×). Wake latency is
+  now µs-class on every host.
 
 ### Removed
 
-- **`offset` kwarg** — was declared in `label()` and forwarded by
-  `get_lut()` but never read anywhere. Dead since v1.0.
-- **`despur_iters`** and **`despur_remove_thin`** — subsumed by
-  `bridge_free`, which is now the default and includes its own
-  fused barrier removal. The standalone despur pass was a no-op on
-  top of bridge_free.
+- **`offset` kwarg** — in 1.5.x this seeded the BFS picker's RNG
+  (`seed = ... + offset`) and the per-attempt starting offset
+  (`attempt_offset = offset + attempt`), letting callers ask for a
+  different valid coloring of the same input. 2.0's picker races 16
+  attempts per `cur_n` internally with offsets `local_depth + idx` and
+  takes the lowest-index success, so a single user-controlled seed is
+  no longer meaningful. No direct replacement; use `first_seen=True`
+  or change `p` if you need a different valid coloring of the same
+  graph.
+- **`greedy` kwarg** — 1.5.x routed `greedy=True` to a pure-greedy
+  coloring path with no repair step. 2.0's picker always does
+  BFS + repair + tabucol + bb_dsatur race; there's no "skip the repair"
+  shortcut. Drop the kwarg.
+- **`experimental` kwarg** — 1.5.x routed `experimental=True` to an
+  alternative `render_net_experimental` algorithm. That algorithm was
+  not ported to 2.0 and would have been redundant with the
+  multi-strategy race anyway. Drop the kwarg.
+- **`despur_iters`** and **`despur_remove_thin`** — subsumed by the
+  `"clean"` expand mode (now default), which includes its own fused
+  barrier removal. The standalone despur pass was a no-op on top.
 - **`expand_spur_free`** and **`spur_free_max_rounds`** — legacy
   aliases that pointed to the now-removed `expand_mode="spur_free"`.
 - **`expand_mode="spur_free"`** entirely (and the standalone
   `ncolor._backend.expand_spur_free` binding). The BFS-dilation
-  kernel built a strictly sparser contact graph than `bridge_free` /
-  `voronoi` by aggressively severing at "spur" pixels, which
-  silently changed which adjacencies the picker saw — on
-  `synthetic_800` the picker would happily return `n_used=3` with a
-  very unbalanced [399, 233, 50] cell-count split, because the
+  kernel built a strictly sparser contact graph than the new
+  `"clean"` / `"standard"` modes by aggressively severing at "spur"
+  pixels, which silently changed which adjacencies the picker saw —
+  on `synthetic_800` the picker would happily return `n_used=3` with
+  a very unbalanced [399, 233, 50] cell-count split, because the
   dropped edges made the problem 3-colorable in spur_free's graph.
   Outputs were correct relative to that graph but surprising to
-  users who expected coverage equivalent to bridge_free / voronoi.
+  users who expected full Voronoi coverage.
   Passing `expand_mode="spur_free"` now raises
   `std::invalid_argument`. `cpp/expand_spur_free.hpp` is deleted.
 - **`get_lut` public function.** A 5-line wrapper around
@@ -110,7 +129,7 @@ removed; the major bump captures that surface change.
   mm-class data). It never had a C++ port; the module docstring
   flagged the gap. With auto-soft now doing global color-balance work
   in C++ at sub-ms-per-cell cost, the two_hop path was strictly
-  dominated. `cpp/_optimize.py` is deleted.
+  dominated. `src/ncolor/_optimize.py` is deleted.
 - **`format_labels(despur=True)` per-cell Python loop.** The slow
   bbox-cropped iteration over every cell — applying binary
   `delete_spurs` + `connected_components` + region-prop area
@@ -121,8 +140,8 @@ removed; the major bump captures that surface change.
   (spurs and 1-voxel-thick interior bridges still removed) and
   faster on inputs with many cells. No public API change.
 - **`balance` kwarg** — the Welsh-Powell visit-order path it gated was
-  the picker's slot-0 warmup, and that warmup is disabled by default
-  (commit `34a067e`). With the warmup off, `balance` was a silent no-op
+  the picker's slot-0 warmup, and that warmup was disabled by default
+  earlier in 2.0 dev. With the warmup off, `balance` was a silent no-op
   on every reference image (logo, synthetic_800, mm 2k² fov104) —
   byte-identical colorings at `balance=True` and `balance=False` —
   while auto-soft post-processing already produces strictly better
@@ -133,6 +152,17 @@ removed; the major bump captures that surface change.
 
 ### Fixed
 
+- **`format_labels(clean=True)` min_area threshold is now symmetric.**
+  The 1.5.x pipeline used `area <= min_area` for the primary component
+  of each label and `area < min_area` for secondary (disjoint) parts.
+  At exactly `min_area`, a primary was dropped but a secondary
+  survived — same input geometry, opposite outcomes depending on which
+  rank a component happened to land in. The threshold is now uniformly
+  strict-less-than (`area < min_area`) across ranks: a component of
+  exactly `min_area` pixels always survives, both as a primary and as a
+  secondary. Matches the 1.5.x README documentation ("remove small
+  labels (<9px)"), which was already the secondary-rank semantic.
+  Boundary regression test added.
 - **`de_table` user-supplied palette no longer segfaults.** The
   `(n+1)×(n+1)` palette override (used with `weight_objective != 0`)
   was being parsed via `py::array_t::ensure()` and `.request()`
@@ -157,9 +187,10 @@ removed; the major bump captures that surface change.
 
 ### Performance
 
-- **mm 2k² real microscopy (5128 cells, 14.6% fill):** auto-soft
-  total ~26 ms at n=5 with sv=3 — ~11× faster than legacy numba
-  ncolor 1.4.5 at ~280 ms with sv=104.
+- **mm 2k² real microscopy (5128 cells, 14.6% fill):** ~25 ms at
+  n=4 with auto-soft on — 8.6× faster than PyPI 1.5.3 (216 ms at
+  n=5; the numba pipeline can't find a 4-coloring on this input).
+  See README bench table and `bench/bench_vs_pypi.py`.
 - **Logo K_4 cluster:** now reaches 4 distinct colors at n=4 via
   iterated local-search restarts + triangle-count edge weights in
   the soft search. Previous greedy single-Kempe was getting stuck
@@ -173,31 +204,43 @@ removed; the major bump captures that surface change.
 
 ### Internal / tests
 
-- Coverage 94% → 96% (`expand.py` 77% → 100%, `color.py` 94% → 97%).
-- Six new tests: soft path default behavior, explicit
-  `soft_extra_edges`, `clean_mask` true/false semantics, soft-off
-  fallback, `expand_labels(mode="bridge_free")` p/metric coverage,
-  `verbose=True` stage summary.
+- Test suite: 330 passing, 3 skipped (count after the removal sweep
+  that dropped `balance` / `two_hop` / `spur_free` parametrize
+  matrices). Net suite is smaller than 2.0-pre but covers exactly
+  the shipped surface.
+- New tests added for the v2.0 surface: soft default behavior,
+  explicit `soft_extra_edges`, `clean_mask` true/false semantics,
+  soft-off fallback, `expand_labels(mode="clean")` p/metric coverage,
+  `verbose=True` stage summary, `de_table` user-palette regression
+  (segfault fix), removed-kwarg rejection tests.
 - Added `.gitignore` entries for `_tmp_*` and `bench_outputs/` so
   per-session scratch and bench output directories stop polluting
   `git status`. Promoted five active benches to `bench/`.
+- Legacy `test_files/test_ncolor.py` renamed to
+  `_legacy_ncolor_tests.py` so pytest's default `test_*.py` glob
+  doesn't auto-collect it from the fixtures directory.
 
 ### Migration notes from 1.5.x
 
-- A call like `ncolor.label(m, despur_iters=2)` now raises
-  `TypeError: unexpected keyword argument 'despur_iters'`. Drop the
-  kwarg — `expand_mode="bridge_free"` (default) already includes the
-  cleanup.
-- Same for `offset`, `expand_spur_free`, `spur_free_max_rounds`,
-  `despur_remove_thin`.
+The four real 1.5.x kwargs/functions removed in 2.0 are `offset`,
+`greedy`, `experimental`, and the standalone `get_lut()` function. See
+the **Removed** section above for the per-kwarg rationale. Calling any
+of them now raises `TypeError: unexpected keyword argument`.
+
+Two more kwargs (`despur_iters`, `despur_remove_thin`) and the
+`expand_spur_free` / `spur_free_max_rounds` aliases were added during
+2.0 development but never shipped to PyPI — 1.5.x users won't have
+written code against them.
+
 - The output of `ncolor.label(m)` is no longer bit-identical to 1.5.x
   for two reasons:
-  1. Default `expand_mode` flipped from `"voronoi"` to `"bridge_free"`.
+  1. Default `expand_mode` flipped from plain Voronoi to `"clean"`
+     (Voronoi expand + bridge/spur barrier removal).
   2. Default soft-constraint post-pass is on. To recover bit-equivalent
      1.5.x behavior pass:
 
      ```python
-     ncolor.label(m, expand_mode="voronoi",
+     ncolor.label(m, expand_mode="standard",
                   soft_conn=0, soft_radius=0, clean_mask=True)
      ```
 
