@@ -20,6 +20,8 @@
 #include <cstring>
 #include <vector>
 
+#include "intrinsics.hpp"
+
 namespace ncolor_cpp {
 
 // Compute the total soft penalty for the current coloring.
@@ -99,7 +101,7 @@ inline bool single_vertex_pass(
         uint8_t best_c = cur_c;
         uint32_t mask = valid_mask;
         while (mask) {
-            int c = __builtin_ctz(mask);
+            int c = ctz_u32(mask);
             mask &= mask - 1;
             const double new_soft = soft_at_color(u, c, colors,
                                                     soft_indptr, soft_indices,
@@ -170,7 +172,7 @@ inline bool kempe_chain_pass(
         // Try each target color b != cur_c.
         uint32_t mask = all_colors & ~(1u << cur_c);
         while (mask) {
-            int b = __builtin_ctz(mask);
+            int b = ctz_u32(mask);
             mask &= mask - 1;
             // BFS the Kempe chain of u in colors {cur_c, b} via hard edges.
             // Mark visited with stamp_counter to avoid clearing.

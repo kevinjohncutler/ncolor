@@ -21,6 +21,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "intrinsics.hpp"
+
 namespace ncolor_cpp {
 
 // Bit-set helpers over a vector<uint64_t> view of length words.
@@ -28,7 +30,7 @@ namespace bk_detail {
 
 inline int popcount_bits(const uint64_t* a, int words) {
     int c = 0;
-    for (int i = 0; i < words; ++i) c += __builtin_popcountll(a[i]);
+    for (int i = 0; i < words; ++i) c += popcount_u64(a[i]);
     return c;
 }
 
@@ -54,14 +56,14 @@ inline void bit_andn(uint64_t* dst, const uint64_t* a, const uint64_t* b, int wo
     for (int i = 0; i < words; ++i) dst[i] = a[i] & ~b[i];
 }
 
-// Iterate set bits of `a` via __builtin_ctzll on each word.
+// Iterate set bits of `a` via ctz_u64 on each word.
 // Calls fn(int bit) for each set bit; fn may return true to abort.
 template <typename F>
 inline void for_each_bit(const uint64_t* a, int words, F&& fn) {
     for (int wi = 0; wi < words; ++wi) {
         uint64_t w = a[wi];
         while (w) {
-            const int b = __builtin_ctzll(w);
+            const int b = ctz_u64(w);
             w &= w - 1;
             if (fn(wi * 64 + b)) return;
         }
@@ -202,7 +204,7 @@ inline void run_bk(BKState& s) {
         int da = 0, db = 0;
         const uint64_t* ra = adj + (size_t)a * (size_t)words;
         const uint64_t* rb = adj + (size_t)b * (size_t)words;
-        for (int w = 0; w < words; ++w) { da += __builtin_popcountll(ra[w]); db += __builtin_popcountll(rb[w]); }
+        for (int w = 0; w < words; ++w) { da += popcount_u64(ra[w]); db += popcount_u64(rb[w]); }
         return da > db;
     });
 

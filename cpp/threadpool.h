@@ -54,6 +54,14 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
   #include <unistd.h>
   #include <climits>
 #elif defined(_WIN32)
+  // Prevent windows.h from defining `min`/`max` macros that break
+  // std::numeric_limits<>::max() etc. in downstream code.
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+  #endif
   #include <windows.h>
   #pragma comment(lib, "Synchronization.lib")
 #endif
@@ -90,7 +98,7 @@ inline void wake_all(int* addr) {
     ::syscall(SYS_futex, reinterpret_cast<int*>(addr),
               FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
 #elif defined(_WIN32)
-    WakeByAddressAll(reinterpret_cast<volatile void*>(addr));
+    WakeByAddressAll(reinterpret_cast<void*>(addr));
 #endif
 }
 

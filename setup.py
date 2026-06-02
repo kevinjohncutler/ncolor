@@ -51,6 +51,13 @@ MARCH_NATIVE = os.environ.get("NCOLOR_MARCH_NATIVE", "1") == "1"
 
 if sys.platform == "win32":
     extra_compile_args += ["/std:c++17", "/O2", "/EHsc"]
+    # NOMINMAX: prevent <windows.h> from defining `min` / `max` macros that
+    #   collide with `std::min` / `std::max` throughout the engine
+    #   (cc_label.hpp, chamfer.hpp, expand.hpp, expand_clean.hpp,
+    #   format_labels.hpp all use std::min/std::max).
+    # WIN32_LEAN_AND_MEAN: trim the windows.h include set; faster compile,
+    #   smaller namespace pollution.
+    extra_compile_args += ["/DNOMINMAX", "/DWIN32_LEAN_AND_MEAN"]
     if MARCH_NATIVE:
         extra_compile_args += ["/arch:AVX2"]
     if USE_CLANG_CL:

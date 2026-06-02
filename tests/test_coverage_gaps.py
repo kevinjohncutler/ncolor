@@ -577,15 +577,24 @@ def test_format_labels_clean_non_despur_secondary_dropped_silently():
 
 
 def test_on_remote_mount_windows_unc_path(monkeypatch):
-    """On Windows, UNC paths (\\\\server\\share\\...) are flagged remote."""
+    """On Windows, UNC paths (\\\\server\\share\\...) are flagged remote.
+    Uses ``PureWindowsPath`` (no OS restriction) so the test runs on
+    POSIX hosts too; ``Path(...)`` under monkeypatched ``os.name='nt'``
+    would try to instantiate ``WindowsPath`` and raise on Python <3.12
+    POSIX hosts."""
+    from pathlib import PureWindowsPath
     monkeypatch.setattr(_backend.os, "name", "nt")
-    p = Path(r"\\server\share\foo")
+    p = PureWindowsPath(r"\\server\share\foo")
     assert _backend._on_remote_mount(p) is True
 
 
 def test_on_remote_mount_windows_local_drive(monkeypatch):
+    """Local Windows drive paths (C:\\...) are not flagged remote.
+    Uses ``PureWindowsPath`` for the same cross-platform reason as
+    the UNC test above."""
+    from pathlib import PureWindowsPath
     monkeypatch.setattr(_backend.os, "name", "nt")
-    p = Path("C:/Users/foo")
+    p = PureWindowsPath("C:/Users/foo")
     # Local C: drive — anchor is "C:\\" (not "\\\\..."), so not remote.
     assert _backend._on_remote_mount(p) is False
 
