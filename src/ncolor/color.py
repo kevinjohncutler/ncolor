@@ -4,6 +4,8 @@ Thin wrappers over the C++ Solver in :mod:`ncolor._backend`.
 """
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 
 from .format import format_labels
@@ -11,13 +13,23 @@ from .format import format_labels
 
 # Persistent thread pool; constructing per call costs ~5-10 ms.
 _SOLVER = None
+# The Solver is a process-global singleton backed by a single C++ ForkJoinPool,
+# which is NOT safe for concurrent solve calls — two Python threads entering
+# ``solver.label``/``solver.connect`` at once corrupt the shared pool and
+# segfault (KERN_INVALID_ADDRESS in bridge_check_subspace_nd). Serialize every
+# C++ solve through this lock. The within-call ForkJoinPool parallelism is
+# unaffected; only cross-thread *overlap* is prevented. Reentrant so a future
+# nested solve on the same thread can't self-deadlock.
+_SOLVER_LOCK = threading.RLock()
 
 
 def _get_solver():
     global _SOLVER
     if _SOLVER is None:
-        from ._backend import Solver
-        _SOLVER = Solver()
+        with _SOLVER_LOCK:                 # guard the check-then-set init race too
+            if _SOLVER is None:
+                from ._backend import Solver
+                _SOLVER = Solver()
     return _SOLVER
 
 
@@ -214,22 +226,23 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
                 f"soft_extra_edges must be an (E, 2) int array of 1-indexed "
                 f"cell-pair preferences; got shape {soft_extra_arr.shape}")
 
-    out_array, n_used = solver.label(
-        lab_arr,
-        n_colors=int(n), max_depth=int(max_depth),
-        conn=int(conn), p=int(p), format_input=bool(format_input),
-        expand=bool(expand), out=out, wrap=bool(wrap),
-        first_seen=bool(first_seen),
-        weight_objective=wobj, de_table=de_arr,
-        weight_mode=wmode_int, extra_edges=extra_arr,
-        connect_radius=int(connect_radius),
-        min_contact=int(min_contact),
-        expand_mode=str(expand_mode),
-        soft_extra_edges=soft_extra_arr,
-        soft_conn=int(soft_conn),
-        soft_radius=int(soft_radius),
-        clean_mask=bool(clean_mask),
-        capture_stages=bool(verbose))
+    with _SOLVER_LOCK:                 # ncolor solve is not thread-safe (shared pool)
+        out_array, n_used = solver.label(
+            lab_arr,
+            n_colors=int(n), max_depth=int(max_depth),
+            conn=int(conn), p=int(p), format_input=bool(format_input),
+            expand=bool(expand), out=out, wrap=bool(wrap),
+            first_seen=bool(first_seen),
+            weight_objective=wobj, de_table=de_arr,
+            weight_mode=wmode_int, extra_edges=extra_arr,
+            connect_radius=int(connect_radius),
+            min_contact=int(min_contact),
+            expand_mode=str(expand_mode),
+            soft_extra_edges=soft_extra_arr,
+            soft_conn=int(soft_conn),
+            soft_radius=int(soft_radius),
+            clean_mask=bool(clean_mask),
+            capture_stages=bool(verbose))
     out = out_array
 
     if verbose:
@@ -281,7 +294,8 @@ def connect(img, conn=1):
 
     Returns an ``(M, 2)`` int array of unique (lo, hi) label pairs.
     """
-    return _get_solver().connect(img, conn=int(conn))
+    with _SOLVER_LOCK:                 # shares the singleton solver / pool
+        return _get_solver().connect(img, conn=int(conn))
 
 
 def connected_components(mask, conn=2):
