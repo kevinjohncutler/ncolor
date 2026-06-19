@@ -74,14 +74,36 @@ constexpr bool mode_uses_count(ReduceMode m) {
 // dispatcher rejects ndim above this.
 constexpr int FIND_PAIRS_MAX_NDIM = 16;
 
-// Insert ``key`` into a power-of-two-sized linear-probing hashtable.
-// ``ht_mask`` must be ``ht_size - 1``.  Idempotent (silently ignores duplicates).
-inline void ht_insert(uint64_t* ht, uint64_t ht_mask, uint64_t key) {
+// Bounded linear probe. Returns the slot index holding ``key`` (an
+// existing match or the first EMPTY slot to claim), or ``ht_mask + 1``
+// when the table is COMPLETELY full and ``key`` is absent.
+//
+// The bound (at most ht_size = ht_mask + 1 steps) is what makes the
+// hashtable robust: the distinct-edge count is not bounded a priori by
+// the table sizing heuristic (a dense ND Voronoi cell can be adjacent to
+// far more neighbors than 2*n_fwd — see find_pairs_ in binding.cpp), so a
+// table can legitimately fill to 100%. An unbounded `while` probe then
+// spins forever on the next insert. Returning the "no slot" sentinel lets
+// callers drop the key instead; find_pairs_ detects the full table
+// (occupancy == ht_size) and retries with a doubled table, so the dropped
+// edge is recovered. The common case (a few probes into a sub-50%-full
+// table) costs one extra comparison per probe.
+inline uint64_t ht_probe(const uint64_t* ht, uint64_t ht_mask, uint64_t key) {
     uint64_t h = (key * HT_HASH_MUL) & ht_mask;
-    while (ht[h] != HT_EMPTY && ht[h] != key) {
+    for (uint64_t p = 0; p <= ht_mask; ++p) {
+        if (ht[h] == HT_EMPTY || ht[h] == key) return h;
         h = (h + 1) & ht_mask;
     }
-    ht[h] = key;
+    return ht_mask + 1;   // table full + key absent ⇒ caller drops & retries
+}
+
+// Insert ``key`` into a power-of-two-sized linear-probing hashtable.
+// ``ht_mask`` must be ``ht_size - 1``.  Idempotent (silently ignores
+// duplicates). Drops the key if the table is completely full (recovered
+// by the find_pairs_ retry-on-full path).
+inline void ht_insert(uint64_t* ht, uint64_t ht_mask, uint64_t key) {
+    const uint64_t h = ht_probe(ht, ht_mask, key);
+    if (h <= ht_mask) ht[h] = key;
 }
 
 // Merge all entries from ``src`` into ``dst``.  Both tables are size ht_size.
@@ -109,10 +131,8 @@ inline void ht_merge(const uint64_t* src, uint64_t* dst, uint64_t ht_size) {
 template <ReduceMode Mode>
 inline void ht_insert_acc(uint64_t* ht, double* primary, int32_t* counts,
                           uint64_t ht_mask, uint64_t key, int32_t cost) {
-    uint64_t h = (key * HT_HASH_MUL) & ht_mask;
-    while (ht[h] != HT_EMPTY && ht[h] != key) {
-        h = (h + 1) & ht_mask;
-    }
+    const uint64_t h = ht_probe(ht, ht_mask, key);
+    if (h > ht_mask) return;   // table full ⇒ drop (recovered on retry)
     const bool is_new = (ht[h] == HT_EMPTY);
     if (is_new) ht[h] = key;
 
@@ -148,10 +168,8 @@ inline void ht_merge_acc(const uint64_t* src_ht,
     for (uint64_t h = 0; h < ht_size; ++h) {
         const uint64_t key = src_ht[h];
         if (key == HT_EMPTY) continue;
-        uint64_t dh = (key * HT_HASH_MUL) & ht_mask;
-        while (dst_ht[dh] != HT_EMPTY && dst_ht[dh] != key) {
-            dh = (dh + 1) & ht_mask;
-        }
+        const uint64_t dh = ht_probe(dst_ht, ht_mask, key);
+        if (dh > ht_mask) continue;   // dst full ⇒ drop (recovered on retry)
         const bool is_new = (dst_ht[dh] == HT_EMPTY);
         if (is_new) dst_ht[dh] = key;
         if constexpr (Mode == ReduceMode::Min) {
@@ -173,10 +191,8 @@ inline void ht_merge_acc(const uint64_t* src_ht,
 // Backward-compat aliases (the old Min-only API surface).
 inline void ht_insert_min(uint64_t* ht, int32_t* mins, uint64_t ht_mask,
                           uint64_t key, int32_t cost) {
-    uint64_t h = (key * HT_HASH_MUL) & ht_mask;
-    while (ht[h] != HT_EMPTY && ht[h] != key) {
-        h = (h + 1) & ht_mask;
-    }
+    const uint64_t h = ht_probe(ht, ht_mask, key);
+    if (h > ht_mask) return;   // table full ⇒ drop (recovered on retry)
     if (ht[h] == HT_EMPTY) {
         ht[h] = key;
         mins[h] = cost;

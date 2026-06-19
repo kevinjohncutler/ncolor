@@ -1265,13 +1265,43 @@ private:
         const int ndim = static_cast<int>(shape.size());
         const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbors(
             ndim, conn, radius);
-        const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
-        const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE));
-        return ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
-            labels, shape, conn,
-            static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap, radius,
-            &fp_ht_buf_);
+        uint64_t ht_size = initial_ht_size_(ndim, n_fwd, max_label);
+        // Retry-on-full: the number of DISTINCT adjacency edges is not
+        // bounded by n_fwd*max_label — a dense ND Voronoi cell can be
+        // face-adjacent to many more neighbors than 2*n_fwd (3D Poisson-
+        // Voronoi mean degree ≈ 15.5 vs 2*n_fwd=6 at conn=1). If the
+        // estimate is low the open-addressing table fills to 100%; the
+        // bounded probe (ht_probe) then drops edges rather than spinning.
+        // out.size() == occupancy, so out.size() == ht_size means the
+        // table filled and an edge may have been dropped — double and
+        // retry. Terminates: distinct edges ≤ max_label², finite.
+        for (;;) {
+            auto out = ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
+                labels, shape, conn,
+                ht_size, n_threads_, *pool_, wrap, radius,
+                &fp_ht_buf_);
+            if (out.size() < ht_size || ht_size >= HT_SIZE_CAP) return out;
+            ht_size <<= 1;
+        }
     }
+
+    // Seed hashtable size for find_pairs. 2*n_fwd*max_label is correct for
+    // planar (2D) adjacency graphs (avg degree < 6 ⇒ 2*n_fwd=4 has
+    // headroom), but undersizes non-planar ND graphs. Give ndim≥3 enough
+    // headroom (degree ~32) to size correctly on the first try; the
+    // retry-on-full loop guarantees correctness if even this is low.
+    static uint64_t initial_ht_size_(int ndim, int64_t n_fwd,
+                                     int32_t max_label) {
+        int64_t deg = 2 * n_fwd;
+        if (ndim >= 3) deg = std::max<int64_t>(deg, 32);
+        const int64_t ht_raw = deg * static_cast<int64_t>(max_label);
+        return static_cast<uint64_t>(
+            ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE)));
+    }
+    // Absolute safety cap on table growth (2^31 slots). Never reached for
+    // realistic inputs — distinct edges ≤ max_label² forces termination
+    // far sooner — but bounds the retry loop against a pathological case.
+    static constexpr uint64_t HT_SIZE_CAP = (uint64_t{1} << 31);
 
     // Weighted variant: same parallel scan also computes a per-pair
     // reducer over the boundary using the EDT distance map. ``Mode``
@@ -1291,13 +1321,18 @@ private:
         const int ndim = static_cast<int>(shape.size());
         const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbors(
             ndim, conn, radius);
-        const int64_t ht_raw = 2 * n_fwd * static_cast<int64_t>(max_label);
-        const int64_t ht_size = ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE));
-        return ncolor_cpp::find_pairs_weighted_nd_unpadded<int32_t, Mode>(
-            labels, dist, shape, conn,
-            static_cast<uint64_t>(ht_size), n_threads_, *pool_, wrap,
-            primary, counts, radius,
-            &fp_ht_buf_, &fp_primary_buf_, &fp_counts_buf_);
+        uint64_t ht_size = initial_ht_size_(ndim, n_fwd, max_label);
+        // Retry-on-full (see find_pairs_): the weighted reducer arrays are
+        // re-cleared and refilled on each call, so a retry is self-consistent.
+        for (;;) {
+            auto out = ncolor_cpp::find_pairs_weighted_nd_unpadded<int32_t, Mode>(
+                labels, dist, shape, conn,
+                ht_size, n_threads_, *pool_, wrap,
+                primary, counts, radius,
+                &fp_ht_buf_, &fp_primary_buf_, &fp_counts_buf_);
+            if (out.size() < ht_size || ht_size >= HT_SIZE_CAP) return out;
+            ht_size <<= 1;
+        }
     }
 
     // Coloring loop: race ``attempts_per_n`` BFS-with-random-offset
