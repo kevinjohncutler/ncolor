@@ -1,7 +1,6 @@
-import multiprocessing as mp
+import faulthandler
 
 import numpy as np
-import pytest
 
 import ncolor
 
@@ -62,11 +61,6 @@ def _make_dense_seeds_3d(shape, n_seeds, seed):
     return m
 
 
-def _label_worker(labels, q):
-    _, conflicts = ncolor.label(labels, expand=True, return_conflicts=True)
-    q.put(int(conflicts))
-
-
 def test_3d_dense_voronoi_does_not_hang_findpairs():
     """Regression: a dense 3D Voronoi where the distinct-edge count exceeds
     the find_pairs hashtable's initial size used to fill the open-addressing
@@ -78,20 +72,16 @@ def test_3d_dense_voronoi_does_not_hang_findpairs():
     6-connected edges vs the old table size of ipow2(6*341) = 2048 — i.e. a
     guaranteed overflow on the pre-fix code path.
 
-    Run in a subprocess with a hard timeout so a re-introduced hang fails
-    the test instead of stalling the whole suite forever.
+    A faulthandler watchdog (a C-level timer thread, so it fires even while
+    the GIL is held inside the C++ solver) aborts with a traceback if the
+    call hangs, turning a re-introduced infinite loop into a hard failure
+    instead of an indefinite stall.
     """
     labels = _make_dense_seeds_3d((100, 100, 100), n_seeds=341, seed=3)
 
-    ctx = mp.get_context("spawn")
-    q = ctx.Queue()
-    proc = ctx.Process(target=_label_worker, args=(labels, q))
-    proc.start()
-    proc.join(timeout=60)
-    if proc.is_alive():
-        proc.terminate()
-        proc.join()
-        pytest.fail("ncolor.label(expand=True) hung on dense 3D Voronoi "
-                    "(find_pairs hashtable overflow regression)")
-    assert not q.empty(), "worker died without returning a result"
-    assert q.get() == 0   # valid coloring, no adjacent same-color cells
+    faulthandler.dump_traceback_later(120, exit=True)
+    try:
+        _, conflicts = ncolor.label(labels, expand=True, return_conflicts=True)
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    assert conflicts == 0   # valid coloring, no adjacent same-color cells
