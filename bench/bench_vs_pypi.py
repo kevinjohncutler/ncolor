@@ -37,7 +37,7 @@ def load_logo():
 
 
 def load_synth():
-    img = np.load(f"{REPO}/test_files/synthetic_800.npy").astype(np.int32)
+    img = np.load(f"{REPO}/test_files/synthetic_800.npz")["labels"].astype(np.int32)
     _, inv = np.unique(img, return_inverse=True)
     return inv.reshape(img.shape).astype(np.int32)
 
