@@ -775,19 +775,65 @@ def test_cpu_model_darwin_failure(monkeypatch):
     assert _smt._cpu_model() == "fallback-mac"
 
 
-def test_cpu_model_win32(monkeypatch):
+class _FakeWinreg:
+    """Stand-in for the ``winreg`` module (only importable on Windows)."""
+    HKEY_LOCAL_MACHINE = object()
+
+    def __init__(self, name):
+        self._name = name
+        self.opened = []
+
+    class _Key:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def OpenKey(self, root, path):
+        self.opened.append(path)
+        return self._Key()
+
+    def QueryValueEx(self, key, value_name):
+        assert value_name == "ProcessorNameString"
+        return self._name, 1
+
+
+def test_cpu_model_win32_reads_the_registry(monkeypatch):
+    """No ``wmic``: Windows 11 24H2 removed it, so the model comes from
+    the registry's CentralProcessor key."""
     monkeypatch.setattr(_smt.sys, "platform", "win32")
-    monkeypatch.setattr(_smt.subprocess, "check_output",
-                         lambda *a, **kw: "\r\nName=Intel(R) FakeCore i9\r\n\r\n")
+    fake = _FakeWinreg("Intel(R) FakeCore i9  ")
+    monkeypatch.setitem(sys.modules, "winreg", fake)
     assert _smt._cpu_model() == "Intel(R) FakeCore i9"
+    assert fake.opened == [r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"]
 
 
 def test_cpu_model_win32_failure(monkeypatch):
     monkeypatch.setattr(_smt.sys, "platform", "win32")
-    monkeypatch.setattr(_smt.subprocess, "check_output",
-                         lambda *a, **kw: (_ for _ in ()).throw(OSError("wmic missing")))
+    monkeypatch.setitem(sys.modules, "winreg", None)     # import fails
     monkeypatch.setattr(_smt.platform, "processor", lambda: "fallback-win")
     assert _smt._cpu_model() == "fallback-win"
+
+
+def test_physical_cores_win32_counts_core_records(monkeypatch):
+    """One RelationProcessorCore record per physical core, whatever the
+    SMT layout; other relationship kinds in the buffer are skipped."""
+    monkeypatch.setattr(_smt.sys, "platform", "win32")
+    raw = (_smt._pack_lpi_record(0, 48) * 6      # 6 cores
+           + _smt._pack_lpi_record(2, 64)        # a cache record
+           + _smt._pack_lpi_record(3, 40))       # a group record
+    monkeypatch.setattr(_smt, "_query_logical_processor_information",
+                        lambda: raw)
+    assert _smt._physical_cores() == 6
+
+
+def test_physical_cores_win32_falls_back_to_cpu_count(monkeypatch):
+    monkeypatch.setattr(_smt.sys, "platform", "win32")
+    monkeypatch.setattr(_smt, "_query_logical_processor_information",
+                        lambda: (_ for _ in ()).throw(OSError("no kernel32")))
+    monkeypatch.setattr(_smt.os, "cpu_count", lambda: 12)
+    assert _smt._physical_cores() == 12
 
 
 def test_physical_cores_linux(monkeypatch, tmp_path):
@@ -831,26 +877,11 @@ def test_physical_cores_darwin_failure(monkeypatch):
     assert _smt._physical_cores() == 8
 
 
-def test_physical_cores_win32(monkeypatch):
+def test_physical_cores_win32_empty_buffer_falls_back(monkeypatch):
+    """A buffer with no core records is treated as a failure."""
     monkeypatch.setattr(_smt.sys, "platform", "win32")
-    monkeypatch.setattr(_smt.subprocess, "check_output",
-                         lambda *a, **kw: "\r\nNumberOfCores=4\r\n\r\n")
-    assert _smt._physical_cores() == 4
-
-
-def test_physical_cores_win32_zero_result_fallback(monkeypatch):
-    """If wmic returns 0 cores, fall back to os.cpu_count()."""
-    monkeypatch.setattr(_smt.sys, "platform", "win32")
-    monkeypatch.setattr(_smt.subprocess, "check_output",
-                         lambda *a, **kw: "")
-    monkeypatch.setattr(_smt.os, "cpu_count", lambda: 12)
-    assert _smt._physical_cores() == 12
-
-
-def test_physical_cores_win32_failure(monkeypatch):
-    monkeypatch.setattr(_smt.sys, "platform", "win32")
-    monkeypatch.setattr(_smt.subprocess, "check_output",
-                         lambda *a, **kw: (_ for _ in ()).throw(OSError("wmic gone")))
+    monkeypatch.setattr(_smt, "_query_logical_processor_information",
+                        lambda: _smt._pack_lpi_record(2, 64))   # cache only
     monkeypatch.setattr(_smt.os, "cpu_count", lambda: 10)
     assert _smt._physical_cores() == 10
 

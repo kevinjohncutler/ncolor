@@ -1,16 +1,64 @@
 import numpy as np
 
-
-# Persistent thread pool; constructing per call costs ~5-10 ms.
-_FORMAT_ENGINE = None
+from ._engines import LOCK as _LOCK, expand_engine as _get_format_engine
 
 
-def _get_format_engine():
-    global _FORMAT_ENGINE
-    if _FORMAT_ENGINE is None:
-        from ._backend import ExpandEngine
-        _FORMAT_ENGINE = ExpandEngine(-1)
-    return _FORMAT_ENGINE
+_INT32_MIN = -(2 ** 31)
+_INT32_MAX = 2 ** 31 - 1
+
+
+def _compact_wide_labels(labels):
+    """Rewrite labels that do not fit int32 as dense int32 codes.
+
+    The fallback for int64 / uint32 / uint64 / float input holding a
+    value outside the int32 range, which the engine reports with
+    ``OverflowError`` instead of wrapping (a wrapped label turns negative
+    and the format pass then treats it as background, so cells silently
+    vanish). Codes follow sorted-unique order, which is what the engine's
+    own compaction yields for an input that fits: a value of 0 stays 0, a
+    negative minimum becomes the background the way the min-shift rule
+    treats it, and an all-positive input keeps every value as a cell.
+    Floats are truncated toward zero first, matching the engine's cast.
+    """
+    arr = np.asarray(labels)
+    if arr.dtype.kind == "f":
+        if not np.isfinite(arr).all():
+            raise ValueError("label array contains NaN or inf")
+        arr = np.trunc(arr)
+    uniq, inverse = np.unique(arr, return_inverse=True)
+    codes = np.asarray(inverse).reshape(arr.shape).astype(np.int32, copy=False)
+    if uniq.size and uniq[0] > 0:
+        codes += 1
+    return codes
+
+
+def _to_int32_labels(labels, allow_compact=True):
+    """``astype(int32)`` that refuses to wrap.
+
+    Narrow integer and bool inputs cast directly. For wide integer and
+    float inputs holding a value that does not fit, the labels are
+    compacted (see :func:`_compact_wide_labels`) when ``allow_compact``
+    is set, and ``OverflowError`` is raised otherwise (for callers that
+    must keep label identities). Always returns a fresh array the caller
+    may modify.
+    """
+    arr = np.asarray(labels)
+    kind, size = arr.dtype.kind, arr.dtype.itemsize
+    if kind == "b" or (kind in "iu" and size < 4) or arr.dtype == np.int32:
+        return arr.astype(np.int32, copy=True)
+    if kind == "f":
+        if not np.isfinite(arr).all():
+            raise ValueError("label array contains NaN or inf")
+        arr = np.trunc(arr)
+    if kind not in "iuf":
+        raise TypeError(f"unsupported label dtype {arr.dtype}")
+    if arr.size == 0 or (arr.min() >= _INT32_MIN and arr.max() <= _INT32_MAX):
+        return arr.astype(np.int32, copy=True)
+    if not allow_compact:
+        raise OverflowError(
+            "label values outside the int32 range; compact them first with "
+            "ncolor.format_labels")
+    return _compact_wide_labels(arr)
 
 
 def format_labels(labels, clean=False, min_area=9, despur=False,
@@ -35,14 +83,22 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
     # under one GIL release. The generic path below has to do its own
     # min-shift / sign handling first, so it can't share this short-cut.
     if (not clean and not ignore and background is None and not verbose):
-        eng = _get_format_engine()
         arr = np.ascontiguousarray(labels)
-        out, _n = eng.format_labels(arr, first_seen=bool(first_seen))
+        with _LOCK:                    # engine calls must not overlap
+            eng = _get_format_engine()
+            try:
+                out, _n = eng.format_labels(arr, first_seen=bool(first_seen))
+            except OverflowError:
+                # A wide-dtype value outside int32: compact in numpy,
+                # then let the engine renumber that.
+                out, _n = eng.format_labels(_compact_wide_labels(arr),
+                                            first_seen=bool(first_seen))
         return out
 
     # Cellpose stores labels inside float arrays; cast back to int.
     # Some segmenters use -1 as background, so use a signed dtype here.
-    labels = labels.copy().astype('int32')
+    # Values outside int32 are compacted rather than wrapped.
+    labels = _to_int32_labels(labels)
     if background is None:
         # Min-shift only when the min is negative; otherwise the smallest
         # cell would be absorbed into the background.
@@ -147,11 +203,11 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                 labels = remap[comp_labels].astype(np.uint32, copy=False)
 
     # Compact to 1..N and downcast to the smallest unsigned int that fits.
-    eng = _get_format_engine()
-    out, n_used = eng.format_labels(
-        np.ascontiguousarray(labels.astype(np.int32)),
-        first_seen=True,
-    )
+    with _LOCK:                        # engine calls must not overlap
+        out, n_used = _get_format_engine().format_labels(
+            np.ascontiguousarray(labels.astype(np.int32)),
+            first_seen=True,
+        )
     if n_used <= 0xFF:
         return out.astype(np.uint8, copy=False)
     if n_used <= 0xFFFF:
@@ -232,8 +288,9 @@ def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
         thr = int(threshold) if threshold is not None else -1
         return _b.delete_spurs(arr_u8, int(hole_threshold), int(conn_kind),
                                 thr, int(max_iter))
-    # kind == "labels"
-    arr32 = arr.astype(np.int32, copy=False)
+    # kind == "labels". Spur removal keeps label identities, so a value
+    # outside int32 is an error here rather than a reason to renumber.
+    arr32 = arr if arr.dtype == np.int32 else _to_int32_labels(arr, allow_compact=False)
     thr = int(threshold) if threshold is not None else 1
     rounds = int(max_iters) if max_iters is not None else (
         20 if max_iter == -1 else int(max_iter))

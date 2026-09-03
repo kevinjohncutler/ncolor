@@ -63,17 +63,75 @@ def _cpu_model() -> str:
         except Exception:
             pass
     elif sys.platform == "win32":
+        # The registry, not ``wmic``: Microsoft removed the WMIC utility
+        # from Windows 11 24H2 (it is no longer even an optional feature).
         try:
-            out = subprocess.check_output(
-                ["wmic", "cpu", "get", "Name", "/value"],
-                text=True, stderr=subprocess.DEVNULL,
-            )
-            for line in out.splitlines():
-                if line.startswith("Name="):
-                    return line.split("=", 1)[1].strip()
+            import winreg
+            with winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as key:
+                name, _ = winreg.QueryValueEx(key, "ProcessorNameString")
+                if name:
+                    return str(name).strip()
         except Exception:
             pass
     return platform.processor() or "unknown"
+
+
+_RELATION_PROCESSOR_CORE = 0
+
+
+def _pack_lpi_record(relationship: int, size: int) -> bytes:
+    """A SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX record header padded to
+    ``size`` bytes (the payload is irrelevant to the core count). Used by
+    the tests to build a fake buffer."""
+    import struct
+    return struct.pack("<II", relationship, size).ljust(size, b"\0")
+
+
+def _query_logical_processor_information() -> bytes:
+    """Raw GetLogicalProcessorInformationEx(RelationProcessorCore) buffer.
+
+    Raises on any failure so the caller can fall back.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    fn = ctypes.windll.kernel32.GetLogicalProcessorInformationEx
+    fn.argtypes = [wintypes.DWORD, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    fn.restype = wintypes.BOOL
+
+    # First call with no buffer fails with ERROR_INSUFFICIENT_BUFFER and
+    # reports the size needed.
+    length = wintypes.DWORD(0)
+    fn(_RELATION_PROCESSOR_CORE, None, ctypes.byref(length))
+    if length.value == 0:
+        raise OSError("GetLogicalProcessorInformationEx: no size returned")
+    buf = ctypes.create_string_buffer(length.value)
+    if not fn(_RELATION_PROCESSOR_CORE, buf, ctypes.byref(length)):
+        raise OSError("GetLogicalProcessorInformationEx failed")
+    return buf.raw[:length.value]
+
+
+def _windows_physical_cores() -> int:
+    """Physical core count: one ``RelationProcessorCore`` record per core,
+    whatever the SMT configuration. Replaces ``wmic``, which Microsoft
+    removed from Windows 11 24H2."""
+    import struct
+    raw = _query_logical_processor_information()
+    # Each record starts with (DWORD Relationship, DWORD Size) and is
+    # variable-length.
+    count, offset = 0, 0
+    while offset + 8 <= len(raw):
+        relationship, size = struct.unpack_from("<II", raw, offset)
+        if size == 0:
+            break
+        if relationship == _RELATION_PROCESSOR_CORE:
+            count += 1
+        offset += size
+    if count == 0:
+        raise OSError("GetLogicalProcessorInformationEx: no core records")
+    return count
 
 
 def _physical_cores() -> int:
@@ -104,15 +162,7 @@ def _physical_cores() -> int:
             pass
     elif sys.platform == "win32":
         try:
-            out = subprocess.check_output(
-                ["wmic", "cpu", "get", "NumberOfCores", "/value"],
-                text=True, stderr=subprocess.DEVNULL,
-            )
-            n = sum(int(line.split("=", 1)[1].strip())
-                    for line in out.splitlines()
-                    if line.startswith("NumberOfCores="))
-            if n:
-                return n
+            return _windows_physical_cores()
         except Exception:
             pass
     return os.cpu_count() or 1

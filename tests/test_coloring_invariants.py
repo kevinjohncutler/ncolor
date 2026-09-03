@@ -97,3 +97,22 @@ def test_no_adjacent_same_color_under_label_permutation(p):
             f"(perm_seed={perm_seed}) produced {bad} adjacent same-color "
             f"pixel-pairs."
         )
+
+
+def test_soft_pass_terminates_on_a_single_color_palette():
+    """Regression: an empty hard graph plus soft edges used to hang.
+
+    Two cells that touch only diagonally have no ``conn=1`` adjacency,
+    so with ``expand=False`` the hard graph has no edges at all and the
+    coloring is a one-color palette. The auto-built soft graph is *not*
+    empty (the diagonal pair lands in the conn=2 / radius=2 kernel), and
+    the soft search's restart loop drew "a color other than the current
+    one" by rejection sampling, which never terminates when there is
+    only one color to draw.
+    """
+    img = np.zeros((6, 6), dtype=np.int32)
+    img[1:3, 1:3] = 1
+    img[3:5, 3:5] = 2
+    out, n = ncolor.label(img, expand=False, return_n=True)
+    assert n == 1
+    assert set(np.unique(out).tolist()) == {0, 1}

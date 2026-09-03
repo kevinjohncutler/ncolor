@@ -10,14 +10,18 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>   // std::sort / std::unique in color_graph
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "cc_label.hpp"
@@ -40,6 +44,7 @@
 #include "clique_lb.hpp"
 #include "dispatch.hpp"
 #include "expand.hpp"
+#include "picker.hpp"
 
 namespace py = pybind11;
 
@@ -80,18 +85,29 @@ static int resolve_threads(double v) {
 //
 // Resolves dtype by (itemsize, signedness) so the same code handles macOS
 // `l` (int64) and pybind11 `q` (long long) — relying on format-code matching
-// alone breaks across platforms. Throws on unsupported dtype with `api_name`
-// in the error message.
+// alone breaks across platforms. numpy ``bool`` (format '?', one byte) is
+// routed to the uint8 kernel: the memory layout is identical and every
+// kernel only asks whether a value is zero. Throws on unsupported dtype
+// with `api_name` in the error message.
+//
+// ``allow_float`` admits float32 / float64 as well. Only the entry points
+// that immediately cast to int32 (label, connect, format_labels, cc_label)
+// take floats: segmenters such as cellpose hand back label maps in float
+// arrays, and for those the range-checked cast truncates toward zero.
 template <typename Func>
 static inline void dispatch_int_dtype(const std::string& fmt, py::ssize_t itemsize,
-                                      const char* api_name, Func&& f) {
-    bool is_signed = false, is_unsigned = false;
+                                      const char* api_name, Func&& f,
+                                      bool allow_float = false) {
+    bool is_signed = false, is_unsigned = false, is_float = false;
     if (!fmt.empty()) {
         const char c = fmt[0];
         if (c == 'b' || c == 'h' || c == 'i' || c == 'l' || c == 'q' || c == 'n')
             is_signed = true;
-        else if (c == 'B' || c == 'H' || c == 'I' || c == 'L' || c == 'Q' || c == 'N')
+        else if (c == 'B' || c == 'H' || c == 'I' || c == 'L' || c == 'Q' ||
+                 c == 'N' || c == '?')
             is_unsigned = true;
+        else if (c == 'f' || c == 'd')
+            is_float = true;
     }
     if (is_signed) {
         switch (itemsize) {
@@ -105,11 +121,36 @@ static inline void dispatch_int_dtype(const std::string& fmt, py::ssize_t itemsi
             case 1: f(static_cast<uint8_t*>(nullptr));  return;
             case 2: f(static_cast<uint16_t*>(nullptr)); return;
             case 4: f(static_cast<uint32_t*>(nullptr)); return;
+            case 8: f(static_cast<uint64_t*>(nullptr)); return;
+        }
+    } else if (is_float && allow_float) {
+        switch (itemsize) {
+            case 4: f(static_cast<float*>(nullptr));  return;
+            case 8: f(static_cast<double*>(nullptr)); return;
         }
     }
     throw std::invalid_argument(std::string(api_name) +
-        ": unsupported dtype '" + fmt + "' (need uint8/uint16/uint32/"
-        "int8/int16/int32/int64)");
+        ": unsupported dtype '" + fmt + "' (need bool, uint8/16/32/64, "
+        "int8/16/32/64" + (allow_float ? ", float32/64)" : ")"));
+}
+
+// The cast-based entry points: everything dispatch_int_dtype takes, plus
+// float32 / float64.
+template <typename Func>
+static inline void dispatch_cast_dtype(const std::string& fmt, py::ssize_t itemsize,
+                                       const char* api_name, Func&& f) {
+    dispatch_int_dtype(fmt, itemsize, api_name, std::forward<Func>(f),
+                       /*allow_float=*/true);
+}
+
+// Raised (as Python OverflowError) when a wide-dtype input holds a value
+// the int32 engine cannot represent. ncolor's Python wrappers catch this
+// for label() / format_labels() and retry on a compacted copy.
+[[noreturn]] static void throw_label_overflow(const char* api_name) {
+    throw std::overflow_error(std::string(api_name) +
+        ": label values outside the int32 range (or NaN / inf). Compact the "
+        "labels first, e.g. with ncolor.format_labels, which handles this "
+        "automatically.");
 }
 
 // Pack a vector of (lo, hi) adjacency pairs into a fresh (M, 2) int32 array.
@@ -125,6 +166,40 @@ static inline py::array_t<int32_t> pairs_to_array(
     return out;
 }
 
+// ---- Shared thread pool ----------------------------------------------------
+//
+// Engines that resolve to the same thread count share one ForkJoinPool.
+// The Python package keeps a Solver and an ExpandEngine alive for the
+// life of the process; with a pool each that was 2 × (threads - 1) parked
+// workers (and, before the format engine was merged into the expand one,
+// 3 ×). Sharing is safe because engine calls are serialized: the Python
+// wrappers hold one process-wide lock, and every engine method takes
+// ``engine_mutex()`` below as a backstop for callers that bypass the
+// wrappers. The registry holds weak references, so a pool dies with the
+// last engine using it (the SMT calibration builds and discards engines
+// with two different counts back to back).
+static std::shared_ptr<ncolor_cpp::ForkJoinPool> acquire_shared_pool(int n_threads) {
+    static std::mutex registry_mutex;
+    static std::map<int, std::weak_ptr<ncolor_cpp::ForkJoinPool>> registry;
+    std::lock_guard<std::mutex> lk(registry_mutex);
+    auto& slot = registry[n_threads];
+    if (auto live = slot.lock()) return live;
+    auto fresh = std::make_shared<ncolor_cpp::ForkJoinPool>(
+        static_cast<size_t>(n_threads));
+    slot = fresh;
+    return fresh;
+}
+
+// Serializes engine calls. Taken inside the GIL-released region of every
+// engine method (never while holding the GIL, so a thread waiting here
+// cannot deadlock a thread that needs the GIL to finish). Two threads
+// entering one engine, or two engines on a shared pool, at the same time
+// used to corrupt the pool and crash the process.
+static std::mutex& engine_mutex() {
+    static std::mutex m;
+    return m;
+}
+
 // Persistent-pool wrapper for expand_labels + parallel LUT apply.
 // One ExpandEngine per ncolor.label "pipeline" — the pool + buffers persist
 // across calls so the only per-call cost is task enqueue.
@@ -132,34 +207,54 @@ class ExpandEngine {
 public:
     explicit ExpandEngine(double n_threads)
         : n_threads_(resolve_threads(n_threads)),
-          pool_(std::make_unique<ncolor_cpp::ForkJoinPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
+          pool_(acquire_shared_pool(n_threads_ <= 1 ? 1 : n_threads_)) {}
 
     int n_threads() const { return n_threads_; }
+
+    // Free the persistent scratch buffers (see ExpandBuffers::release).
+    void release() {
+        py::gil_scoped_release gil;
+        std::lock_guard<std::mutex> engine_lock(engine_mutex());
+        bufs_.release();
+    }
 
     // Voronoi label expansion under L_p metric. ``p=1`` (Manhattan) uses the
     // Saito-Toriwaki separable sweep; ``p=2`` (Euclidean²) uses the
     // Felzenszwalb-Huttenlocher parabolic envelope. Same ND driver,
     // dispatched at compile time on p — see ``expand_lp.hpp``. Default is
     // p=2 (matches numba's ``expand_labels(metric='l2')``).
-    py::array_t<int32_t> expand_labels(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
-            int p = 2, bool wrap = false) {
+    //
+    // Takes any supported label dtype (see dispatch_cast_dtype): the cast
+    // to int32 is range-checked and runs in parallel, straight into the
+    // output array, which the kernels then expand in place. Raises
+    // OverflowError for values outside int32 rather than renumbering,
+    // because expand keeps label identities.
+    py::array_t<int32_t> expand_labels(py::array labels, int p = 2, bool wrap = false) {
+        if (p != 1 && p != 2) {
+            throw std::invalid_argument("expand_labels: p must be 1 or 2");
+        }
+        if (!(labels.flags() & py::array::c_style)) {
+            labels = py::array::ensure(labels, py::array::c_style);
+        }
         const auto buf = labels.request();
         std::vector<int64_t> shape(buf.ndim);
-        for (int i = 0; i < buf.ndim; ++i) shape[i] = buf.shape[i];
-
-        const int32_t* input = static_cast<const int32_t*>(buf.ptr);
+        int64_t total = 1;
+        for (int i = 0; i < buf.ndim; ++i) {
+            shape[i] = buf.shape[i];
+            total *= buf.shape[i];
+        }
+        const void* src_ptr = buf.ptr;
         py::array_t<int32_t> out(buf.shape);
         int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
 
         {
             py::gil_scoped_release release;
+            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            cast_into_(buf, src_ptr, out_ptr, total, "ExpandEngine.expand_labels");
             if (p == 2) {
-                ncolor_cpp::expand_labels_lp<2>(input, out_ptr, bufs_, shape, *pool_, n_threads_, wrap);
-            } else if (p == 1) {
-                ncolor_cpp::expand_labels_lp<1>(input, out_ptr, bufs_, shape, *pool_, n_threads_, wrap);
+                ncolor_cpp::expand_labels_lp<2>(out_ptr, out_ptr, bufs_, shape, *pool_, n_threads_, wrap);
             } else {
-                throw std::invalid_argument("expand_labels: p must be 1 or 2");
+                ncolor_cpp::expand_labels_lp<1>(out_ptr, out_ptr, bufs_, shape, *pool_, n_threads_, wrap);
             }
         }
         return out;
@@ -171,25 +266,31 @@ public:
     // in 2D) are marked as barriers (lbl=0) so the next axis sweep
     // can't refill them. Currently 2D L2 only — falls back to standard
     // L2 expand for ND > 2 until 3D antipodal generalization lands.
-    py::array_t<int32_t> expand_labels_clean(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
-            int p = 2) {
+    py::array_t<int32_t> expand_labels_clean(py::array labels, int p = 2) {
         if (p != 1 && p != 2) {
             throw std::invalid_argument(
                 "expand_labels_clean: p must be 1 or 2");
         }
+        if (!(labels.flags() & py::array::c_style)) {
+            labels = py::array::ensure(labels, py::array::c_style);
+        }
         const auto buf = labels.request();
         std::vector<int64_t> shape(buf.ndim);
-        for (int i = 0; i < buf.ndim; ++i) shape[i] = buf.shape[i];
-
-        const int32_t* input = static_cast<const int32_t*>(buf.ptr);
+        int64_t total = 1;
+        for (int i = 0; i < buf.ndim; ++i) {
+            shape[i] = buf.shape[i];
+            total *= buf.shape[i];
+        }
+        const void* src_ptr = buf.ptr;
         py::array_t<int32_t> out(buf.shape);
         int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
 
         {
             py::gil_scoped_release release;
+            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            cast_into_(buf, src_ptr, out_ptr, total, "ExpandEngine.expand_labels_clean");
             ncolor_cpp::expand_labels_clean_inplace(
-                input, bufs_, shape, *pool_, n_threads_, p);
+                out_ptr, bufs_, shape, *pool_, n_threads_, p);
             std::memcpy(out_ptr, bufs_.lbl(),
                         bufs_.size() * sizeof(int32_t));
         }
@@ -220,6 +321,7 @@ public:
 
         {
             py::gil_scoped_release release;
+            std::lock_guard<std::mutex> engine_lock(engine_mutex());
             if (p == 2) {
                 ncolor_cpp::expand_labels_lp<2>(input, out_lbl_ptr, bufs_, shape, *pool_, n_threads_, wrap);
                 const int32_t* d = bufs_.dist();
@@ -283,6 +385,7 @@ public:
 
         {
             py::gil_scoped_release release;
+            std::lock_guard<std::mutex> engine_lock(engine_mutex());
             // Initialise output to +infinity. If a class has no seeds the
             // expansion writes labels=0 and dist=INT_MAX/4; we replace
             // those with +inf for safe min-aggregation downstream.
@@ -357,6 +460,7 @@ public:
 
         {
             py::gil_scoped_release release;
+            std::lock_guard<std::mutex> engine_lock(engine_mutex());
             const double INF = std::numeric_limits<double>::infinity();
             for (int64_t i = 0; i < static_cast<int64_t>(n_labels) * n_labels; ++i)
                 D[i] = INF;
@@ -448,14 +552,17 @@ public:
         int n_labels;
         {
             py::gil_scoped_release release;
+            std::lock_guard<std::mutex> engine_lock(engine_mutex());
             // Cast to int32 in parallel inside the released-GIL block.
-            dispatch_int_dtype(buf.format, buf.itemsize,
+            bool fits = true;
+            dispatch_cast_dtype(buf.format, buf.itemsize,
                 "ExpandEngine.format_labels", [&](auto* tag) {
                     using T = std::remove_pointer_t<decltype(tag)>;
-                    ncolor_cpp::cast_to_int32<T>(
+                    fits = ncolor_cpp::cast_to_int32<T>(
                         static_cast<const T*>(src_ptr), out_ptr, total,
                         *pool_, n_threads_);
                 });
+            if (!fits) throw_label_overflow("ExpandEngine.format_labels");
             n_labels = first_seen
                 ? ncolor_cpp::format_labels_inplace_first_seen(
                     out_ptr, total, *pool_, n_threads_)
@@ -466,8 +573,23 @@ public:
     }
 
 private:
+    // Range-checked parallel cast of a caller's buffer into ``dst``.
+    // Must be called with the GIL released and the engine lock held.
+    void cast_into_(const py::buffer_info& buf, const void* src_ptr,
+                    int32_t* dst, int64_t total, const char* api_name) {
+        bool fits = true;
+        dispatch_cast_dtype(buf.format, buf.itemsize, api_name,
+            [&](auto* tag) {
+                using T = std::remove_pointer_t<decltype(tag)>;
+                fits = ncolor_cpp::cast_to_int32<T>(
+                    static_cast<const T*>(src_ptr), dst, total,
+                    *pool_, n_threads_);
+            });
+        if (!fits) throw_label_overflow(api_name);
+    }
+
     int n_threads_;
-    std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
+    std::shared_ptr<ncolor_cpp::ForkJoinPool> pool_;
     ncolor_cpp::ExpandBuffers bufs_;
 };
 
@@ -492,9 +614,35 @@ class Solver {
 public:
     explicit Solver(double n_threads)
         : n_threads_(resolve_threads(n_threads)),
-          pool_(std::make_unique<ncolor_cpp::ForkJoinPool>(n_threads_ <= 1 ? 1 : n_threads_)) {}
+          pool_(acquire_shared_pool(n_threads_ <= 1 ? 1 : n_threads_)) {}
 
     int n_threads() const { return n_threads_; }
+
+    // Free every persistent scratch buffer. The engine keeps the working
+    // set of the largest image it has processed (roughly 22 bytes per
+    // pixel) alive between calls so repeated same-shape calls never
+    // allocate; after a single whole-slide image that is gigabytes. The
+    // next call reallocates as needed. Accessor state (last LUT, stage
+    // timings, conflict count) is reset too.
+    void release() {
+        py::gil_scoped_release gil;
+        std::lock_guard<std::mutex> engine_lock(engine_mutex());
+        expand_bufs_.release();
+        drop_(bg_mask_); drop_(partials_);
+        drop_(src_idx_); drop_(dst_idx_);
+        drop_(indptr_); drop_(indices_); drop_(edge_weights_);
+        drop_(soft_indptr_); drop_(soft_indices_); drop_(soft_weights_);
+        drop_(colors_); drop_(lut_); drop_(lut_lbl_); drop_(orig_labels_);
+        drop_(despur_face_count_);
+        drop_(fp_ht_buf_); drop_(fp_primary_buf_); drop_(fp_counts_buf_);
+        drop_(fp_soft_ht_buf_); drop_(fused_soft_pairs_);
+        drop_(last_stages_);
+        drop_(picker_scratch_.per_attempt_colors_);
+        drop_(picker_scratch_.per_attempt_ok_);
+        last_n_conflicts_ = 0;
+        n_soft_violations_last_ = 0.0;
+        lut_.assign(1, 0);
+    }
 
     // Per-stage timing breakdown of the most recent label() call. Empty
     // unless capture_stages=true was passed.
@@ -527,6 +675,7 @@ public:
         std::vector<std::pair<int32_t, int32_t>> pairs;
         {
             py::gil_scoped_release release;
+            std::lock_guard<std::mutex> engine_lock(engine_mutex());
             // Cast to int32 in expand_bufs_.lbl(); the bg mask is unused
             // here (Solver.connect never applies a LUT) but cast_with_bg
             // is the parallel cast we already use elsewhere — bg writes
@@ -535,13 +684,15 @@ public:
             int32_t* labels = expand_bufs_.lbl();
             bg_mask_.resize(static_cast<size_t>(total));
             uint8_t* bg = bg_mask_.data();
-            dispatch_int_dtype(buf.format, buf.itemsize, "Solver.connect",
+            bool fits = true;
+            dispatch_cast_dtype(buf.format, buf.itemsize, "Solver.connect",
                 [&](auto* tag) {
                     using T = std::remove_pointer_t<decltype(tag)>;
-                    ncolor_cpp::cast_with_bg<T>(
+                    fits = ncolor_cpp::cast_with_bg<T>(
                         static_cast<const T*>(src_ptr), labels, bg, total,
                         *pool_, n_threads_);
                 });
+            if (!fits) throw_label_overflow("Solver.connect");
 
             const int32_t max_label = parallel_max_label_(labels, total);
             pairs = find_pairs_(labels, shape, conn, wrap, max_label);
@@ -683,6 +834,7 @@ public:
         bool early_exit_empty = false;
         {
             py::gil_scoped_release release;
+            std::lock_guard<std::mutex> engine_lock(engine_mutex());
 
             // 0a. Cast input dtype → int32 (in expand_bufs_.lbl()) AND
             // capture the bg pattern (input == 0) into bg_mask_, all in
@@ -699,13 +851,15 @@ public:
             bg_mask_.resize(static_cast<size_t>(total));
             int32_t* expanded = expand_bufs_.lbl();
             uint8_t* bg = bg_mask_.data();
-            dispatch_int_dtype(buf.format, buf.itemsize, "Solver.label",
+            bool fits = true;
+            dispatch_cast_dtype(buf.format, buf.itemsize, "Solver.label",
                 [&](auto* tag) {
                     using T = std::remove_pointer_t<decltype(tag)>;
-                    ncolor_cpp::cast_with_bg<T>(
+                    fits = ncolor_cpp::cast_with_bg<T>(
                         static_cast<const T*>(src_ptr), expanded, bg, total,
                         *pool_, n_threads_);
                 });
+            if (!fits) throw_label_overflow("Solver.label");
             stage("cast");
 
             // 0b. Optional format_labels: compact nonzero labels to 1..N
@@ -1169,6 +1323,164 @@ public:
         return {std::move(out), n_used};
     }
 
+    // Color an arbitrary graph from an edge list, running the same
+    // picker ``label`` runs on the pixel-adjacency graph, decoupled from
+    // any image. Backs the vector-geometry front end
+    // (``ncolor.geo.label`` / ``ncolor.color_graph``), where adjacency
+    // comes from polygon topology instead of a pixel walk.
+    //
+    // ``edges`` is an (M, 2) integer array of **0-indexed** vertex pairs;
+    // ``soft_edges`` (optional, same shape) feeds the soft_local_search
+    // post-pass: edges that should differ in color when possible but do
+    // not constrain the hard coloring. Both lists are normalized to
+    // (lo, hi), sorted and de-duplicated, so a symmetric edge list (both
+    // (a, b) and (b, a)) is accepted without double-counting. Self-loops
+    // and out-of-range endpoints are dropped rather than raising, so a
+    // geometry front end can pass its raw candidate pairs.
+    //
+    // Returns (colors uint8[n_vertices] with values in 1..n_used,
+    // n_used). Isolated vertices get color 1. get_last_n_conflicts() /
+    // get_last_lut() / get_last_n_soft_violations() are updated exactly
+    // as they are by label().
+    std::pair<py::array_t<uint8_t>, int> color_graph(
+            py::object edges_obj,
+            int n_vertices,
+            int n_colors = 4,
+            int max_depth = 30,
+            int rand_period = 10,
+            py::object soft_edges_obj = py::none(),
+            int color_mode = -1,
+            bool capture_stages = false) {
+        if (n_vertices < 0) throw std::invalid_argument(
+            "Solver.color_graph: n_vertices must be >= 0");
+        if (n_colors < 1) throw std::invalid_argument(
+            "Solver.color_graph: n_colors must be >= 1");
+        const int32_t N = static_cast<int32_t>(n_vertices);
+
+        // Parse both edge arrays HERE, while we still hold the GIL; the
+        // compute below runs with it released and may only touch the raw
+        // pointers kept alive by the holders.
+        auto parse_edges = [](py::object obj, const char* name,
+                              py::array_t<int32_t>& holder,
+                              const int32_t*& ptr) -> int32_t {
+            if (obj.is_none()) return 0;
+            holder = py::array_t<int32_t,
+                py::array::c_style | py::array::forcecast>::ensure(obj);
+            if (!holder) throw std::invalid_argument(
+                std::string("Solver.color_graph: ") + name +
+                " must be an (M, 2) integer array");
+            const auto eb = holder.request();
+            if (eb.ndim != 2 || eb.shape[1] != 2) throw std::invalid_argument(
+                std::string("Solver.color_graph: ") + name +
+                " must have shape (M, 2)");
+            ptr = static_cast<const int32_t*>(eb.ptr);
+            return static_cast<int32_t>(eb.shape[0]);
+        };
+        py::array_t<int32_t> edges_holder, soft_holder;
+        const int32_t* edge_ptr = nullptr;
+        const int32_t* soft_ptr = nullptr;
+        const int32_t n_edges_in = parse_edges(edges_obj, "edges",
+                                               edges_holder, edge_ptr);
+        const int32_t n_soft_in = parse_edges(soft_edges_obj, "soft_edges",
+                                              soft_holder, soft_ptr);
+
+        py::array_t<uint8_t> out(static_cast<py::ssize_t>(N));
+        uint8_t* out_ptr = static_cast<uint8_t*>(out.request().ptr);
+
+        int n_used = 0;
+        last_stages_.clear();
+        last_n_conflicts_ = 0;
+        n_soft_violations_last_ = 0.0;
+        lut_.assign(1, 0);
+        std::chrono::steady_clock::time_point t_start, t_now;
+        if (capture_stages) t_start = std::chrono::steady_clock::now();
+        auto stage = [&](const char* name) {
+            if (!capture_stages) return;
+            t_now = std::chrono::steady_clock::now();
+            last_stages_.emplace_back(name,
+                std::chrono::duration<double, std::milli>(t_now - t_start).count());
+            t_start = t_now;
+        };
+
+        // Drop invalid entries, orient each pair (lo, hi), then sort +
+        // unique so duplicates and reversed duplicates collapse.
+        auto clean_pairs = [N](const int32_t* src, int32_t count,
+                               std::vector<std::pair<int32_t, int32_t>>& dst) {
+            dst.clear();
+            dst.reserve(static_cast<size_t>(count));
+            for (int32_t i = 0; i < count; ++i) {
+                int32_t a = src[2 * i], b = src[2 * i + 1];
+                if (a < 0 || b < 0 || a >= N || b >= N || a == b) continue;
+                dst.emplace_back(std::min(a, b), std::max(a, b));
+            }
+            std::sort(dst.begin(), dst.end());
+            dst.erase(std::unique(dst.begin(), dst.end()), dst.end());
+        };
+
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            if (N > 0) {
+                std::vector<std::pair<int32_t, int32_t>> uniq;
+                clean_pairs(edge_ptr, n_edges_in, uniq);
+                const int32_t M = static_cast<int32_t>(uniq.size());
+                src_idx_.resize(static_cast<size_t>(M));
+                dst_idx_.resize(static_cast<size_t>(M));
+                for (int32_t i = 0; i < M; ++i) {
+                    src_idx_[i] = uniq[i].first;
+                    dst_idx_[i] = uniq[i].second;
+                }
+                stage("edges");
+
+                ncolor_cpp::build_csr_from_pairs(src_idx_.data(), dst_idx_.data(),
+                                                 N, M, indptr_, indices_);
+                stage("build_csr");
+
+                // ndim=2 / wrap=false only steer the picker's internal
+                // heuristics (attempt budgets); an abstract graph has no
+                // embedding, so the 2D setting is the right neutral value.
+                n_used = solve_coloring_(N, M, n_colors, max_depth, rand_period,
+                                         color_mode, /*ndim=*/2, /*wrap=*/false);
+                stage("color");
+
+                if (n_soft_in > 0 && n_used > 0) {
+                    clean_pairs(soft_ptr, n_soft_in, uniq);
+                    // build_soft_csr indexes from 1 (it consumes label IDs
+                    // in label()); shift our 0-indexed vertices to match.
+                    std::vector<int32_t> soft_flat;
+                    soft_flat.reserve(2 * uniq.size());
+                    for (auto& pr : uniq) {
+                        soft_flat.push_back(pr.first + 1);
+                        soft_flat.push_back(pr.second + 1);
+                    }
+                    const int32_t n_soft =
+                        static_cast<int32_t>(soft_flat.size() / 2);
+                    if (n_soft > 0) {
+                        ncolor_cpp::build_soft_csr(
+                            N, n_soft, soft_flat.data(), /*weights_in=*/nullptr,
+                            soft_indptr_, soft_indices_, soft_weights_);
+                        ncolor_cpp::compute_triangle_weights(
+                            N, soft_indptr_.data(), soft_indices_.data(),
+                            soft_weights_);
+                        n_soft_violations_last_ = ncolor_cpp::soft_local_search(
+                            colors_.data(), N,
+                            indptr_.data(), indices_.data(),
+                            soft_indptr_.data(), soft_indices_.data(),
+                            soft_weights_.data(),
+                            n_used);
+                    }
+                    stage("soft_search");
+                }
+
+                std::memcpy(out_ptr, colors_.data(),
+                            static_cast<size_t>(N) * sizeof(uint8_t));
+                lut_.assign(static_cast<size_t>(N) + 1, 0);
+                for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
+            }
+        }
+        return {std::move(out), n_used};
+    }
+
     // Accessors for the most recent label() call. Used by the public
     // ncolor.label wrapper to satisfy return_lut / check_conflicts /
     // return_conflicts without re-running connect()/coloring.
@@ -1335,624 +1647,20 @@ private:
         }
     }
 
-    // Coloring loop: race ``attempts_per_n`` BFS-with-random-offset
-    // attempts in parallel at each cur_n; bb_dsatur takes the last slot
-    // as an exact-coloring race entry. The weighted-objective path
-    // (weight_obj != 0) substitutes weighted-WP for the BFS body in
-    // slots 0..N-2; otherwise WP is unused.
-    //
-    // Slot layout at each cur_n:
-    //   default          slots: [BFS+0, BFS+1, ..., BFS+(N-2), bb_dsatur]
-    //   weight_obj != 0  slots: [weighted-WP+0, ..., +(N-2), pure WP]
-    //
-    // Lowest-index successful attempt wins. Big graphs (N+M ≥ 500) race
-    // the attempts in parallel on the pool; small graphs run them
-    // serially.
-    //
-    // Side effects: writes the winning coloring into ``colors_`` and the
-    // adjacency-conflict count into ``last_n_conflicts_``. Returns
-    // ``n_used`` = max color value in the winning coloring.
+    // The picker itself lives in picker.hpp (no Python dependency); this
+    // forwards the Solver's CSR, edge list, color buffer and scratch.
     int solve_coloring_(int32_t N, int32_t M, int n_colors,
                         int max_depth, int rand_period,
                         int color_mode, int ndim, bool wrap,
                         const double* edge_weights = nullptr,
                         const double* de_table = nullptr,
                         int weight_obj = 0) {
-        constexpr int attempts_per_n = 16;
-        const int64_t max_iter = std::max<int64_t>(
-            static_cast<int64_t>(indices_.size()) +
-            static_cast<int64_t>(indptr_.size()), 512);
-        // color_mode: -1 = auto (threshold-based), 0 = forced serial,
-        // 1 = forced parallel. Auto threshold tuned on M2 / 20-thread
-        // ForkJoinPool: below ~500 edges the BFS finishes in <100 µs and
-        // dispatch overhead eats the win.
-        bool color_parallel;
-        if (color_mode == 0) color_parallel = false;
-        else if (color_mode == 1) color_parallel = (n_threads_ > 1);
-        else color_parallel = (n_threads_ > 1) &&
-            (static_cast<int64_t>(N) + M >= 500);
-        if (color_parallel) {
-            per_attempt_colors_.resize(attempts_per_n);
-            per_attempt_ok_.assign(attempts_per_n, 0);
-        }
-
-        int cur_n = n_colors;
-        bool ok = false;
-        static const bool dbg_solve = std::getenv("NCOLOR_SOLVE_DEBUG") != nullptr;
-        // ω(G) lower bound: χ(G) ≥ ω(G). If a clique larger than the
-        // user's target k exists, the graph requires ≥ ω colors and
-        // we'd otherwise burn ~200 ms per (race+tabu-restart+
-        // bb_dsatur+HEA) round each time we increment cur_n on the
-        // way up to ω. Bron-Kerbosch with a tight deadline (10 ms)
-        // returns a valid lower bound even on partial searches —
-        // worst case: no time saved when ω ≤ n_colors (the common
-        // case). Skipped for N > 20000 (memory) and for the weighted
-        // path (perceptual objective is orthogonal to clique
-        // structure).
-        const bool wobj_active_for_clique = weight_obj != 0 && edge_weights != nullptr;
-        // Clique-lower-bound: detect K_{k+1} (or larger) in the graph
-        // to skip doomed cur_n=k attempts. For typical cell-adjacency
-        // graphs ω = target (no K_5), so CLB returns "no adjustment"
-        // — pure overhead. But on dense or higher-connectivity inputs
-        // (conn=2, connect_radius=2) K_5 is common and CLB saves the
-        // ~200 ms the picker would otherwise burn at cur_n=n_colors.
-        //
-        // Two regimes:
-        //   • N ≤ 1500: 2 ms deadline, classic behavior. CLB rarely
-        //     fires but is cheap when it does.
-        //   • N > 1500: 5 ms deadline, max_N up to 8000. Bron-Kerbosch
-        //     on dense graphs >8k vertices has a memory/time profile
-        //     that loses to slot-race failure detection. Below 8k,
-        //     the early-out at target+1 finds K_5 in <2 ms on real
-        //     cell-adjacency graphs (verified mm 2k² L1 r=2: ~1 ms
-        //     to detect K_5, vs the 200 ms the picker otherwise burns
-        //     on n=4 attempts before bumping).
-        static constexpr int32_t CLB_TIGHT_N = 1500;
-        static constexpr int32_t CLB_MAX_N   = 8000;
-        if (!wobj_active_for_clique && N >= 5 && N <= CLB_MAX_N) {
-            const auto clb_t0 = std::chrono::steady_clock::now();
-            const int64_t budget_ns = (N <= CLB_TIGHT_N)
-                ? (2LL * 1000LL * 1000LL)
-                : (5LL * 1000LL * 1000LL);
-            const int64_t clb_deadline_ns =
-                clb_t0.time_since_epoch().count() + budget_ns;
-            const int omega = ncolor_cpp::clique_lower_bound(
-                N, indptr_.data(), indices_.data(),
-                /*target=*/n_colors + 1, clb_deadline_ns);
-            if (dbg_solve) {
-                const double clb_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - clb_t0).count();
-                std::fprintf(stderr,
-                    "[clique-lb] N=%d ω≥%d (target=%d) %.1fms\n",
-                    N, omega, n_colors + 1, clb_ms);
-            }
-            if (omega > cur_n) cur_n = omega;  // χ ≥ ω, so skip doomed cur_n values
-        }
-        for (int depth = 0; depth < max_depth && !ok; ++depth) {
-            const auto depth_t0 = std::chrono::steady_clock::now();
-            if (color_parallel) {
-                const int local_cur_n = cur_n;
-                const int local_depth = depth;
-                const int32_t* ip = indptr_.data();
-                const int32_t* ix = indices_.data();
-
-                // Shared early-exit flag: as soon as any parallel
-                // attempt finds a 0-conflict coloring, other workers
-                // (a) skip subsequent slots and (b) abort any
-                // in-flight per-attempt tabucol. Without (b), race
-                // latency = slowest worker's full tabucol budget; with
-                // it, race latency = first success.
-                std::atomic<bool> winner_found{false};
-
-                // Run-one-attempt body factored out so we can call it
-                // once sequentially as a warmup before paying pool-
-                // dispatch overhead, and dispatch the rest in parallel
-                // only on warmup failure.
-                auto run_one_attempt = [&, local_cur_n, local_depth, ip, ix](
-                        int idx, const std::atomic<bool>* cancel,
-                        bool allow_tabucol, int64_t race_deadline_ns) -> bool {
-                    auto& cv = per_attempt_colors_[idx];
-                    const int attempt_offset = local_depth + idx;
-                    // Special slot: branch-and-bound exact coloring
-                    // racing the BFS+tabucol slots. For K_5-free
-                    // planar-ish cell-adjacency graphs at our scale
-                    // (N ≤ few thousand), B&B+DSatur typically finds
-                    // a k-coloring in <1 ms — often faster than
-                    // BFS+tabucol convergence. When the search tree
-                    // blows up on adversarial vertex orderings, the
-                    // node budget + cancel-flag short-circuit kick in
-                    // and one of the BFS slots wins instead. Only
-                    // fires at the user's target k (no value running
-                    // exact search at cur_n > n_colors). Disabled
-                    // when the user opted into a perceptual weight
-                    // objective, since bb_dsatur doesn't honour
-                    // weights. Slot picked: the LAST one (free slot —
-                    // slots 0..N-2 are BFS, slot N-1 is bb_dsatur).
-                    // Cancel propagation: bb_dsatur checks the cancel
-                    // flag every 1024 nodes.
-                    const bool wobj_active = weight_obj != 0 && edge_weights != nullptr;
-                    const bool bb_slot = !wobj_active
-                                         && (idx == attempts_per_n - 1)
-                                         && local_cur_n == n_colors;
-                    if (bb_slot) {
-                        const int64_t node_budget = std::max<int64_t>(
-                            20000, (int64_t)N * 30);
-                        const bool bb_ok = ncolor_cpp::bb_dsatur(
-                            ip, ix, N, local_cur_n, cv, node_budget,
-                            cancel, race_deadline_ns);
-                        per_attempt_ok_[idx] = bb_ok ? 1 : 0;
-                        return bb_ok;
-                    }
-                    // Slot 0 = user-preferred algorithm; remaining
-                    // slots = alternate algorithm with different
-                    // random offsets (algorithm-switching fallback).
-                    // For the weighted opt-in, slots 0-(attempts-2)
-                    // use weighted-WP with different offsets; the
-                    // LAST slot is a pure WP fallback. If all
-                    // weighted attempts fail at n_colors, the WP
-                    // attempt can still produce a clean 4-coloring
-                    // before we bump cur_n. With wobj off (default),
-                    // all slots run BFS; WP is never selected here.
-                    const bool wp = wobj_active;
-                    const bool weighted_attempt = wobj_active &&
-                                                  (idx < attempts_per_n - 1);
-                    const double* w_ptr = weighted_attempt ? edge_weights : nullptr;
-                    const double* de_ptr = weighted_attempt ? de_table : nullptr;
-                    const int w_obj_local = weighted_attempt ? weight_obj : 0;
-                    const bool finished = ncolor_cpp::color_graph_csr_legacy(
-                        ip, ix, N, local_cur_n, rand_period,
-                        attempt_offset, max_iter, cv, wp,
-                        w_ptr, de_ptr, w_obj_local);
-                    const bool conflict = !finished ||
-                        ncolor_cpp::has_conflict_csr(ip, ix, N, cv.data());
-                    bool a_ok = !conflict || ncolor_cpp::repair_coloring(
-                        ip, ix, N, local_cur_n, std::max(4, max_depth), cv);
-                    // Per-attempt TabuCol fallback when greedy+repair
-                    // fail at the user's target k. Each attempt runs
-                    // its own small-budget tabucol seeded uniquely,
-                    // turning the parallel block into a true K-way
-                    // race of (greedy+repair+tabucol) jobs. Only
-                    // fires for the user's target k. The `cancel`
-                    // pointer lets the tabucol loop short-circuit
-                    // when a sibling worker has already won.
-                    // Disabled for the warmup attempt (allow_tabucol
-                    // false): the warmup is meant to be a sub-ms
-                    // fast-path; if WP+repair fails we'd rather fall
-                    // through to the parallel race (which has
-                    // sibling-cancellable tabucol) than burn up to
-                    // 5 ms of un-cancellable budget here.
-                    if (!a_ok && local_cur_n == n_colors && allow_tabucol) {
-                        for (int32_t u = 0; u < N; ++u) {
-                            if (cv[u] < 1 || cv[u] > local_cur_n) {
-                                cv[u] = (uint8_t)(1 + (u % local_cur_n));
-                            }
-                        }
-                        const int per_attempt_tabu_iters = std::min(
-                            5000, std::max(500, N * 5));
-                        const uint64_t tabu_seed =
-                            (uint64_t)(attempt_offset + 1)
-                                * 0x9e3779b97f4a7c15ULL
-                            ^ (uint64_t)(local_depth + 1)
-                                * 0x517cc1b727220a95ULL;
-                        if (ncolor_cpp::tabucol(
-                                ip, ix, N, local_cur_n,
-                                per_attempt_tabu_iters, cv, tabu_seed,
-                                race_deadline_ns, cancel)) {
-                            a_ok = true;
-                        }
-                    }
-                    // For the weighted path the user has opted in to
-                    // a perceptual objective and accepts repair. With
-                    // wobj off there's no clean-WP gate (wp is false).
-                    const bool clean_wp_required = wp && !weighted_attempt;
-                    const bool slot_ok = a_ok && (!clean_wp_required || !conflict);
-                    per_attempt_ok_[idx] = slot_ok ? 1 : 0;
-                    return slot_ok;
-                };
-
-                // All attempts go through the parallel race. The earlier
-                // WP-first warmup path was retired when the ``balance``
-                // kwarg was dropped — slot 0 is now a regular BFS+offset
-                // slot raced against the rest.
-                {
-                    std::atomic<int> next{0};
-                    static const bool dbg_slots = std::getenv("NCOLOR_SLOT_DEBUG") != nullptr;
-                    std::vector<double> slot_ms(attempts_per_n, -1.0);
-                    std::vector<int> slot_done(attempts_per_n, 0);
-                    const auto race_t0 = std::chrono::steady_clock::now();
-                    // Race wall-clock deadline shared across all slots:
-                    // bounds time wasted on infeasible-at-cur_n graphs.
-                    // Without this, the 16 per-attempt tabucols all run
-                    // their full iter budget (up to several seconds on
-                    // N≥few-thousand) trying to escape a non-k-colorable
-                    // graph. 50 ms is plenty for any feasible case at
-                    // our scale — successes typically converge in <5 ms.
-                    // For large N (> 1500) on graphs that are
-                    // genuinely (k+1)-chromatic (Mycielski-like, e.g.
-                    // mm r=2 after despur), no race slot will find a
-                    // k-coloring. Cap race wall budget more tightly
-                    // to bound the wasted time on the failure path.
-                    // Successes on real cell-adjacency graphs converge
-                    // in <5ms anyway; the 50ms slack was tuned for
-                    // adversarial despur-perturbation cases on small N
-                    // that benefit from longer per-slot tabucol.
-                    const int64_t race_budget_ns = (N > 1500)
-                        ? (15LL * 1000LL * 1000LL)
-                        : (50LL * 1000LL * 1000LL);
-                    const int64_t race_deadline_ns =
-                        race_t0.time_since_epoch().count()
-                        + race_budget_ns;
-                    pool_->parallel([&]() {
-                        int idx;
-                        while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < attempts_per_n) {
-                            if (winner_found.load(std::memory_order_relaxed)) break;
-                            const auto t0 = std::chrono::steady_clock::now();
-                            const bool ok_slot = run_one_attempt(
-                                idx, &winner_found, /*allow_tabucol=*/true,
-                                race_deadline_ns);
-                            if (dbg_slots) {
-                                const auto t1 = std::chrono::steady_clock::now();
-                                slot_ms[idx] = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                                slot_done[idx] = ok_slot ? 1 : 2;
-                            }
-                            if (ok_slot) {
-                                winner_found.store(true, std::memory_order_relaxed);
-                            }
-                        }
-                    });
-                    if (dbg_solve) {
-                        const double race_ms = std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - race_t0).count();
-                        std::fprintf(stderr, "  [race] %.1fms\n", race_ms);
-                    }
-                    if (dbg_slots) {
-                        const auto race_t1 = std::chrono::steady_clock::now();
-                        const double race_ms = std::chrono::duration<double, std::milli>(race_t1 - race_t0).count();
-                        std::fprintf(stderr, "[race] total=%.3fms\n", race_ms);
-                        for (int a = 0; a < attempts_per_n; ++a) {
-                            const char* st = slot_done[a] == 1 ? "OK"
-                                           : slot_done[a] == 2 ? "FAIL"
-                                           : "skip";
-                            if (slot_ms[a] >= 0) {
-                                std::fprintf(stderr, "  slot[%d] %.3fms %s\n", a, slot_ms[a], st);
-                            }
-                        }
-                    }
-                    // Lowest-index successful attempt wins
-                    // (deterministic preference for the first random
-                    // offset).
-                    for (int a = 0; a < attempts_per_n; ++a) {
-                        if (per_attempt_ok_[a]) {
-                            colors_.swap(per_attempt_colors_[a]);
-                            ok = true;
-                            break;
-                        }
-                    }
-                }
-            } else {
-                for (int attempt = 0; attempt < attempts_per_n && !ok; ++attempt) {
-                    // When weight_obj != 0: slots 0..(attempts-2) run
-                    // weighted-WP (different offsets); LAST slot is a
-                    // pure WP fallback so a 4-colorable graph doesn't
-                    // get bumped to 5 colors when broad-support
-                    // reducers (count, harmonic) over-constrain the BFS.
-                    // With wobj off, all slots run plain BFS.
-                    const bool wobj_active = weight_obj != 0 && edge_weights != nullptr;
-                    const bool wp = wobj_active;
-                    const bool weighted_attempt = wobj_active &&
-                                                  (attempt < attempts_per_n - 1);
-                    const double* w_ptr = weighted_attempt ? edge_weights : nullptr;
-                    const double* de_ptr = weighted_attempt ? de_table : nullptr;
-                    const int w_obj_local = weighted_attempt ? weight_obj : 0;
-                    const bool finished = ncolor_cpp::color_graph_csr_legacy(
-                        indptr_.data(), indices_.data(), N,
-                        cur_n, rand_period, depth + attempt, max_iter,
-                        colors_, wp, w_ptr, de_ptr, w_obj_local);
-                    const bool conflict = !finished || ncolor_cpp::has_conflict_csr(
-                        indptr_.data(), indices_.data(), N, colors_.data());
-                    bool a_ok = !conflict || ncolor_cpp::repair_coloring(
-                        indptr_.data(), indices_.data(), N,
-                        cur_n, std::max(4, max_depth), colors_);
-                    // For the weighted path the user has opted into a
-                    // perceptual objective and accepts repair as part of
-                    // the deal — otherwise the WP-weighted result is
-                    // silently dropped in favor of a non-WP, non-weighted
-                    // fallback (which defeats the point). With wobj off
-                    // wp is false and the gate doesn't fire.
-                    const bool clean_wp_required = wp && !weighted_attempt;
-                    if (a_ok && (!clean_wp_required || !conflict)) ok = true;
-                }
-            }
-            if (!ok && cur_n == n_colors) {
-                const auto tabu_restart_t0 = std::chrono::steady_clock::now();
-                // TabuCol fallback at the user's target k. Some graphs
-                // are k-colorable (verified by SAT) but every
-                // vertex-ordering greedy hits the same local minimum
-                // (e.g. dense corner-touching cells under conn=2 with
-                // K4 substructures). Tabu search rescues these by
-                // allowing temporary conflict increases to escape.
-                // Cost is bounded to one tabucol call per ncolor.label
-                // — fast graphs never hit this branch.
-                if (color_parallel) {
-                    // Parallel path doesn't auto-update colors_ on
-                    // failure; pull in the attempt with fewest
-                    // conflicts (one of them must be sized N since
-                    // color_graph_csr_legacy was called on each).
-                    int best_idx = -1, best_conf = INT_MAX;
-                    for (int a = 0; a < attempts_per_n; ++a) {
-                        if ((int)per_attempt_colors_[a].size() < N) continue;
-                        int c = 0;
-                        for (int32_t i = 0; i < M; ++i) {
-                            if (per_attempt_colors_[a][src_idx_[i]] ==
-                                per_attempt_colors_[a][dst_idx_[i]]) ++c;
-                        }
-                        if (c < best_conf) { best_conf = c; best_idx = a; }
-                    }
-                    if (best_idx < 0) goto skip_tabucol;
-                    colors_.swap(per_attempt_colors_[best_idx]);
-                }
-                // Sanity-check colors_ before handing to TabuCol; bail
-                // out if any vertex has color 0 or > cur_n (would
-                // corrupt the conf[] accumulator). Vertices are
-                // 0-indexed (matches the rest of the C++ pipeline).
-                if ((int)colors_.size() < N) goto skip_tabucol;
-                for (int32_t u = 0; u < N; ++u) {
-                    if (colors_[u] < 1 || colors_[u] > cur_n) goto skip_tabucol;
-                }
-                {
-                    // Tabu-search restart loop. First restart uses the
-                    // conflicted-greedy coloring as a starting point
-                    // (often within a few moves of valid). Subsequent
-                    // restarts use a fresh uniform-random coloring so
-                    // they sample different basins.
-                    //
-                    // Total time is capped by a shared wall-clock budget
-                    // (default 200 ms) so dense graphs that don't
-                    // 4-color quickly fall through to cur_n bump
-                    // instead of burning seconds. Each restart still has
-                    // its own iter cap as a secondary bound.
-                    const int per_seed_iters = std::min(
-                        50000, std::max(2000, N * 30));
-                    // 50 ms wall budget. Tabucol with restart from the
-                    // race's best partial coloring rescues feasible-
-                    // but-hard graphs that the race + bb_dsatur + HEA
-                    // chain can otherwise miss. Two real cases this
-                    // catches on MM r=1:
-                    //   (a) despur_iters=30 (no remove_thin): the
-                    //       cascade removes 16 1-px bridges, leaving
-                    //       a graph that's a strict subgraph of the
-                    //       iter-20 graph (which 4-colors fine) but
-                    //       that the race's BFS-order heuristic gets
-                    //       stuck on. χ is unchanged but the search
-                    //       trajectory shifts.
-                    //   (b) despur_iters=2 with remove_thin=True: same
-                    //       failure mode, ~400 scattered single-pixel
-                    //       removals at corner junctions perturb the
-                    //       graph just enough to break the race.
-                    // Without this budget both cases bump cur_n to 5
-                    // even though χ ≤ 4. 50 ms is enough for tabucol
-                    // to climb out of the local minimum on both.
-                    // Skipped when the race already found a valid
-                    // coloring (the !ok guard above).
-                    // Tighter budget for large N — see race_budget_ns
-                    // rationale above. Tabucol can't escape Mycielski-
-                    // like local minima within ANY reasonable budget,
-                    // so a shorter cap just bounds the inevitable wait.
-                    const int64_t budget_ns = (N > 1500)
-                        ? (15LL * 1000LL * 1000LL)
-                        : (50LL * 1000LL * 1000LL);
-                    const int64_t deadline_ns =
-                        std::chrono::steady_clock::now()
-                            .time_since_epoch().count() + budget_ns;
-                    std::vector<uint8_t> saved = colors_;
-                    uint64_t base_seed =
-                        (uint64_t)(depth + 1) * 0x9e3779b97f4a7c15ULL;
-                    for (int s = 0; s < 24 && !ok; ++s) {
-                        if (std::chrono::steady_clock::now()
-                                .time_since_epoch().count() > deadline_ns) break;
-                        uint64_t rs = base_seed + (uint64_t)s * 0xdeadbeefcafebabeULL;
-                        auto next32 = [&]() -> uint32_t {
-                            rs = rs * 6364136223846793005ULL + 1442695040888963407ULL;
-                            return (uint32_t)(rs >> 32);
-                        };
-                        if (s == 0) {
-                            colors_ = saved;
-                        } else {
-                            for (int32_t u = 0; u < N; ++u) {
-                                colors_[u] = (uint8_t)(1 + (next32() % (uint32_t)cur_n));
-                            }
-                        }
-                        if (ncolor_cpp::tabucol(
-                                indptr_.data(), indices_.data(), N,
-                                cur_n, per_seed_iters, colors_, rs,
-                                deadline_ns)) {
-                            ok = true;
-                        }
-                    }
-                }
-                skip_tabucol: ;
-                if (dbg_solve) {
-                    const double tabu_ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - tabu_restart_t0).count();
-                    std::fprintf(stderr, "  [tabu-restart] %.1fms ok=%d\n", tabu_ms, (int)ok);
-                }
-                // bb_dsatur + HEA fallback chain. Wall-clock deadlines
-                // bound both: bb_dsatur's per-node cost is O(N) (pick_
-                // next is a linear scan), so a fixed node budget
-                // translates to multi-second wall time on graphs with
-                // N in the thousands. A graph that is genuinely NOT
-                // k-colorable would otherwise burn the entire
-                // bb_dsatur node budget AND HEA's generation budget
-                // proving infeasibility before cur_n bumps to k+1.
-                // The 50 ms-each deadlines cap the wasted time per
-                // cur_n bump at ~100 ms; the feasible-but-hard cases
-                // (e.g. the 2 adversarial shuffles in our stress test
-                // where HEA solves in 25-37 ms) still finish well
-                // within budget. Fires only when every cheaper path
-                // has failed → zero cost on the common path.
-                // For graphs that defeat the race + tabu-restart, the
-                // bb_dsatur + HEA chain is a desperation play. When a
-                // graph is genuinely (k+1)-chromatic (e.g. Mycielski-
-                // like structure: no K_{k+1} subgraph but χ = k+1
-                // anyway), neither bb_dsatur nor HEA can find a
-                // k-coloring — they just exhaust their budgets proving
-                // it. For N > 1500 those budgets dominate the failure-
-                // path cost (~200ms on mm 2k² r=2). Trim them for
-                // large N to bound the wasted time. Small N keeps the
-                // generous budget because (a) it amortizes to little
-                // wall time anyway, (b) HEA has a real win-rate there
-                // on the despur-perturbation cases the original budget
-                // was tuned for.
-                const int64_t bb_budget_ns = (N > 1500)
-                    ? (10LL * 1000LL * 1000LL)   // 10 ms for large N
-                    : (50LL * 1000LL * 1000LL);  // 50 ms otherwise
-                const int64_t hea_budget_ns = (N > 1500)
-                    ? (20LL * 1000LL * 1000LL)   // 20 ms for large N
-                    : (100LL * 1000LL * 1000LL); // 100 ms otherwise
-                if (!ok) {
-                    const int64_t node_budget = std::max<int64_t>(
-                        200000, (int64_t)N * 100);
-                    std::vector<uint8_t> bb_colors;
-                    static const bool dbg_bb = std::getenv("NCOLOR_BB_DEBUG") != nullptr;
-                    const auto bb_t0 = std::chrono::steady_clock::now();
-                    const int64_t bb_deadline_ns =
-                        bb_t0.time_since_epoch().count() + bb_budget_ns;
-                    const bool bb_ok = ncolor_cpp::bb_dsatur(
-                            indptr_.data(), indices_.data(),
-                            N, cur_n, bb_colors, node_budget,
-                            /*cancel=*/nullptr, bb_deadline_ns);
-                    if (dbg_bb) {
-                        const auto bb_t1 = std::chrono::steady_clock::now();
-                        const double bb_ms = std::chrono::duration<double, std::milli>(
-                            bb_t1 - bb_t0).count();
-                        std::fprintf(stderr,
-                            "[bb_dsatur] N=%d cur_n=%d budget=%lld ok=%d %.2fms\n",
-                            N, cur_n, (long long)node_budget, (int)bb_ok, bb_ms);
-                    }
-                    if (bb_ok) {
-                        colors_ = std::move(bb_colors);
-                        ok = true;
-                    }
-                }
-                if (!ok) {
-                    std::vector<uint8_t> hea_colors;
-                    const uint64_t hea_seed =
-                        ((uint64_t)N * 0x9e3779b97f4a7c15ULL)
-                        ^ ((uint64_t)(depth + 1) * 0xc6a4a7935bd1e995ULL);
-                    static const bool dbg_hea = std::getenv("NCOLOR_BB_DEBUG") != nullptr;
-                    const auto hea_t0 = std::chrono::steady_clock::now();
-                    const int64_t hea_deadline_ns =
-                        hea_t0.time_since_epoch().count() + hea_budget_ns;
-                    const bool hea_ok = ncolor_cpp::hea(
-                            indptr_.data(), indices_.data(),
-                            N, cur_n, hea_colors,
-                            /*max_generations=*/80,
-                            /*pop_size=*/8,
-                            /*init_tabu_iters=*/500,
-                            /*gen_tabu_iters=*/2000,
-                            hea_seed, hea_deadline_ns);
-                    if (dbg_hea) {
-                        const auto hea_t1 = std::chrono::steady_clock::now();
-                        const double hea_ms = std::chrono::duration<double, std::milli>(
-                            hea_t1 - hea_t0).count();
-                        std::fprintf(stderr,
-                            "[hea] N=%d cur_n=%d ok=%d %.2fms\n",
-                            N, cur_n, (int)hea_ok, hea_ms);
-                    }
-                    if (hea_ok) {
-                        colors_ = std::move(hea_colors);
-                        ok = true;
-                    }
-                }
-            }
-            if (dbg_solve) {
-                const double depth_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - depth_t0).count();
-                std::fprintf(stderr,
-                    "[solve] depth=%d cur_n=%d ok=%d total=%.1fms\n",
-                    depth, cur_n, (int)ok, depth_ms);
-            }
-            if (!ok) {
-                ++cur_n;
-                // ndim-aware floor on the FIRST failure only. Planar
-                // (ndim=2) inputs hit ≤ 4 colors by the 4-color theorem,
-                // so the floor is a no-op there. For ndim ≥ 3 there's no
-                // such bound; empirically dense-blob inputs hit ~3·ndim − 2
-                // colors (more with wrap), so jumping directly to that
-                // floor skips 2-5 doomed sequential attempts on the
-                // fallback path. Triggered only after depth==0 fails, so
-                // user-supplied n_colors and planar workloads remain
-                // bit-identical to the pre-patch behavior.
-                if (depth == 0 && ndim >= 3) {
-                    const int floor_n = 3 * ndim - 2 + (wrap ? 1 : 0);
-                    if (cur_n < floor_n) cur_n = floor_n;
-                }
-            }
-        }
-
-        // Post-success class-merge decoloring: if the picker had to
-        // bump cur_n past the user's target k (n_colors), try the
-        // CHEAP recovery — find two color classes (a, b) that have no
-        // mutual edges and merge them. O(M + cur_n²) per merge.
-        //
-        // This is a no-op when the (k+1)-coloring has all classes
-        // pairwise adjacent (e.g. mm 2k² p=2 clean expand, where the
-        // 5-coloring is "tight"); in those cases χ is still k but
-        // recovering it from a fresh coloring would require Kempe-chain
-        // recoloring or a stronger heuristic. We don't attempt that
-        // here — leaving cur_n at the picker's discovered value rather
-        // than burning more wall-clock time on a recovery that's not
-        // reliable for graphs where tabucol got stuck in the first
-        // place. Documented limitation; the picker's race +
-        // tabu-restart already runs ~100ms of effort at cur_n=n_colors.
-        if (ok && cur_n > n_colors && (int32_t)colors_.size() >= N) {
-            const int32_t* ip = indptr_.data();
-            const int32_t* ix = indices_.data();
-            while (cur_n > n_colors) {
-                const int dim = cur_n + 1;
-                std::vector<uint8_t> cadj((size_t)dim * dim, 0);
-                for (int32_t u = 0; u < N; ++u) {
-                    const int cu = colors_[u];
-                    if (cu < 1) continue;
-                    for (int32_t j = ip[u]; j < ip[u + 1]; ++j) {
-                        const int32_t v = ix[j];
-                        const int cv = colors_[v];
-                        if (cv < 1 || cv == cu) continue;
-                        cadj[(size_t)cu * dim + cv] = 1;
-                        cadj[(size_t)cv * dim + cu] = 1;
-                    }
-                }
-                int merge_a = -1, merge_b = -1;
-                for (int a = 1; a <= cur_n && merge_a < 0; ++a) {
-                    for (int b = a + 1; b <= cur_n; ++b) {
-                        if (!cadj[(size_t)a * dim + b]) {
-                            merge_a = a; merge_b = b; break;
-                        }
-                    }
-                }
-                if (merge_a < 0) break;  // No mergeable pair; bail out.
-                for (int32_t u = 0; u < N; ++u) {
-                    if (colors_[u] == merge_b) colors_[u] = (uint8_t)merge_a;
-                    else if (colors_[u] > merge_b) colors_[u]--;
-                }
-                --cur_n;
-                if (dbg_solve) {
-                    std::fprintf(stderr,
-                        "[decolor merge] class %d -> %d, cur_n=%d\n",
-                        merge_b, merge_a, cur_n);
-                }
-            }
-        }
-
-        int n_used = 0;
-        for (uint8_t c : colors_) if (c > n_used) n_used = c;
-        // O(M) tally of adjacent same-color pairs so callers that
-        // request return_conflicts don't pay another scan over labels.
-        last_n_conflicts_ = 0;
-        for (int32_t i = 0; i < M; ++i) {
-            if (colors_[src_idx_[i]] == colors_[dst_idx_[i]]) ++last_n_conflicts_;
-        }
-        return n_used;
+        return ncolor_cpp::pick_coloring(
+            N, M, n_colors, max_depth, rand_period, color_mode, ndim, wrap,
+            edge_weights, de_table, weight_obj,
+            indptr_, indices_, src_idx_, dst_idx_,
+            colors_, last_n_conflicts_, picker_scratch_,
+            pool_.get(), n_threads_);
     }
 
     // Apply the color LUT to ``expanded[i]``: bg pixels (bg_mask_[i]==1)
@@ -1989,8 +1697,11 @@ private:
             });
     }
 
+    template <typename V>
+    static void drop_(V& v) { V().swap(v); }
+
     int n_threads_;
-    std::unique_ptr<ncolor_cpp::ForkJoinPool> pool_;
+    std::shared_ptr<ncolor_cpp::ForkJoinPool> pool_;
     ncolor_cpp::ExpandBuffers expand_bufs_;
     std::vector<uint8_t> bg_mask_;     // captured from cast, used by apply_lut
     std::vector<int32_t> partials_;     // max-reduce partials, reused across calls
@@ -2043,10 +1754,8 @@ private:
     std::vector<std::pair<int32_t, int32_t>> fused_soft_pairs_;
     int last_n_conflicts_ = 0;
     std::vector<std::pair<std::string, double>> last_stages_;
-    // Per-attempt scratch for parallel coloring (one colors vector per
-    // racing attempt). Reused across calls.
-    std::vector<std::vector<uint8_t>> per_attempt_colors_;
-    std::vector<int> per_attempt_ok_;
+    // Per-attempt scratch for the picker's parallel race. Reused across calls.
+    ncolor_cpp::PickerScratch picker_scratch_;
 };
 
 PYBIND11_MODULE(_impl, m) {
@@ -2114,9 +1823,12 @@ PYBIND11_MODULE(_impl, m) {
              "rank among present values. first_seen=True uses input-order\n"
              "numbering matching fastremap.renumber bit-for-bit (serial\n"
              "build, ~2× slower) — opt in when bit-equality matters.\n"
-             "Accepts uint8/uint16/uint32, int8/int16/int32, int64 input;\n"
-             "cast to int32 happens in parallel inside the released-GIL\n"
-             "block. Returns (formatted_array, n_labels).");
+             "Accepts bool, uint8/16/32/64, int8/16/32/64 and float32/64\n"
+             "input; the cast to int32 happens in parallel inside the\n"
+             "released-GIL block and raises OverflowError if a value does\n"
+             "not fit. Returns (formatted_array, n_labels).")
+        .def("release", &ExpandEngine::release,
+             "Free the persistent scratch buffers; the next call reallocates.");
 
     py::class_<Solver>(m, "Solver",
         "End-to-end ncolor.label() equivalent. Wraps a single ThreadPool\n"
@@ -2187,6 +1899,20 @@ PYBIND11_MODULE(_impl, m) {
              "wrap=True treats the image as a torus (opposite edges are\n"
              "adjacent), adding wrap-around pairs between cells on the\n"
              "image perimeter.")
+        .def("color_graph", &Solver::color_graph,
+             py::arg("edges"), py::arg("n_vertices"),
+             py::arg("n_colors") = 4, py::arg("max_depth") = 30,
+             py::arg("rand_period") = 10,
+             py::arg("soft_edges") = py::none(),
+             py::arg("color_mode") = -1,
+             py::arg("capture_stages") = false,
+             "Color an abstract graph given its edge list, using the same\n"
+             "picker label() runs on the pixel-adjacency graph.\n\n"
+             "``edges`` is an (M, 2) integer array of 0-indexed vertex\n"
+             "pairs; duplicate / reversed / self / out-of-range entries are\n"
+             "normalized away. ``soft_edges`` (same shape) feeds the\n"
+             "soft-constraint local search. Returns (colors uint8[n_vertices]\n"
+             "in 1..n_used, n_used).")
         .def("get_last_stages", &Solver::get_last_stages,
              "Per-stage timing breakdown from the most recent label() call\n"
              "made with capture_stages=True.")
@@ -2202,7 +1928,10 @@ PYBIND11_MODULE(_impl, m) {
              "Total weight (or count if unit weights) of soft_extra_edges\n"
              "whose endpoints share a color after the post-solve local\n"
              "search. 0 means all soft preferences satisfied. Only nonzero\n"
-             "when soft_extra_edges was passed to label().");
+             "when soft_extra_edges was passed to label().")
+        .def("release", &Solver::release,
+             "Free every persistent scratch buffer (the working set of the\n"
+             "largest image processed so far); the next call reallocates.");
 
     m.def("cc_label",
           [](py::array mask, int conn) -> std::pair<py::array_t<int32_t>, int32_t> {
@@ -2226,7 +1955,7 @@ PYBIND11_MODULE(_impl, m) {
               int32_t n_labels = 0;
               {
                   py::gil_scoped_release release;
-                  dispatch_int_dtype(buf.format, buf.itemsize, "cc_label",
+                  dispatch_cast_dtype(buf.format, buf.itemsize, "cc_label",
                       [&](auto* tag) {
                           using T = std::remove_pointer_t<decltype(tag)>;
                           n_labels = ncolor_cpp::cc_label_nd<T>(

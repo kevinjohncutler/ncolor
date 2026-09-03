@@ -4,33 +4,10 @@ Thin wrappers over the C++ Solver in :mod:`ncolor._backend`.
 """
 from __future__ import annotations
 
-import threading
-
 import numpy as np
 
-from .format import format_labels
-
-
-# Persistent thread pool; constructing per call costs ~5-10 ms.
-_SOLVER = None
-# The Solver is a process-global singleton backed by a single C++ ForkJoinPool,
-# which is NOT safe for concurrent solve calls — two Python threads entering
-# ``solver.label``/``solver.connect`` at once corrupt the shared pool and
-# segfault (KERN_INVALID_ADDRESS in bridge_check_subspace_nd). Serialize every
-# C++ solve through this lock. The within-call ForkJoinPool parallelism is
-# unaffected; only cross-thread *overlap* is prevented. Reentrant so a future
-# nested solve on the same thread can't self-deadlock.
-_SOLVER_LOCK = threading.RLock()
-
-
-def _get_solver():
-    global _SOLVER
-    if _SOLVER is None:
-        with _SOLVER_LOCK:                 # guard the check-then-set init race too
-            if _SOLVER is None:
-                from ._backend import Solver
-                _SOLVER = Solver()
-    return _SOLVER
+from ._engines import LOCK as _SOLVER_LOCK, solver as _get_solver
+from .format import format_labels, _compact_wide_labels
 
 
 def label(lab, n=4, conn=1, max_depth=30, expand=True,
@@ -187,6 +164,14 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
     pass an ``(n+1) × (n+1)`` float array.
 
     """
+    # A GeoDataFrame / GeoSeries / Shapely geometry would otherwise
+    # become an object array and fail deep in the dtype dispatch.
+    if hasattr(lab, "__geo_interface__") or (
+            hasattr(lab, "geometry") and hasattr(lab, "crs")):
+        raise TypeError(
+            "ncolor.label colors a raster label image; for vector features "
+            "(GeoDataFrame / GeoSeries / GeoJSON) use ncolor.geo.label().")
+
     lab_arr = np.asarray(lab)
     solver = _get_solver()
 
@@ -226,23 +211,30 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
                 f"soft_extra_edges must be an (E, 2) int array of 1-indexed "
                 f"cell-pair preferences; got shape {soft_extra_arr.shape}")
 
-    with _SOLVER_LOCK:                 # ncolor solve is not thread-safe (shared pool)
-        out_array, n_used = solver.label(
-            lab_arr,
-            n_colors=int(n), max_depth=int(max_depth),
-            conn=int(conn), p=int(p), format_input=bool(format_input),
-            expand=bool(expand), out=out, wrap=bool(wrap),
-            first_seen=bool(first_seen),
-            weight_objective=wobj, de_table=de_arr,
-            weight_mode=wmode_int, extra_edges=extra_arr,
-            connect_radius=int(connect_radius),
-            min_contact=int(min_contact),
-            expand_mode=str(expand_mode),
-            soft_extra_edges=soft_extra_arr,
-            soft_conn=int(soft_conn),
-            soft_radius=int(soft_radius),
-            clean_mask=bool(clean_mask),
-            capture_stages=bool(verbose))
+    call_kwargs = dict(
+        n_colors=int(n), max_depth=int(max_depth),
+        conn=int(conn), p=int(p), format_input=bool(format_input),
+        expand=bool(expand), out=out, wrap=bool(wrap),
+        first_seen=bool(first_seen),
+        weight_objective=wobj, de_table=de_arr,
+        weight_mode=wmode_int, extra_edges=extra_arr,
+        connect_radius=int(connect_radius),
+        min_contact=int(min_contact),
+        expand_mode=str(expand_mode),
+        soft_extra_edges=soft_extra_arr,
+        soft_conn=int(soft_conn),
+        soft_radius=int(soft_radius),
+        clean_mask=bool(clean_mask),
+        capture_stages=bool(verbose))
+    with _SOLVER_LOCK:                 # engine calls must not overlap (shared pool)
+        try:
+            out_array, n_used = solver.label(lab_arr, **call_kwargs)
+        except OverflowError:
+            # int64 / uint32 / uint64 / float input holding a value the
+            # int32 engine cannot represent. Rare, so it is handled off
+            # the fast path: compact the labels in numpy and go again.
+            lab_arr = _compact_wide_labels(lab_arr)
+            out_array, n_used = solver.label(lab_arr, **call_kwargs)
     out = out_array
 
     if verbose:
@@ -292,7 +284,11 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
 def connect(img, conn=1):
     """Find adjacent label pairs in a label image.
 
-    Returns an ``(M, 2)`` int array of unique (lo, hi) label pairs.
+    Returns an ``(M, 2)`` int array of unique (lo, hi) label pairs, in
+    terms of the input's own label values. Raises ``OverflowError`` if a
+    label does not fit int32; compact such inputs with
+    :func:`ncolor.format_labels` first (the pairs would otherwise refer
+    to renumbered labels).
     """
     with _SOLVER_LOCK:                 # shares the singleton solver / pool
         return _get_solver().connect(img, conn=int(conn))
@@ -332,3 +328,89 @@ def regionprops(labels, n_labels=0):
     return _b.regionprops(labels, int(n_labels))
 
 
+
+
+def color_graph(edges, n_vertices=None, n=4, soft_edges=None, max_depth=30,
+                return_n=False, check_conflicts=False, return_conflicts=False):
+    """Color an abstract graph given its edge list.
+
+    The same picker :func:`ncolor.label` runs on the pixel-adjacency
+    graph, decoupled from any image. Use it when the adjacency comes
+    from somewhere other than a raster: polygon topology (see
+    :func:`ncolor.geo.label`), a mesh, a region-adjacency graph built
+    by another library.
+
+    Parameters
+    ----------
+    edges : (M, 2) array_like of int
+        **0-indexed** vertex pairs. Duplicate, reversed-duplicate,
+        self- and out-of-range pairs are dropped, so a symmetric edge
+        list is accepted as-is.
+    n_vertices : int, optional
+        Number of vertices. Defaults to ``edges.max() + 1``, which
+        silently drops trailing isolated vertices, so pass it explicitly
+        when the count matters.
+    n : int
+        Color target. The picker works up from the clique lower bound
+        and spends its search budget trying to fit the graph into ``n``;
+        a graph that genuinely needs more escalates past it (up to
+        ``max_depth`` increments) rather than returning a broken
+        coloring. Read the count back with ``return_n=True``.
+    soft_edges : (E, 2) array_like of int, optional
+        Pairs that *should* differ in color but do not constrain the
+        hard coloring. A local-search post-pass minimizes how many of
+        them end up sharing a color.
+    max_depth : int
+        Cap on those escalation steps. Only a graph that exhausts it
+        comes back with conflicts. Surface that with
+        ``check_conflicts=True`` (raises) or ``return_conflicts=True``.
+
+    Returns
+    -------
+    colors : (n_vertices,) uint8 ndarray
+        Color of each vertex, in ``1..n_used``. Isolated vertices get 1.
+
+    Examples
+    --------
+    >>> import ncolor
+    >>> colors = ncolor.color_graph([[0, 1], [1, 2], [2, 0]], n_vertices=3)
+    >>> len(set(colors.tolist()))          # a triangle needs three
+    3
+    """
+    edges_arr = np.ascontiguousarray(edges, dtype=np.int32) \
+        if edges is not None else np.zeros((0, 2), dtype=np.int32)
+    if edges_arr.ndim != 2 or edges_arr.shape[1] != 2:
+        raise ValueError(
+            f"edges must be an (M, 2) int array of 0-indexed vertex pairs; "
+            f"got shape {edges_arr.shape}")
+    if n_vertices is None:
+        n_vertices = int(edges_arr.max()) + 1 if edges_arr.size else 0
+    if n_vertices < 0:
+        raise ValueError(f"n_vertices must be >= 0; got {n_vertices}")
+
+    soft_arr = None
+    if soft_edges is not None:
+        soft_arr = np.ascontiguousarray(soft_edges, dtype=np.int32)
+        if soft_arr.ndim != 2 or soft_arr.shape[1] != 2:
+            raise ValueError(
+                f"soft_edges must be an (E, 2) int array of 0-indexed "
+                f"vertex pairs; got shape {soft_arr.shape}")
+
+    solver = _get_solver()
+    with _SOLVER_LOCK:                 # shares the singleton solver / pool
+        colors, n_used = solver.color_graph(
+            edges_arr, int(n_vertices), n_colors=int(n),
+            max_depth=int(max_depth), soft_edges=soft_arr)
+
+    conflicts = solver.get_last_n_conflicts() \
+        if (check_conflicts or return_conflicts) else 0
+    if check_conflicts and conflicts:
+        raise ValueError(
+            f"Coloring conflict detected: {conflicts} adjacent pairs share a color.")
+    if return_n and return_conflicts:
+        return colors, int(n_used), conflicts
+    if return_n:
+        return colors, int(n_used)
+    if return_conflicts:
+        return colors, conflicts
+    return colors

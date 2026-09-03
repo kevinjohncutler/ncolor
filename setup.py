@@ -36,18 +36,77 @@ install_deps = [
     "numpy",
     "platformdirs",  # SMT calibration cache + native loader
 ]
-extras_deps = {}
+extras_deps = {
+    # Vector-geometry front end (ncolor.geo.label / .connect). Shapely
+    # 2.0 is the floor: the vectorized STRtree.query + predicate API the
+    # adjacency scan is built on landed there. GeoPandas is NOT required:
+    # GeoDataFrames are handled by duck-typing, and geopandas itself
+    # depends on shapely, so anyone passing one already has it.
+    "geo": ["shapely>=2.0"],
+}
 
 extra_compile_args = []
 extra_link_args = []
-USE_CLANG_CL = os.environ.get("NCOLOR_USE_CLANG_CL") == "1"
-# -march=native picks AVX2/AVX512 on Zen, NEON 4×4 transpose on Apple
-# Silicon, etc. — but produces wheels that crash on older CPUs. Default
-# ON for source builds (developer machines), OFF in cibuildwheel where
-# we want a portable baseline. The arm64 SIMD paths in expand.hpp are
-# gated on ``__aarch64__`` (always true on apple-arm) so they stay on
-# regardless of the march flag.
+# Target CPU selection:
+#   NCOLOR_MARCH_NATIVE=1 (default for source builds)  -> -march=native
+#   NCOLOR_MARCH=<arch>   (wheel builds)                -> -march=<arch>
+#   neither                                             -> compiler baseline
+# -march=native picks AVX2/AVX-512 on Zen, NEON on Apple Silicon, etc.,
+# but produces binaries that crash on older CPUs, so cibuildwheel turns
+# it off. The x86_64 wheels instead get NCOLOR_MARCH=x86-64-v2 (SSE4.2,
+# 2009+ CPUs, the same floor NumPy 2 requires), which turns on the SSE4.1
+# lane multiply in expand.hpp; the plain SSE2 baseline still gets the
+# 4-wide path through an emulated multiply. The arm64 NEON paths are
+# gated on ``__aarch64__`` and stay on regardless of the march flag.
 MARCH_NATIVE = os.environ.get("NCOLOR_MARCH_NATIVE", "1") == "1"
+MARCH = os.environ.get("NCOLOR_MARCH", "").strip()
+
+
+def _want_clang_cl():
+    """clang-cl requested (NCOLOR_USE_CLANG_CL=1) and actually on PATH."""
+    if os.environ.get("NCOLOR_USE_CLANG_CL") != "1":
+        return False
+    import shutil  # noqa: PLC0415
+    if shutil.which("clang-cl") is None and shutil.which("clang-cl.exe") is None:
+        print("[ncolor] NCOLOR_USE_CLANG_CL=1 but clang-cl is not on PATH; "
+              "building with cl.exe instead.")
+        return False
+    return True
+
+
+def _patch_msvc_to_clang_cl():
+    """Make distutils' MSVC compiler class invoke clang-cl.exe.
+
+    clang-cl is an MSVC-compatible Clang front end (same switches), so
+    distutils sees it as just another ``cl.exe``. setuptools has moved
+    the MSVC compiler class twice; try the current location first and
+    the legacy one second.
+    """
+    candidates = (
+        "setuptools._distutils.compilers.C.msvc",   # setuptools >= 74
+        "distutils._msvccompiler",                  # older setuptools shim
+    )
+    last_exc = None
+    for modname in candidates:
+        try:
+            import importlib  # noqa: PLC0415
+            mod = importlib.import_module(modname)
+            cls = getattr(mod, "Compiler", None) or getattr(mod, "MSVCCompiler")
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            continue
+        orig_initialize = cls.initialize
+
+        def _patched_initialize(self, plat_name=None, _orig=orig_initialize):
+            _orig(self, plat_name)
+            self.cc = "clang-cl.exe"
+
+        cls.initialize = _patched_initialize
+        return
+    raise RuntimeError(f"could not locate the distutils MSVC compiler class: {last_exc!r}")
+
+
+USE_CLANG_CL = sys.platform == "win32" and _want_clang_cl()
 
 if sys.platform == "win32":
     extra_compile_args += ["/std:c++17", "/O2", "/EHsc"]
@@ -59,10 +118,12 @@ if sys.platform == "win32":
     #   smaller namespace pollution.
     extra_compile_args += ["/DNOMINMAX", "/DWIN32_LEAN_AND_MEAN"]
     if MARCH_NATIVE:
+        # MSVC has no -march=native; AVX2 is the closest portable-enough
+        # stand-in for a developer box (every x86 CPU since 2013).
         extra_compile_args += ["/arch:AVX2"]
     if USE_CLANG_CL:
-        # clang-cl maps /O2 -> -O2; push to -O3 + (optionally) -march=native
-        # via /clang:. Without LTO the host MS link.exe is fine.
+        # clang-cl maps /O2 -> -O2; push to -O3 + the GCC-style flags via
+        # /clang:. Without LTO the host MS link.exe is fine.
         extra_compile_args += [
             "/clang:-O3",
             "/clang:-ffp-contract=fast",
@@ -70,15 +131,9 @@ if sys.platform == "win32":
         ]
         if MARCH_NATIVE:
             extra_compile_args += ["/clang:-march=native"]
-        # Monkey-patch distutils' MSVC compiler to invoke clang-cl instead
-        # of cl.exe. clang-cl is an MSVC-compatible Clang frontend (same
-        # switches) — distutils sees it as just another `cl.exe`.
-        import distutils._msvccompiler as _msvc  # noqa: PLC0415
-        _orig_initialize = _msvc.MSVCCompiler.initialize
-        def _patched_initialize(self, plat_name=None):
-            _orig_initialize(self, plat_name)
-            self.cc = "clang-cl.exe"
-        _msvc.MSVCCompiler.initialize = _patched_initialize
+        elif MARCH:
+            extra_compile_args += [f"/clang:-march={MARCH}"]
+        _patch_msvc_to_clang_cl()
 else:
     extra_compile_args += [
         "-std=c++17",
@@ -87,12 +142,22 @@ else:
         "-pthread",
         "-ffp-contract=fast",  # fuse mul+add -> FMA, matches numba LLVM emission
         "-funroll-loops",
+        # No debug info in the shared object. Python's own CFLAGS carry
+        # -g, and on manylinux that shipped 25 MB of .debug_* sections in
+        # a 27 MB .so (1.8 MB of code): a 6 MB wheel instead of 0.5 MB.
+        "-g0",
     ]
     if MARCH_NATIVE:
         extra_compile_args += ["-march=native"]
+    elif MARCH:
+        extra_compile_args += [f"-march={MARCH}"]
     extra_link_args += ["-pthread"]
     if sys.platform == "darwin":
         extra_compile_args += ["-mmacosx-version-min=10.14"]
+    elif sys.platform.startswith("linux"):
+        # Drop the static symbol table too; the dynamic symbols the
+        # loader needs are kept.
+        extra_link_args += ["-Wl,--strip-all"]
 
 
 native_ext = Extension(

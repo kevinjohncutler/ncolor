@@ -350,6 +350,17 @@ inline double soft_local_search(
     // escape *tight, small* local optima like the logo K_4 cluster; on
     // big graphs they're a perf tax with low ROI. Skip by default.
     if (N > restart_max_N) n_restarts = 0;
+    // A one-color palette leaves the search no move to make: every
+    // vertex already sits on the only color there is. Bail before the
+    // restart loop, whose "draw a color != cu" rejection sampling
+    // cannot terminate when n_colors == 1. Reachable whenever the hard
+    // graph has no edges but soft edges exist: cells that only touch
+    // diagonally with expand=False, say, or vector features rejected by
+    // the min_shared_length filter.
+    if (n_colors < 2 || N <= 0) {
+        return soft_total_penalty(colors, N, soft_indptr, soft_indices,
+                                  /*soft_weights=*/nullptr);
+    }
     double penalty = soft_total_penalty(colors, N, soft_indptr,
                                           soft_indices, soft_weights);
     if (penalty == 0.0) return 0.0;

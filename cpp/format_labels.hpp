@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 #include "dispatch.hpp"
@@ -206,70 +207,149 @@ inline int32_t format_labels_inplace(int32_t* lbl, int64_t total,
     return next_lbl;
 }
 
+// ---- Range-checked casts to int32 -----------------------------------------
+//
+// Every engine entry point works on int32 labels internally. Inputs that
+// can hold values outside the int32 range (int64, uint32, uint64, float,
+// double) are checked while they are cast: a plain ``static_cast`` would
+// wrap a label like 2^31 + 5 to a negative number, which the format pass
+// then treats as background, so whole cells silently vanish from the
+// output. The check is one compare per element folded into a pass that
+// is memory-bound anyway; for the narrow types it compiles away.
+//
+// The cast functions return ``true`` when every value fit. On ``false``
+// the destination contents are unspecified and the caller raises; the
+// Python wrappers catch that and compact the labels with ``np.unique``
+// before retrying, so callers never see it for the label()/format
+// paths. Floats are truncated toward zero; NaN and infinities count as
+// out of range.
+
+namespace detail {
+
+template <typename InT>
+constexpr bool cast_needs_range_check() {
+    return std::is_floating_point<InT>::value ||
+           (sizeof(InT) > 4) ||
+           (sizeof(InT) == 4 && !std::is_signed<InT>::value);
+}
+
+template <typename InT>
+inline bool fits_int32(InT v) {
+    if constexpr (std::is_floating_point<InT>::value) {
+        // Compare in double so the float32 rounding of INT32_MAX
+        // (2147483648.0f) cannot admit a value that overflows the cast.
+        // NaN fails both comparisons.
+        const double d = static_cast<double>(v);
+        return d >= -2147483648.0 && d < 2147483648.0;
+    } else if constexpr (std::is_signed<InT>::value) {
+        return v >= static_cast<InT>(std::numeric_limits<int32_t>::min()) &&
+               v <= static_cast<InT>(std::numeric_limits<int32_t>::max());
+    } else {
+        return v <= static_cast<InT>(std::numeric_limits<int32_t>::max());
+    }
+}
+
+// One element: the cast plus, for the wide types, the range test. The
+// float branch writes 0 for an out-of-range value instead of performing
+// an undefined float-to-int conversion; the result is discarded anyway.
+template <typename InT>
+inline int32_t checked_cast_int32(InT v, bool& ok) {
+    if constexpr (cast_needs_range_check<InT>()) {
+        const bool fits = fits_int32(v);
+        ok &= fits;
+        if constexpr (std::is_floating_point<InT>::value) {
+            return fits ? static_cast<int32_t>(v) : int32_t{0};
+        } else {
+            return static_cast<int32_t>(v);
+        }
+    } else {
+        return static_cast<int32_t>(v);
+    }
+}
+
+}  // namespace detail
+
 // Cast a typed input array to int32 AND capture the bg pattern (lbl == 0)
 // to a uint8 mask in one parallel pass. This is what Solver.label uses
 // for multi-dtype input: fuses the dtype conversion (which numpy.astype
 // would have done single-threaded outside the GIL release) with the
 // bg-mask capture (so apply_lut can do the post-expand zero-out without
 // keeping a typed pointer to the original input around).
+//
+// Returns false if any value was outside the int32 range (see above).
 template <typename InT>
-inline void cast_with_bg(const InT* src, int32_t* dst, uint8_t* bg_mask,
+inline bool cast_with_bg(const InT* src, int32_t* dst, uint8_t* bg_mask,
                          int64_t total,
                          ForkJoinPool& pool, int n_threads) {
     if (n_threads <= 1 || total < 500000) {
+        bool ok = true;
         for (int64_t i = 0; i < total; ++i) {
             const InT v = src[i];
-            dst[i] = static_cast<int32_t>(v);
+            dst[i] = detail::checked_cast_int32<InT>(v, ok);
             bg_mask[i] = (v == InT{0}) ? uint8_t{1} : uint8_t{0};
         }
-        return;
+        return ok;
     }
+    // A single shared flag, written only on failure, so the common path
+    // never touches a contended cache line.
+    std::atomic<bool> any_bad{false};
     dispatch_parallel(pool, static_cast<size_t>(total),
         static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD,
-        [src, dst, bg_mask](size_t i0, size_t i1) {
+        [src, dst, bg_mask, &any_bad](size_t i0, size_t i1) {
+            bool ok = true;
             for (size_t i = i0; i < i1; ++i) {
                 const InT v = src[i];
-                dst[i] = static_cast<int32_t>(v);
+                dst[i] = detail::checked_cast_int32<InT>(v, ok);
                 bg_mask[i] = (v == InT{0}) ? uint8_t{1} : uint8_t{0};
             }
+            if (!ok) any_bad.store(true, std::memory_order_relaxed);
         });
+    return !any_bad.load(std::memory_order_relaxed);
 }
 
-// Cast a typed input array (uint8/uint16/uint32/int8/int16/int32/int64)
-// to int32 in parallel. For int32 → int32 the templated path becomes a
-// straight copy; we provide an explicit specialization that uses memcpy
-// (with a same-pointer guard, so callers can no-op when src == dst).
+// Cast a typed input array to int32 in parallel. For int32 → int32 the
+// templated path becomes a straight copy; we provide an explicit
+// specialization that uses memcpy (with a same-pointer guard, so callers
+// can no-op when src == dst).
 //
-// Used by Solver.label so the dtype conversion fuses naturally with the
-// downstream format_labels_inplace pass — same memory bandwidth either
-// way, but we avoid the single-threaded numpy.astype the Python wrapper
-// would otherwise have done before calling in.
+// Used by ExpandEngine.format_labels so the dtype conversion fuses
+// naturally with the downstream format_labels_inplace pass — same memory
+// bandwidth either way, but we avoid the single-threaded numpy.astype the
+// Python wrapper would otherwise have done before calling in.
+//
+// Returns false if any value was outside the int32 range (see above).
 template <typename InT>
-inline void cast_to_int32(const InT* src, int32_t* dst, int64_t total,
+inline bool cast_to_int32(const InT* src, int32_t* dst, int64_t total,
                           ForkJoinPool& pool, int n_threads) {
     if (n_threads <= 1 || total < 500000) {
+        bool ok = true;
         for (int64_t i = 0; i < total; ++i) {
-            dst[i] = static_cast<int32_t>(src[i]);
+            dst[i] = detail::checked_cast_int32<InT>(src[i], ok);
         }
-        return;
+        return ok;
     }
+    std::atomic<bool> any_bad{false};
     dispatch_parallel(pool, static_cast<size_t>(total),
         static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD,
-        [src, dst](size_t i0, size_t i1) {
+        [src, dst, &any_bad](size_t i0, size_t i1) {
+            bool ok = true;
             for (size_t i = i0; i < i1; ++i) {
-                dst[i] = static_cast<int32_t>(src[i]);
+                dst[i] = detail::checked_cast_int32<InT>(src[i], ok);
             }
+            if (!ok) any_bad.store(true, std::memory_order_relaxed);
         });
+    return !any_bad.load(std::memory_order_relaxed);
 }
 
 // int32 → int32 specialization: memcpy when src != dst, no-op otherwise.
 template <>
-inline void cast_to_int32<int32_t>(const int32_t* src, int32_t* dst,
+inline bool cast_to_int32<int32_t>(const int32_t* src, int32_t* dst,
                                    int64_t total,
                                    ForkJoinPool& /*pool*/, int /*n_threads*/) {
     if (src != dst) {
         std::memcpy(dst, src, static_cast<size_t>(total) * sizeof(int32_t));
     }
+    return true;
 }
 
 }  // namespace ncolor_cpp

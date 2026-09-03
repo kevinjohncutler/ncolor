@@ -13,6 +13,10 @@ Public names:
 * ``connected_components`` — N-D connected-components labeling
 * ``regionprops``          — area / bbox / centroid for a labeled image
 * ``delete_spurs``         — N-D skeleton hole-fill + endpoint pruning
+* ``color_graph``          — 4-color an abstract graph from an edge list
+* ``geo``                  — vector front end: ``geo.label`` / ``geo.connect``
+                             for GeoDataFrames, GeoJSON and Shapely geometries
+* ``release_buffers``      — free the scratch memory kept between calls
 """
 from ._version import __version__
 
@@ -24,6 +28,9 @@ __all__ = [
     "connected_components",
     "regionprops",
     "delete_spurs",
+    "color_graph",
+    "geo",
+    "release_buffers",
 ]
 
 _LAZY_ATTRS = {
@@ -34,7 +41,17 @@ _LAZY_ATTRS = {
     "format_labels": ".format",
     "expand_labels": ".expand",
     "delete_spurs": ".format",
+    "color_graph": ".color",
+    "release_buffers": "._engines",
 }
+
+# Submodules reachable as a plain attribute (``ncolor.geo.label``) after
+# a bare ``import ncolor``. Without this hook that access raises
+# AttributeError until something has imported the submodule; ``import
+# ncolor.geo`` and ``from ncolor import geo`` work either way. ``geo``
+# itself imports shapely lazily, inside its functions, so touching the
+# attribute stays as cheap as the rest of the package.
+_LAZY_SUBMODULES = {"geo"}
 
 
 def __getattr__(name):
@@ -44,6 +61,11 @@ def __getattr__(name):
         attr = getattr(module, name)
         globals()[name] = attr
         return attr
+    if name in _LAZY_SUBMODULES:
+        import importlib
+        module = importlib.import_module("." + name, __name__)
+        globals()[name] = module
+        return module
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

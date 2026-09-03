@@ -6,17 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 
-
-# Persistent thread pool; constructing per call costs ~5-10 ms.
-_ENGINE = None
-
-
-def _get_engine():
-    global _ENGINE
-    if _ENGINE is None:
-        from ._backend import ExpandEngine
-        _ENGINE = ExpandEngine()
-    return _ENGINE
+from ._engines import LOCK as _LOCK, expand_engine as _get_engine
 
 
 def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
@@ -45,6 +35,12 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
       metric where the test changes the output materially. 2D only for
       now — ND > 2 falls back to standard expand (no bridge
       prevention).
+
+    Accepts any integer, bool or float label array; the cast to the
+    engine's int32 runs in parallel inside the call. Labels are kept as
+    they are, so an input holding a value outside the int32 range raises
+    ``OverflowError`` instead of being renumbered; compact it with
+    :func:`ncolor.format_labels` first.
     """
     if mode not in ("standard", "clean"):
         raise ValueError(
@@ -60,13 +56,16 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
     if p not in (1, 2):
         raise ValueError(f"p must be 1 or 2, got {p!r}")
 
-    arr = np.asarray(label_image)
-    if arr.size == 0 or int(arr.max()) == 0:
-        # No seeds to expand from; return a fresh int32 copy so callers
-        # always get a writable buffer of the canonical output dtype.
+    arr = np.ascontiguousarray(label_image)
+    if arr.size == 0:
+        # Nothing to expand; return a fresh int32 copy so callers always
+        # get a writable buffer of the canonical output dtype.
         return arr.astype(np.int32, copy=True)
 
-    arr32 = arr.astype(np.int32, copy=False)
-    if mode == "standard":
-        return _get_engine().expand_labels(arr32, p=p, wrap=bool(wrap))
-    return _get_engine().expand_labels_clean(arr32, p=int(p))
+    # The engine casts to int32 itself (checked, in parallel), so no
+    # numpy astype pass here.
+    with _LOCK:                        # engine calls must not overlap
+        engine = _get_engine()
+        if mode == "standard":
+            return engine.expand_labels(arr, p=p, wrap=bool(wrap))
+        return engine.expand_labels_clean(arr, p=int(p))

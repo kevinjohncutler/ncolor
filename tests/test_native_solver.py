@@ -46,11 +46,20 @@ def test_float_at_or_above_one_rounds():
 
 
 def test_fraction_scales_to_cpu_count():
-    """``0 < x < 1`` → round(x × os.cpu_count())."""
+    """``0 < x < 1`` → x × os.cpu_count(), rounded half up.
+
+    The engine rounds with ``floor(x + 0.5)``; Python's ``round`` is
+    half-to-even, so the two disagree whenever the product lands on .5
+    (0.25 × 18 cores = 4.5 → 5 in the engine, 4 in Python).
+    """
     ncpu = os.cpu_count() or 1
-    assert nc.Solver(0.5).n_threads == max(1, round(0.5 * ncpu))
-    assert nc.Solver(0.25).n_threads == max(1, round(0.25 * ncpu))
-    assert nc.Solver(0.75).n_threads == max(1, round(0.75 * ncpu))
+
+    def half_up(x):
+        return max(1, int(x * ncpu + 0.5))
+
+    assert nc.Solver(0.5).n_threads == half_up(0.5)
+    assert nc.Solver(0.25).n_threads == half_up(0.25)
+    assert nc.Solver(0.75).n_threads == half_up(0.75)
 
 
 def test_tiny_fraction_rounds_up_to_1():

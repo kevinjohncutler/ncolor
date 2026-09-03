@@ -22,13 +22,18 @@
 #include <cstdint>
 #include <cstring>
 
+// SIMD selection. NEON is unconditional on arm64. On x86 the 4-wide SSE
+// path needs only SSE2, which every x86_64 compiler has on by default
+// (GCC/clang define __SSE2__; MSVC defines _M_X64 and never __SSE2__),
+// so the wheel builds get it too. AVX2 adds an 8-wide fill when the
+// build targets it (-march=native / x86-64-v3, or MSVC /arch:AVX2).
 #if defined(__aarch64__) || defined(__ARM_NEON)
 #  include <arm_neon.h>
-#elif defined(__SSE2__)
-#  include <emmintrin.h>
-#  if defined(__SSE4_1__)
-#    include <smmintrin.h>
-#  endif
+#  define NCOLOR_SIMD_NEON 1
+#elif defined(__SSE2__) || defined(_M_X64) || \
+      (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#  include <immintrin.h>
+#  define NCOLOR_SIMD_X86 1
 #endif
 #include <vector>
 
@@ -38,6 +43,23 @@
 namespace ncolor_cpp {
 
 using ::ForkJoinPool;
+
+#if defined(NCOLOR_SIMD_X86)
+// 32-bit lane-wise multiply. One instruction from SSE4.1 up; on a plain
+// SSE2 target it is two 32x32->64 multiplies on the even and odd lanes
+// whose low halves are re-interleaved (two's complement makes the low 32
+// bits identical for signed inputs).
+static inline __m128i mullo_epi32_sse(__m128i a, __m128i b) {
+#if defined(__SSE4_1__) || defined(__AVX__)
+    return _mm_mullo_epi32(a, b);
+#else
+    const __m128i even = _mm_mul_epu32(a, b);
+    const __m128i odd  = _mm_mul_epu32(_mm_srli_si128(a, 4), _mm_srli_si128(b, 4));
+    return _mm_unpacklo_epi32(_mm_shuffle_epi32(even, _MM_SHUFFLE(0, 0, 2, 0)),
+                              _mm_shuffle_epi32(odd,  _MM_SHUFFLE(0, 0, 2, 0)));
+#endif
+}
+#endif
 
 // Parabolic-envelope pass on one line of length N.
 //
@@ -62,8 +84,8 @@ using ::ForkJoinPool;
 // by the strided write half anyway).
 // SIMD fill helper: writes lbl[i_start..i_end) = lbl_j and
 // dist[i_start..i_end) = g_j + (i - v_j)². Vectorized for ARM64 NEON
-// (Apple Silicon — 4×int32 per iteration) and x86_64 SSE2/AVX2 (4×int32
-// per iteration via _mm_mullo_epi32). Scalar tail handles the remainder.
+// (4×int32 per iteration), x86 AVX2 (8×int32) and x86 SSE2/SSE4.1
+// (4×int32). Scalar tail handles the remainder.
 //
 // Hand-rolled because clang -O3 -march=native consistently fails to
 // vectorize the int32 ``di*di`` multiply + paired stores even with
@@ -73,7 +95,7 @@ static inline void envelope_fill_simd(
         int64_t i_start, int64_t i_end,
         int32_t lbl_j, int32_t g_j, int32_t v_j) {
     int64_t i = i_start;
-#if defined(__aarch64__) || defined(__ARM_NEON)
+#if defined(NCOLOR_SIMD_NEON)
     const int32x4_t v_lbl = vdupq_n_s32(lbl_j);
     const int32x4_t v_g   = vdupq_n_s32(g_j);
     const int32x4_t v_vj  = vdupq_n_s32(v_j);
@@ -88,23 +110,38 @@ static inline void envelope_fill_simd(
         vst1q_s32(dist + i, v_dist);
         v_i = vaddq_s32(v_i, v_four);
     }
-#elif defined(__SSE4_1__)
-    // SSE4.1 (Penryn / Bulldozer +). Pure SSE2 lacks _mm_mullo_epi32, and
-    // the scalar tail below covers that case at no perf cost (the caller
-    // typically processes whole 4-wide blocks on modern x86_64 anyway).
-    const __m128i v_lbl = _mm_set1_epi32(lbl_j);
-    const __m128i v_g   = _mm_set1_epi32(g_j);
-    const __m128i v_vj  = _mm_set1_epi32(v_j);
-    const __m128i v_four = _mm_set1_epi32(4);
-    __m128i v_i = _mm_add_epi32(_mm_set1_epi32(static_cast<int32_t>(i_start)),
-                                _mm_set_epi32(3, 2, 1, 0));
-    for (; i + 4 <= i_end; i += 4) {
-        __m128i v_di    = _mm_sub_epi32(v_i, v_vj);
-        __m128i v_di_sq = _mm_mullo_epi32(v_di, v_di);
-        __m128i v_dist  = _mm_add_epi32(v_di_sq, v_g);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(lbl + i), v_lbl);
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(dist + i), v_dist);
-        v_i = _mm_add_epi32(v_i, v_four);
+#elif defined(NCOLOR_SIMD_X86)
+#  if defined(__AVX2__)
+    {
+        const __m256i w_lbl  = _mm256_set1_epi32(lbl_j);
+        const __m256i w_g    = _mm256_set1_epi32(g_j);
+        const __m256i w_vj   = _mm256_set1_epi32(v_j);
+        const __m256i w_step = _mm256_set1_epi32(8);
+        __m256i w_i = _mm256_add_epi32(_mm256_set1_epi32(static_cast<int32_t>(i)),
+                                       _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+        for (; i + 8 <= i_end; i += 8) {
+            const __m256i w_di   = _mm256_sub_epi32(w_i, w_vj);
+            const __m256i w_dist = _mm256_add_epi32(_mm256_mullo_epi32(w_di, w_di), w_g);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(lbl + i), w_lbl);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(dist + i), w_dist);
+            w_i = _mm256_add_epi32(w_i, w_step);
+        }
+    }
+#  endif
+    {
+        const __m128i v_lbl = _mm_set1_epi32(lbl_j);
+        const __m128i v_g   = _mm_set1_epi32(g_j);
+        const __m128i v_vj  = _mm_set1_epi32(v_j);
+        const __m128i v_four = _mm_set1_epi32(4);
+        __m128i v_i = _mm_add_epi32(_mm_set1_epi32(static_cast<int32_t>(i)),
+                                    _mm_set_epi32(3, 2, 1, 0));
+        for (; i + 4 <= i_end; i += 4) {
+            const __m128i v_di   = _mm_sub_epi32(v_i, v_vj);
+            const __m128i v_dist = _mm_add_epi32(mullo_epi32_sse(v_di, v_di), v_g);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(lbl + i), v_lbl);
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dist + i), v_dist);
+            v_i = _mm_add_epi32(v_i, v_four);
+        }
     }
 #endif
     for (; i < i_end; ++i) {
@@ -437,7 +474,25 @@ inline void envelope_pass_strided_abc(
 // 4x4 in-register transpose for 32-bit elements. src is 4 rows of 4 ints
 // at stride sb; dst is 4 rows of 4 ints at stride db. Stage 1 does a
 // pairwise 32-bit interleave; stage 2 swaps the 64-bit halves to finish.
-#if defined(__aarch64__) || defined(__ARM_NEON)
+#if defined(NCOLOR_SIMD_X86)
+// SSE2: the classic 4x4 float transpose applied to the integer bit
+// patterns. Shuffles move lanes verbatim, so the ints are unchanged.
+template <typename T>
+static inline void transpose_4x4_4byte(
+        const T* __restrict src, int64_t sb,
+        T* __restrict dst, int64_t db) {
+    static_assert(sizeof(T) == 4, "transpose_4x4_4byte requires 4-byte T");
+    __m128 r0 = _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 0 * sb)));
+    __m128 r1 = _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 1 * sb)));
+    __m128 r2 = _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 2 * sb)));
+    __m128 r3 = _mm_castsi128_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 3 * sb)));
+    _MM_TRANSPOSE4_PS(r0, r1, r2, r3);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 0 * db), _mm_castps_si128(r0));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 1 * db), _mm_castps_si128(r1));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * db), _mm_castps_si128(r2));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 3 * db), _mm_castps_si128(r3));
+}
+#elif defined(NCOLOR_SIMD_NEON)
 template <typename T>
 static inline void transpose_4x4_4byte(
         const T* __restrict__ src, int64_t sb,
@@ -478,9 +533,9 @@ static inline void transpose_4x4_4byte(
 //     two different destination cache lines per iteration; splitting
 //     keeps each pass focused on one cache-line stream and lets the
 //     compiler schedule the loads/stores independently per stream.
-//   - On ARM64 with sizeof(T)==4 we transpose in 4×4 NEON sub-tiles,
-//     which is roughly 2× faster on the 2D 4096² L2 expand benchmark
-//     than scalar with the same blocking.
+//   - With sizeof(T)==4 we transpose in 4×4 in-register sub-tiles (NEON
+//     on arm64, SSE2 on x86), which is roughly 2× faster on the 2D 4096²
+//     L2 expand benchmark than scalar with the same blocking.
 template <typename T>
 void batch_transpose(
         const T* src_a, const T* src_b,
@@ -504,7 +559,7 @@ void batch_transpose(
             const int64_t c1  = std::min<int64_t>(c0 + Bi, C);
             const int64_t plane  = a * B * C;
             const int64_t tplane = a * C * B;
-#if defined(__aarch64__) || defined(__ARM_NEON)
+#if defined(NCOLOR_SIMD_NEON) || defined(NCOLOR_SIMD_X86)
             if constexpr (sizeof(T) == 4) {
                 const int64_t b1m = b0 + ((b1 - b0) & ~3);
                 const int64_t c1m = c0 + ((c1 - c0) & ~3);
@@ -586,6 +641,19 @@ public:
     int64_t size() const { return size_; }
     // Per-worker envelope scratch (resized lazily).
     std::vector<EnvelopeScratch>& scratch() { return scratch_; }
+    // Give the memory back. The buffers hold 16 bytes per pixel of the
+    // largest image seen (plus per-worker scratch) for the engine's
+    // lifetime; after one whole-slide call that is gigabytes. The next
+    // call simply reallocates.
+    void release() {
+        std::vector<int32_t>().swap(h_lbl_);
+        std::vector<int32_t>().swap(h_dist_);
+        std::vector<int32_t>().swap(t_lbl_);
+        std::vector<int32_t>().swap(t_dist_);
+        std::vector<EnvelopeScratch>().swap(scratch_);
+        capacity_ = 0;
+        size_ = 0;
+    }
 private:
     std::vector<int32_t> h_lbl_, h_dist_, t_lbl_, t_dist_;
     int64_t capacity_ = 0;
