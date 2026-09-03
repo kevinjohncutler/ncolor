@@ -1,4 +1,10 @@
-include example.png
 include README.md
 include LICENSE
+include CHANGELOG.md
 recursive-include cpp *.cpp *.hpp *.h
+# Keep the sdist to source: no example renders, bench outputs or figures.
+prune examples
+prune figures
+prune bench_outputs
+prune scratch
+global-exclude *.png *.gif *.npz *.npy *.tif *.so *.pyd

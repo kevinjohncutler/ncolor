@@ -159,3 +159,6 @@ dmypy.json
 /scripts/coverage_cross_device.conf
 # Output dir of scripts/coverage_cross_device.sh.
 /.coverage_combined/
+
+# Session scratch (moved out of the repo root; never committed).
+scratch/

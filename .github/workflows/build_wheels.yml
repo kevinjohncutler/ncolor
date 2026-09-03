@@ -23,31 +23,31 @@ jobs:
     runs-on: ${{ matrix.cell.os }}
     strategy:
       fail-fast: false
-      # 5 archs × 4 Pythons = 20 parallel jobs. Each builds ONE wheel
+      # 6 archs × 5 Pythons = 30 parallel jobs. Each builds ONE wheel
       # via CIBW_BUILD=${{ matrix.python }}-* (pattern borrowed from
-      # opencodecs), so cibuildwheel's per-cell 4-Python serial loop
-      # becomes 4-way parallel. Wall-clock per row drops by ~3-4×.
-      # Trade: 4× CI minutes (free on public repos). ncolor has no
+      # opencodecs), so cibuildwheel's per-cell serial loop over Pythons
+      # becomes fully parallel. Wall-clock per row drops by ~3-4×.
+      # Trade: more CI minutes (free on public repos). ncolor has no
       # heavyweight BEFORE_ALL step, so no cache-warm complication.
       matrix:
-        python: ["cp311", "cp312", "cp313", "cp314"]
+        python: ["cp311", "cp312", "cp313", "cp314", "cp315"]
         cell:
           - {os: ubuntu-latest,    archs_linux: "x86_64"}
           - {os: ubuntu-24.04-arm, archs_linux: "aarch64"}
           - {os: windows-latest,   archs_windows: "AMD64"}
           - {os: windows-11-arm,   archs_windows: "ARM64"}
           - {os: macos-latest,     archs_macos: "arm64"}
-        # Skipped (covered by sdist):
-        #   - macos-13 x86_64 — Apple stopped shipping Intel hardware in
-        #                       2020; user base ≈ 0, GitHub's Intel
-        #                       runners have multi-hour queues.
+          # Intel Macs: GitHub brought back x86_64 runners as
+          # macos-15-intel, so the wheel is cheap to ship again (labs
+          # keep Intel machines alive for years).
+          - {os: macos-15-intel,   archs_macos: "x86_64"}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # setuptools_scm needs the full history for version
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.3.1
+        uses: pypa/cibuildwheel@v4.2.0
         with:
           output-dir: ./wheelhouse
         env:
