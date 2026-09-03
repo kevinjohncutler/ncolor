@@ -35,6 +35,8 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 #include <thread>
 #include <vector>
 
+#include "affinity.hpp"  // optional, opt-in CPU pinning (NCOLOR_PIN_THREADS)
+
 // ---- Platform wait-on-address primitives ---------------------------------
 #if defined(__APPLE__)
   // Darwin private but ABI-stable since macOS 10.12. Used by libc's
@@ -139,7 +141,7 @@ public:
     {
         workers_.reserve(num_workers_);
         for (size_t i = 0; i < num_workers_; ++i) {
-            workers_.emplace_back(&ForkJoinPool::worker_main_, this);
+            workers_.emplace_back(&ForkJoinPool::worker_main_, this, i);
         }
     }
 
@@ -171,7 +173,10 @@ public:
     ForkJoinPool& operator=(const ForkJoinPool&) = delete;
 
 private:
-    void worker_main_() {
+    void worker_main_(size_t worker_index) {
+        // Opt-in (NCOLOR_PIN_THREADS), Linux-only; a no-op otherwise.
+        ncolor::affinity::pin_worker(static_cast<unsigned>(worker_index),
+                                     static_cast<unsigned>(num_workers_));
         for (;;) {
             barrier_wait_();   // wait for work to be posted
             if (!alive_.load(std::memory_order_relaxed)) return;
