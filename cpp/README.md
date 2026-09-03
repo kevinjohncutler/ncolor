@@ -1,225 +1,56 @@
-# ncolor cpp_proto — C++/threadpool drop-in for ncolor.label
+# The C++ engine
 
-Header-only C++ port of ncolor's hot kernels (`expand_labels`,
-`_search_hashset_parallel`, `_color_graph_csr_legacy`, `_repair_coloring`,
-`_apply_lut`) plus a `Solver` class that runs the full `ncolor.label(image,
-expand=True)` pipeline in C++ with a single persistent ThreadPool.
+Everything in this directory except `binding.cpp` is header-only C++17
+with no dependency beyond the standard library. `binding.cpp` is the
+pybind11 module `ncolor._backend._impl`; the headers are the engine and
+can be used on their own from C++ (or wrapped for C, Rust, Julia, R, or
+a command-line tool) without Python anywhere in the picture.
 
-## Output parity
-
-`Solver.label` is **bit-identical** to `numba.ncolor.label` across all
-tested sizes (287×377 through 2048×2048). Same colored output, same
-`n_used`. The numba version's `_kempe_repair_csr` fallback is intentionally
-omitted — it never triggered on any test input we threw at it; the
-BFS+local-repair chain converges to the same coloring.
-
-## Why this prototype exists
-
-Two motivations:
-
-1. **A persistent thread-pool model is structurally faster than numba's
-   `@njit(parallel=True)` model for low-latency calls** — every prange
-   region launches a new parallel team (even on a "warm" pool numba pays
-   per-region dispatch + barrier). `Solver` keeps a single std::thread pool
-   alive for its lifetime; per call we pay only enqueue + futures wait,
-   ≈10 µs vs numba's hundreds of µs to ~1 ms per region. This shows up as
-   a 2–6× speedup at small image sizes (≤512²) where per-call overhead
-   dominates.
-2. **Bit-identical drop-in for `ncolor.label`** with no JIT cold-start —
-   useful for interactive viewers where the first call shouldn't take
-   seconds while numba compiles.
-
-A long-running diagnostic earlier in this repo's history reported
-"700 ms" wall times for `ncolor.label` on a 64-core x86 Linux host and
-attributed it to libgomp's per-parallel-region launch cost. **That turned
-out to be wrong** — the actual cause was ~75 cores' worth of orphan
-multiprocessing workers spinning on the host. On the same hardware with
-a clean machine, numba's `omp` layer completes the small-image
-case in ≈1 ms (with `OMP_PROC_BIND=spread OMP_PLACES=cores`); the
-prototype shaves ~10–50% on top of that for small/medium sizes and ties
-at 2048².
-
-## Status
-
-- `connect.hpp` — `_search_hashset_parallel` with parallel pairwise tree-merge
-- `expand.hpp` — `expand_labels` (envelope_pass + batch_transpose) with
-  per-thread persistent scratch, divisionless pop comparison in phase-1,
-  segmented phase-2 for clean autovec
-- `color.hpp` — `build_csr_from_pairs`, `color_graph_csr_legacy`,
-  `repair_coloring`, `has_conflict_csr`
-- `binding.cpp` — pybind11 module exposing `ConnectEngine`, `ExpandEngine`,
-  `Solver`
-- `setup.py` — local build with `-O3 -march=native -ffp-contract=fast -funroll-loops`
-- `bench.py` — comparison vs `numba.ncolor.label`, includes element-wise
-  identity test against numba
-
-Not ported (rarely needed in practice):
-
-- `_kempe_repair_csr` — Kempe-chain swaps when `_repair_coloring` can't
-  fix conflicts. None of the synthetic or real workloads tested needed it.
-- `format_labels` — 1..N relabel of a non-contiguous label image. The
-  Solver assumes the input is already normalized; if you need the full
-  `ncolor.label(format_input=True)` semantics, normalize in Python first.
-
-## Build
+## Using it without Python
 
 ```bash
-cd ncolor/cpp_proto    # or wherever the repo is checked out
-python setup.py build_ext --inplace
+cd cpp
+c++ -std=c++17 -O3 -pthread -march=native -I. example_standalone.cpp -o example_standalone
+./example_standalone
 ```
 
-Requires `pybind11` and a C++17 compiler.
+[`example_standalone.cpp`](example_standalone.cpp) runs the whole
+pipeline on a synthetic image: connected components, Voronoi expansion,
+the adjacency scan, and the coloring picker. [`ncolor.hpp`](ncolor.hpp)
+includes every header; pick individual ones if you only need a kernel.
 
-> **macOS + NAS gotcha**: importing a `.so` directly from `/Volumes/<NAS>/`
-> hangs in `dlopen` on macOS (Gatekeeper code-validation deadlocks on SMB
-> mounts). `bench.py` copies the in-place `.so` to `/tmp` as a fresh byte
-> stream before importing — adapt the same trick if you import the module
-> elsewhere from a NAS-resident source tree.
+The pieces, in pipeline order:
 
-## Usage
+| header | what it does |
+|---|---|
+| `threadpool.h`, `dispatch.hpp` | persistent fork-join pool with a wait-on-address idle path; atomic work-stealing chunk dispatch |
+| `cc_label.hpp` | N-D connected-components labeling |
+| `format_labels.hpp` | compact labels to `1..N`; range-checked casts from any integer or float type |
+| `expand.hpp`, `expand_lp.hpp`, `chamfer.hpp` | N-D L1 / L2 Voronoi expansion (Saito-Toriwaki and Felzenszwalb sweeps) with NEON / SSE / AVX2 inner loops |
+| `expand_clean.hpp` | the same expansion fused with bridge and stub removal (the `"clean"` mode) |
+| `connect.hpp`, `connect_with_face_count.hpp` | the `find_pairs` adjacency scan, hard and soft kernels in one pass |
+| `color.hpp` | CSR construction, BFS / greedy coloring, repair, conflict check |
+| `picker.hpp` | the coloring picker: the race of strategies (`tabucol.hpp`, `bb_dsatur.hpp`, `hea.hpp`, `clique_lb.hpp`) that `label` and `color_graph` run |
+| `soft_color.hpp` | soft-constraint local search after the hard coloring |
+| `delete_spurs.hpp`, `delete_spurs_labels.hpp`, `fast_despur.hpp` | spur and thin-bridge removal |
+| `geometry.hpp`, `intrinsics.hpp` | N-D index helpers; portable bit intrinsics |
 
-```python
-import numpy as np
-import ncolor_cpp_proto
+Design notes, benchmarks and the reasoning behind the kernels are in
+[ARCHITECTURE.md](../ARCHITECTURE.md) at the repository root.
 
-solver = ncolor_cpp_proto.Solver(n_threads=16)
-colored, n_used = solver.label(label_image_int32, n_colors=4)
-# colored is uint8, same shape as input. n_used is the number of colors used.
-```
+## Building the Python extension
 
-## Bench
+`pip install -e .` from the repository root, or `python setup.py
+build_ext --inplace` for an in-place build. Environment variables the
+build honors:
 
-```bash
-python bench.py
-# or with explicit numba threading:
-NUMBA_THREADING_LAYER=workqueue NUMBA_NUM_THREADS=64 python bench.py
-```
+| variable | effect |
+|---|---|
+| `NCOLOR_MARCH_NATIVE=0` | drop `-march=native` (on by default for source builds) |
+| `NCOLOR_MARCH=x86-64-v2` | explicit `-march` when native is off; the x86_64 wheels use this |
+| `NCOLOR_USE_CLANG_CL=1` | Windows: compile with clang-cl instead of cl.exe (needs LLVM on `PATH`) |
+| `NCOLOR_NO_CALIBRATE=1` | skip the post-build SMT calibration (CI, cross builds) |
 
-All benches: each implementation in its own best configuration; bit-identical
-output verified element-wise.
-
-### Threadripper PRO 3995WX (Linux, 64C/128T, idle, OMP_PROC_BIND=spread)
-
-| shape       | numba   | cpp best         | speedup |
-|-------------|--------:|-----------------:|--------:|
-| 287×377     | 5.63 ms | 0.88 (T=8)       | **6.4×** |
-| 512×512     | 4.79    | 1.78 (T=32)      | **2.7×** |
-| 1024×1024   | 9.51    | 6.70 (T=32)      | **1.4×** |
-| 2048×2048   | 27.32   | 25.82 (T=64)     | 1.06× (tied) |
-
-### AMD Ryzen 9 7950X (Linux, 16C/32T, idle, default env)
-
-| shape       | numba    | cpp best        | speedup |
-|-------------|---------:|----------------:|--------:|
-| 287×377     | 0.53 ms  | 0.39 (T=8)      | **1.4×** |
-| 512×512     | 0.97     | 0.86 (T=16)     | 1.13×    |
-| 1024×1024   | 3.40     | 3.72 (T=16)     | 0.91× (numba wins) |
-| 2048×2048   | 15.02 (med) | 18.03 (T=32) | 0.83× (numba wins) |
-
-### Intel i9-9900K (Linux, 8C/16T, idle, default env)
-
-| shape       | numba   | cpp best        | speedup |
-|-------------|--------:|----------------:|--------:|
-| 287×377     | 0.62 ms | 0.50 (T=16)     | **1.2×** |
-| 512×512     | 1.25    | 1.23 (T=16)     | tied     |
-| 1024×1024   | 5.78    | 5.78 (T=16)     | tied     |
-| 2048×2048   | 26.58   | 29.09 (T=8)     | 0.91× (numba wins) |
-
-### Mac M-series (idle, workqueue — only layer numba builds on macOS)
-
-| shape       | numba   | cpp best        | speedup |
-|-------------|--------:|----------------:|--------:|
-| 287×377     | 5.05 ms | 1.20 (T=8)      | **4.2×** |
-| 512×512     | 5.51    | 2.51 (T=8)      | **2.2×** |
-| 1024×1024   | 13.36   | 9.13 (T=16)     | **1.5×** |
-| 2048×2048   | 32.95   | 32.76 (T=8)     | tied     |
-
-### L1 fast path (`use_l1=True`) — Saito-Toriwaki separable transform
-
-`Solver.label(..., use_l1=True)` runs:
-
-1. **Saito-Toriwaki separable L1** ([chamfer.hpp::chamfer_st_l1](chamfer.hpp))
-   — exact L1 Voronoi via two orthogonal 1D passes per axis (forward+
-   backward sweep each), with label propagation. Phase 1 parallelizes
-   trivially over rows (each row's 1D L1 transform is independent); phase 2
-   parallelizes over column-bands (each band's vertical sweep is independent).
-   No boundary fixup, clean parallel scaling. Both algorithms compute
-   exact L1 — the legacy Rosenfeld–Pfaltz path
-   ([chamfer_l1_parallel](chamfer.hpp)) is still available as
-   `expand_labels_l1_rp` for benchmarking.
-2. **Unpadded `find_pairs`** ([connect.hpp::find_pairs_2d_unpadded](connect.hpp))
-   — direct row-major scan with 2 forward neighbors (right, down) per pixel.
-   Skips the (H+2, W+2) padded-buffer roundtrip the original
-   `search_hashset_parallel` needs.
-3. **Parallel `apply_lut`** at the tail — chunked dispatch via the persistent
-   ThreadPool. Earlier this was a single-threaded loop costing 5–10 ms at
-   2048².
-
-Bench at 2048², minimums of 10 timed runs:
-
-| host | L2 default | L1 (Saito-Toriwaki + unpadded + parallel-LUT) | speedup |
-|---|---:|---:|---:|
-| Mac M-series (T=32) | 18.29 ms | **5.80** | **3.2×** |
-| Threadripper (T=64) | 11.25 ms | **6.55** | **1.7×** |
-
-Both hosts are now under 10 ms at 2048². L2 also benefits substantially
-from the parallel `apply_lut` (Threadripper L2 went from ~17.8 → 11.25 ms).
-
-Trade-off: L1 boundaries differ from L2 at ~5% of pixels (mostly on
-diagonals between adjacent regions). The resulting label adjacency graph
-is essentially the same so the 4-coloring still works (verified — both
-return valid 4-colorings with `n_used=5` on the 2048² synthetic test);
-just don't expect bit-identity with `numba.ncolor.label` when `use_l1=True`.
-
-### Pattern across all hosts
-
-The Solver wins decisively at small images (where the per-call overhead
-of numba's prange dispatch is unamortized) and ties or modestly loses at
-2048² where both implementations are bound by the same algorithmic cost
-of the parabolic-envelope build. **The shrinking-ratio-with-size pattern
-is structural, not a regression** — once the actual algorithm work
-exceeds the dispatch overhead, two well-tuned implementations of the same
-algorithm necessarily converge.
-
-The C++ Solver's primary value is therefore at small/medium image sizes
-(interactive use, viewer pipelines) and on macOS (where numba can only
-build `workqueue`). On healthy single-CCD Linux boxes (AMD/Intel) at
-2048+, numba's @njit + omp is highly competitive and sometimes faster.
-
-## Optimizations vs. numba's @njit
-
-C++-side wins applied to `expand.hpp`:
-
-1. **Divisionless pop comparison** in phase-1: `sv > z[top]` rewritten as
-   `numer > z[top] * denom` (denom always positive), saves one FP divide
-   per stack pop. Only the final break iteration computes `sv = numer/denom`.
-2. **Pre-stored doubles** in stack scratch (`vd[k] = double(v[k])`,
-   `vd_sq[k] = vd[k]*vd[k]`) so the data-dependent while loop avoids
-   per-iteration int→double + extra multiply.
-3. **Segmented phase-2 fill**: each parabola's domain is a contiguous range
-   `[ceil(z[j]), ceil(z[j+1]))` with `lblstk[j]`, `g[j]`, `v[j]` lifted to
-   loop invariants; lets the compiler emit clean NEON/AVX2 vector stores
-   for the per-segment fill that the original interleaved while form blocked.
-4. **Persistent threadpool**: workers live for the engine lifetime, so per
-   call we pay only `enqueue + condition_variable::notify` (microseconds),
-   not pthread_create. Critical on high-thread-count x86 hosts where every
-   parallel region in numba would otherwise pay 14–43 ms of fan-out.
-5. **Persistent scratch buffers** on `ExpandBuffers` (envelope stack +
-   double-stack + transpose buffers): expand_labels gets called with the
-   same shape repeatedly, so allocations amortize to zero.
-
-C++-side wins applied to `connect.hpp`:
-
-6. **Parallel pairwise tree merge** of per-thread hashtables. The numba
-   version had this as an O(n_threads × ht_size) serial reduction at the
-   end; the tree merge runs the reduction in log₂(n_threads) parallel rounds,
-   eliminating the linear-in-thread-count term.
-
-## Open work
-
-- Port `_kempe_repair_csr` if any real workload turns out to need it
-  (none have so far).
-- Within-row parallelism for `envelope_pass` (chunk-and-merge) — would
-  help short-wide images where row count is much less than the thread count.
-- AVX-512/NEON 8×8 transpose intrinsics — `batch_transpose` is currently
-  a tiled scalar loop; intrinsics would shave a couple ms at 4K+.
+A build needs `pybind11` and a C++17 compiler; the resulting module is
+loaded by `ncolor/_backend/__init__.py`, which also handles the
+network-mounted-source case described in ARCHITECTURE.md.

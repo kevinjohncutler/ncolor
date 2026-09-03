@@ -18,10 +18,33 @@ expand → find_pairs → color → soft post-pass → apply_lut
 
 end-to-end under one `gil_scoped_release`.
 
+`Solver.color_graph` enters that pipeline at the `color` stage: it takes
+an edge list instead of an image, so expand / find_pairs / apply_lut are
+skipped and the picker plus the soft post-pass run unchanged. That is
+what lets the vector front end (`ncolor.geo.label`, adjacency from
+Shapely rather than a pixel walk) reuse the engine as-is.
+
 The C++ engine auto-calibrates its thread count once per machine
 (~50–300 ms hidden under the user's first `import ncolor`) and caches
 the result. Skip calibration with `NCOLOR_NO_CALIBRATE=1` (CI /
 cross-compile builds).
+
+The package holds two engine objects for the life of the process, a
+`Solver` (label / connect / color_graph) and an `ExpandEngine`
+(expand_labels / format_labels), created on first use in
+`ncolor._engines`. Engines that resolve to the same thread count share
+one `ForkJoinPool`. Engine calls must not overlap: the Python wrappers
+take one process-wide lock, and each engine method also takes a C++
+mutex inside its GIL-released region as a backstop for direct
+`ncolor._backend` callers (the lock is taken only after the GIL is
+dropped, so a waiter can never deadlock a thread that needs the GIL to
+finish). Both engines keep the working set of the largest image they
+have seen; `ncolor.release_buffers()` frees it.
+
+The headers under `cpp/` have no Python dependency; only `binding.cpp`
+does. `cpp/ncolor.hpp` includes all of them and
+`cpp/example_standalone.cpp` runs the pipeline from plain C++; see
+[cpp/README.md](cpp/README.md).
 
 ### Kernel files (under `cpp/`)
 
@@ -31,8 +54,9 @@ cross-compile builds).
 | `expand_clean.hpp` | Antipodal-bridge test + despur cascade fused with expand (the default `"clean"` mode) |
 | `connect.hpp`, `connect_with_face_count.hpp` | `find_pairs` adjacency scan (dual-emit hard + soft) |
 | `cc_label.hpp` | Connected-components labeling (drop-in for `skimage.measure.label`) |
-| `format_labels.hpp` | Compact non-sequential labels to `1..N` |
+| `format_labels.hpp` | Compact non-sequential labels to `1..N`; range-checked parallel casts from bool, any integer width and float |
 | `color.hpp` | BFS coloring + Welsh-Powell + repair |
+| `picker.hpp` | The coloring picker: the per-color-count race of strategies that `label` and `color_graph` run |
 | `bb_dsatur.hpp` | Iterative branch-and-bound exact DSATUR for the race |
 | `tabucol.hpp`, `hea.hpp`, `kempe_sa.hpp`, `clique_lb.hpp` | Picker fallbacks: TabuCol, HEA, Kempe SA, clique lower bound |
 | `soft_color.hpp` | Soft-edge local search (ILS + triangle weights) |
@@ -81,6 +105,25 @@ A few choices that aren't obvious from the code itself:
 8. **`bb_dsatur` is iterative.** Recursive backtracking blew the
    512 KB macOS worker-thread stack at `N ≥ 3000`; the heap-allocated
    state stack is safe for graphs of any size.
+9. **Range-checked casts.** Every entry point works on int32 labels.
+   Inputs that can hold larger values (int64, uint32, uint64, float)
+   are checked while they are cast, one compare per element folded
+   into a pass that is memory-bound anyway. A value that does not fit
+   raises `OverflowError` from the engine; `label` and `format_labels`
+   then compact the array with `numpy.unique` and retry. Before this,
+   a label of 2^31 wrapped negative, the format pass took it for
+   background, and the cell silently vanished.
+10. **SIMD by target, not by hand-picked flag.** The envelope fill and
+    the 4x4 transpose have NEON (arm64), AVX2 (8-wide, when the build
+    targets it) and SSE (4-wide, any x86_64) variants. The SSE lane
+    multiply is one instruction from SSE4.1 up and an SSE2 emulation
+    below, so the plain-baseline and MSVC builds get the vector path
+    too; the x86_64 wheels are built for x86-64-v2, the floor NumPy 2
+    already assumes.
+11. **No debug info in the wheels.** Python's own CFLAGS carry `-g`;
+    the manylinux `.so` was 27 MB of which 25 MB were `.debug_*`
+    sections. `-g0` plus `--strip-all` on Linux bring the wheel from
+    6 MB to under 1 MB with no effect on the generated code.
 
 ### Scaling pattern across image sizes
 

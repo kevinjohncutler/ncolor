@@ -5,7 +5,134 @@ All notable changes to ncolor are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [semantic versioning](https://semver.org/).
 
-## [2.0.0] — unreleased
+## [2.1.0] — unreleased
+
+### Added
+
+- **Vector-geometry support (`ncolor.geo.label` / `ncolor.geo.connect`).**
+  Colors polygons directly, so data that starts out as vectors is never
+  rasterized to get a coloring. Accepts a GeoPandas `GeoDataFrame` or
+  `GeoSeries`, a GeoJSON file / string / `dict`, a list of Shapely
+  geometries, or any object with a `__geo_interface__`, and returns a
+  `uint8` color per feature in input order (0 for missing or empty
+  geometries), or a `GeoDataFrame` with `return_frame=True`.
+  Adjacency is read off the geometry with a Shapely `STRtree`:
+  - `min_shared_length` (default `0.0`) requires a shared *border*
+    rather than a point of contact, so corner-only touches do not
+    constrain the coloring. That is the raster `conn=1` rule in vector
+    form, and it is what keeps a planar partition 4-colorable. `None`
+    counts point contacts and then 5 colors are likely.
+  - `tolerance` treats features within a distance of each other as
+    touching, for polygons left with hairline gaps by vectorization or
+    reprojection. The analogue of `connect_radius`.
+  - Pairs the filters reject are fed to the soft-constraint pass, so
+    near-misses still differ in color where that is free.
+  Requires Shapely 2.0+: `pip install "ncolor[geo]"`. GeoPandas is
+  optional; GeoDataFrames are recognized by duck-typing.
+  Resolves [#2](https://github.com/kevinjohncutler/ncolor/issues/2).
+- **`ncolor.color_graph(edges, n_vertices=...)`.** The picker, decoupled
+  from any image: colors an abstract graph from a 0-indexed `(M, 2)`
+  edge list, with optional `soft_edges`. Backs `ncolor.geo.label`, and is the
+  entry point for adjacency built by anything else (a mesh, a region
+  adjacency graph from another library). Duplicate, reversed, self and
+  out-of-range pairs are normalized away. Exposed on the C++ engine as
+  `Solver.color_graph`.
+- **Bool, float and uint64 inputs.** `label`, `connect`, `format_labels`,
+  `expand_labels` and `connected_components` accept `bool` masks,
+  `float32` / `float64` label arrays (as segmenters such as cellpose
+  emit; values are truncated toward zero) and `uint64`, alongside the
+  integer dtypes already supported. The cast to the engine's int32 runs
+  in parallel inside the call; `expand_labels` no longer pays a
+  single-threaded `numpy.astype` pass first.
+- **`ncolor.release_buffers()`.** The engines keep the working set of the
+  largest image processed so far (about 22 bytes per pixel for `label`)
+  allocated between calls. After one whole-slide image that is
+  gigabytes of resident memory; this gives it back. The thread pool is
+  kept.
+- **Wheels for CPython 3.15 and for Intel Macs** (`macosx_x86_64`), and
+  the Windows ARM64 wheel is now documented.
+- **`bench/bench_hosts.py` and `bench/run_host_bench.sh`.** A cross-host
+  regression benchmark that records per-stage timings with host, CPU,
+  thread count and compiler metadata, builds the tree on a remote
+  machine and compares two tags. Every performance change below was
+  checked with it on an Intel i9-9900K, a Ryzen 9 7950X, a Threadripper
+  PRO 3995WX, an M1 Ultra, an M5 Max and a Windows 11 VM.
+
+### Changed
+
+- **One thread pool for the whole package.** `Solver` and
+  `ExpandEngine` instances that resolve to the same thread count share
+  a single `ForkJoinPool`, and the format engine is the expand engine.
+  A process that touched `label`, `expand_labels` and `format_labels`
+  used to hold three pools (52 parked threads on an 18-core machine);
+  it now holds one.
+- **x86_64 wheels are built for x86-64-v2** (SSE4.2 / POPCNT, CPUs from
+  2009 on, the same floor NumPy 2 assumes) and carry no debug info. The
+  Linux wheel was 27 MB of which 25 MB were `.debug_*` sections; it is
+  now under 1 MB. The SSE fill in the expand kernel previously compiled
+  out of every x86 wheel (it was gated on SSE4.1, which the baseline
+  build never defines and MSVC never defines at all); it is now on for
+  every x86 build, with an SSE2 fallback for the lane multiply, an AVX2
+  8-wide variant when the build targets it, and an SSE 4x4 in-register
+  transpose matching the NEON one. Expand is 5 to 35% faster on the
+  x86 hosts above; arm64 is unchanged.
+- **Windows core count without `wmic`.** Microsoft removed the WMIC
+  utility from Windows 11 24H2. The SMT calibration read the physical
+  core count and CPU model through it and fell back to the logical
+  count when it was missing, so recent Windows installs ran
+  SMT-doubled, the case the calibration exists to avoid. The count now
+  comes from `GetLogicalProcessorInformationEx` and the model from the
+  registry.
+- **`Solver(fraction)` rounding** is documented as round-half-up; the
+  test that assumed Python's half-to-even rounding was wrong on hosts
+  where the product lands on .5.
+
+### Fixed
+
+- **Crash on concurrent `expand_labels` / `format_labels`.** 2.0.1
+  serialized `label` and `connect`, but the expand and format engines
+  were left unguarded and two threads calling them at once corrupted
+  the shared pool and took the interpreter down with SIGSEGV. Every
+  engine call now takes one process-wide lock in Python, and the C++
+  engines hold a mutex of their own inside the GIL-released region as
+  a backstop for callers of `ncolor._backend` directly. The
+  parallelism inside a call is unaffected.
+- **Labels at or above 2^31 silently vanished.** An `int64` or `uint32`
+  (or `uint64` / float) array holding such a value was cast to int32
+  with a plain `static_cast`; the wrapped value went negative, the
+  format pass treated it as background, and whole cells disappeared
+  from the output with no error. The cast is now range-checked at no
+  extra cost; `label` and `format_labels` compact such inputs with
+  `numpy.unique` and retry, and the identity-preserving operations
+  (`connect`, `expand_labels`, `delete_spurs`) raise `OverflowError`
+  with instructions instead.
+- **Hang when the soft pass runs on a one-color palette.** If the hard
+  adjacency graph has no edges at all but the soft graph does, the
+  coloring is a single color and the soft search's restart loop draws
+  "a color other than the current one" by rejection sampling, which
+  never terminates when there is only one color to draw. Reachable from
+  the shipped raster API: two cells touching only diagonally with
+  `expand=False` have no `conn=1` adjacency, yet the auto-built
+  `conn=2 / radius=2` soft kernel still emits their pair.
+  `soft_local_search` now returns immediately when there are fewer than
+  two colors to work with.
+
+## [2.0.2] — 2026-06-19
+
+### Fixed
+
+- **3D Voronoi hang.** The `find_pairs` hashtable probe is bounded, so a
+  pathological 3D input can no longer spin forever.
+
+## [2.0.1] — 2026-06-07
+
+### Fixed
+
+- **Concurrent `label` / `connect` crashed.** The `Solver` is a
+  process-wide singleton on one pool; calls from several threads are
+  now serialized.
+
+## [2.0.0] — 2026-06-02
 
 The headline of 2.0 is a new default expand pipeline (`expand_mode="clean"`)
 and an opt-out auto-soft constraint post-pass that together produce
