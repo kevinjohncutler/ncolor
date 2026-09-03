@@ -60,6 +60,29 @@ and versions follow [semantic versioning](https://semver.org/).
 
 ### Changed
 
+- **The clean expand's bridge scan is 5 to 12x faster, and its output
+  no longer depends on the thread count.** The antipodal-bridge scan
+  that `expand_mode="clean"` runs after each axis sweep walked every
+  pixel with a per-neighbor bounds-check loop and a mixed-radix
+  coordinate counter: branchy scalar code that Apple Silicon in
+  particular ran poorly (the clean expand cost 3 to 5 times the plain
+  one on an M5 Max and an M1 Ultra, against 1.1 to 1.35 times on x86).
+  The scan now walks the image one line at a time: which neighbor
+  offsets stay in bounds is settled once per line, the interior of the
+  line accumulates its same-label face count in a straight loop that
+  vectorizes on NEON and SSE alike, and neighbors are re-read only for
+  the few pixels whose count is two. Still one N-dimensional
+  implementation driven by the offset tables, with no per-dimension
+  special case, and bit-identical output on 400 test images. Because
+  threads claim scan chunks in arrival order, the merged bridge queue
+  used to vary run to run and the peel-back cascade with it (a few
+  pixels per image); the queue is now sorted, so the parallel result
+  equals the serial one. `label` at 2048 squared went from 12 to 6 ms
+  on an M5 Max and from 38 to 10 ms on an M1 Ultra; the x86 hosts gain
+  7 to 29% on `label`. The barrier-aware L2 sweep also gained the
+  strided-slab path the plain sweep already had for 3D, and a header
+  edit now triggers a rebuild (`setup.py` lists the headers as
+  dependencies).
 - **One thread pool for the whole package.** `Solver` and
   `ExpandEngine` instances that resolve to the same thread count share
   a single `ForkJoinPool`, and the format engine is the expand engine.

@@ -124,6 +124,21 @@ A few choices that aren't obvious from the code itself:
     the manylinux `.so` was 27 MB of which 25 MB were `.debug_*`
     sections. `-g0` plus `--strip-all` on Linux bring the wheel from
     6 MB to under 1 MB with no effect on the generated code.
+12. **The bridge scan walks lines, not pixels.** The subspace the
+    antipodal test runs over is always the trailing axes, so its last
+    axis is the unit-stride axis and every chunk is a whole number of
+    lines. Along a line only the innermost coordinate changes, so which
+    neighbor offsets stay in bounds is fixed except at the two end
+    pixels. The interior run therefore needs no bounds checks: its
+    same-label face count is accumulated one offset at a time in a
+    loop the compiler vectorizes, and neighbors are re-read only for
+    pixels whose count is exactly two (cell boundaries). The end pixels
+    and lines shorter than three go through the generic path. Nothing
+    depends on the number of axes; validity comes from the offset
+    vectors. Per-pixel bounds-check loops were what made this pass 3 to
+    5 times the cost of the plain expand on Apple Silicon. The merged
+    bridge queue is sorted before the peel-back so the result does not
+    depend on which thread finished first.
 
 ### Scaling pattern across image sizes
 

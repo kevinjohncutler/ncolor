@@ -301,162 +301,197 @@ inline int64_t bridge_check_subspace_nd(
         for (int j = 0; j < k; ++j) co_flat[d * k + j] = table.coord_offsets[d][j];
     }
 
-    // Phase 1: single-pass scan with saturation.
-    //   • count same-label subspace neighbors, early-exit at count > 2
-    //   • for count <= 2 track match_a/match_b (antipodal check input)
-    //   • store SATURATED for count > 2 (lazy recount in peel-back);
-    //     exact count otherwise
-    //   • bad pixels (stub or antipodal-2) appended to per-thread queue
+    // Phase 1: single-pass scan with saturation, one line at a time.
     //
-    // Interior pixels go through a tight nested-loop iterator with no
-    // per-pixel coord update or bounds check. Boundary pixels use the
-    // generic scan with bounds checks (small fraction).
+    // The subspace is always the trailing axes, so its last axis is the
+    // innermost (unit-stride) axis of the image and every chunk is a
+    // whole number of lines along it. Along a line only the innermost
+    // coordinate changes, so which displacements stay in bounds is fixed
+    // for the whole line except at its two end pixels. The line therefore
+    // splits into an interior run, where no pixel needs a bounds check,
+    // and at most two end pixels handled by the generic path. Over the
+    // interior run the same-label face count is accumulated one
+    // displacement at a time in a straight loop that vectorizes; the
+    // per-pixel decision then re-reads neighbors only for pixels with
+    // face count <= 2 (cell boundaries), the rare case. Nothing here
+    // depends on k or N: validity comes from the offset vectors.
+    //
+    //   • face >= 3   -> SATURATED (lazy exact recount in peel-back)
+    //   • face <= 1   -> stub, queued
+    //   • face == 2   -> SATURATED if any same-label corner neighbor,
+    //                    else queued iff the two face matches are
+    //                    antipodal
     constexpr uint8_t SATURATED = 255;
     std::vector<uint8_t> nbr_count((size_t)total, 0);
 
     using QEnt = std::pair<int64_t, int32_t>;
     std::vector<QEnt> queue;
 
-    auto scan_kernel = [&](int64_t i_lo, int64_t i_hi,
-                            std::vector<QEnt>& out) {
-        std::vector<int64_t> coords_all(N);
-        std::vector<int> coords_sub(k, 0);
+    const int64_t W = shape[N - 1];            // innermost axis == subset axis k-1
+    const int64_t n_lines = total / W;
+    constexpr int64_t RUN_BLOCK = 1024;        // keeps cnt + neighbor lines in L1
 
-        int64_t rem = i_lo;
-        for (int d = 0; d < N; ++d) {
-            coords_all[d] = rem / strides[d];
-            rem -= coords_all[d] * strides[d];
+    // Generic classification of one pixel given the displacements valid
+    // for it (indices into flat_disps; faces then corners). Same
+    // decision as the interior path, with the original early exits.
+    auto classify = [&](int64_t i, int32_t A,
+                        const int* fd, int nf, const int* cd, int nc,
+                        std::vector<QEnt>& out) {
+        int face = 0, match_a = -1, match_b = -1;
+        for (int ff = 0; ff < nf; ++ff) {
+            const int d = fd[ff];
+            if (labels[i + flat_disps[d]] == A) {
+                if (face == 0) match_a = d;
+                else if (face == 1) match_b = d;
+                if (++face > 2) { nbr_count[(size_t)i] = SATURATED; return; }
+            }
         }
-        for (int d = 0; d < k; ++d) coords_sub[d] = (int)coords_all[subset_axes[d]];
-
-        for (int64_t i = i_lo; i < i_hi; ++i) {
-            const int32_t A = labels[i];
-            if (A != 0) {
-                bool interior = true;
-                for (int j = 0; j < k; ++j) {
-                    const int c = coords_sub[j];
-                    if (c == 0 || c == (int)shape_sub[j] - 1) {
-                        interior = false; break;
-                    }
-                }
-
-                int face = 0, total_cnt = 0;
-                int match_a = -1, match_b = -1;
-                bool face_saturated = false;
-
-                // Faces first — early-exit on face > 2 fires after 3
-                // reads for interior pixels of uniform regions. Then
-                // corners/edges for the antipodal-2 bridge total.
-                if (interior) {
-                    for (int ff = 0; ff < n_face_disps; ++ff) {
-                        const int d = face_d_idx[ff];
-                        if (labels[i + flat_disps[d]] == A) {
-                            if (total_cnt == 0) match_a = d;
-                            else if (total_cnt == 1) match_b = d;
-                            ++total_cnt; ++face;
-                            if (face > 2) { face_saturated = true; break; }
-                        }
-                    }
-                    // Skip corners entirely when face <= 1 — the pixel
-                    // is a stub regardless of corner contribution, so
-                    // we already know the queue decision and total_cnt
-                    // isn't needed for the antipodal check. This is the
-                    // common case for stub/sliver pixels and trims the
-                    // corner loop overhead. When face == 2, we still
-                    // need corners to verify the antipodal-2 case (and
-                    // can early-exit once total_cnt > 2).
-                    if (!face_saturated && face >= 2) {
-                        for (int cc = 0; cc < n_corner_disps; ++cc) {
-                            const int d = corner_d_idx[cc];
-                            if (labels[i + flat_disps[d]] == A) {
-                                if (total_cnt == 0) match_a = d;
-                                else if (total_cnt == 1) match_b = d;
-                                ++total_cnt;
-                                if (total_cnt > 2) { face_saturated = true; break; }
-                            }
-                        }
-                    }
-                } else {
-                    for (int ff = 0; ff < n_face_disps; ++ff) {
-                        const int d = face_d_idx[ff];
-                        const int* co_d = co_flat.data() + d * k;
-                        bool ok = true;
-                        for (int j = 0; j < k; ++j) {
-                            const int c = coords_sub[j] + co_d[j];
-                            if (c < 0 || c >= (int)shape_sub[j]) { ok = false; break; }
-                        }
-                        if (!ok) continue;
-                        if (labels[i + flat_disps[d]] == A) {
-                            if (total_cnt == 0) match_a = d;
-                            else if (total_cnt == 1) match_b = d;
-                            ++total_cnt; ++face;
-                            if (face > 2) { face_saturated = true; break; }
-                        }
-                    }
-                    if (!face_saturated && face >= 2) {
-                        for (int cc = 0; cc < n_corner_disps; ++cc) {
-                            const int d = corner_d_idx[cc];
-                            const int* co_d = co_flat.data() + d * k;
-                            bool ok = true;
-                            for (int j = 0; j < k; ++j) {
-                                const int c = coords_sub[j] + co_d[j];
-                                if (c < 0 || c >= (int)shape_sub[j]) { ok = false; break; }
-                            }
-                            if (!ok) continue;
-                            if (labels[i + flat_disps[d]] == A) {
-                                if (total_cnt == 0) match_a = d;
-                                else if (total_cnt == 1) match_b = d;
-                                ++total_cnt;
-                                if (total_cnt > 2) { face_saturated = true; break; }
-                            }
-                        }
-                    }
-                }
-
-                if (face_saturated) {
+        if (face == 2) {
+            for (int cc = 0; cc < nc; ++cc) {
+                if (labels[i + flat_disps[cd[cc]]] == A) {
                     nbr_count[(size_t)i] = SATURATED;
-                } else {
-                    nbr_count[(size_t)i] = (uint8_t)face;
-                    if (face <= 1
-                            || (total_cnt == 2
-                                && pair_idx[match_a] == match_b)) {
-                        out.emplace_back(i, A);
-                    }
+                    return;
                 }
             }
-            int d = N - 1;
-            ++coords_all[d];
-            while (d > 0 && coords_all[d] >= shape[d]) {
-                coords_all[d] = 0; --d; ++coords_all[d];
+            nbr_count[(size_t)i] = 2;
+            if (pair_idx[match_a] == match_b) out.emplace_back(i, A);
+            return;
+        }
+        nbr_count[(size_t)i] = (uint8_t)face;
+        out.emplace_back(i, A);
+    };
+
+    auto scan_lines = [&](int64_t line_lo, int64_t line_hi,
+                          std::vector<QEnt>& out, uint8_t* __restrict cnt) {
+        // Coordinates of the current line along axes 0..N-2 (mixed radix,
+        // axis N-2 fastest), advanced incrementally per line.
+        std::vector<int64_t> lc(N - 1, 0);
+        {
+            int64_t r = line_lo;
+            for (int d = N - 2; d >= 0; --d) { lc[d] = r % shape[d]; r /= shape[d]; }
+        }
+        std::vector<int> fd_line, cd_line, fd_end, cd_end;
+        fd_line.reserve(n_face_disps); fd_end.reserve(n_face_disps);
+        cd_line.reserve(n_corner_disps); cd_end.reserve(n_corner_disps);
+
+        for (int64_t line = line_lo; line < line_hi; ++line) {
+            const int64_t base = line * W;
+
+            // Displacements whose non-innermost offsets stay inside the
+            // subspace on this line.
+            auto line_valid = [&](int d) {
+                const int* co = co_flat.data() + d * k;
+                for (int j = 0; j < k - 1; ++j) {
+                    const int64_t c = lc[subset_axes[j]];
+                    if ((co[j] < 0 && c == 0) ||
+                        (co[j] > 0 && c == shape_sub[j] - 1)) return false;
+                }
+                return true;
+            };
+            fd_line.clear(); cd_line.clear();
+            for (int ff = 0; ff < n_face_disps; ++ff) {
+                if (line_valid(face_d_idx[ff])) fd_line.push_back(face_d_idx[ff]);
             }
-            for (int j = 0; j < k; ++j) coords_sub[j] = (int)coords_all[subset_axes[j]];
+            for (int cc = 0; cc < n_corner_disps; ++cc) {
+                if (line_valid(corner_d_idx[cc])) cd_line.push_back(corner_d_idx[cc]);
+            }
+
+            // An end pixel: the innermost offset must stay in range too.
+            auto end_pixel = [&](int64_t x) {
+                const int64_t i = base + x;
+                const int32_t A = labels[i];
+                if (A == 0) return;
+                auto in_range = [&](int d) {
+                    const int o = co_flat[d * k + (k - 1)];
+                    return !((o < 0 && x == 0) || (o > 0 && x == W - 1));
+                };
+                fd_end.clear(); cd_end.clear();
+                for (int d : fd_line) if (in_range(d)) fd_end.push_back(d);
+                for (int d : cd_line) if (in_range(d)) cd_end.push_back(d);
+                classify(i, A, fd_end.data(), (int)fd_end.size(),
+                         cd_end.data(), (int)cd_end.size(), out);
+            };
+
+            if (W <= 2) {
+                for (int64_t x = 0; x < W; ++x) end_pixel(x);
+            } else {
+                end_pixel(0);
+                for (int64_t x0 = 1; x0 < W - 1; x0 += RUN_BLOCK) {
+                    const int64_t x1 = std::min<int64_t>(W - 1, x0 + RUN_BLOCK);
+                    const int64_t n = x1 - x0;
+                    const int32_t* cur = labels + base + x0;
+                    std::memset(cnt, 0, (size_t)n);
+                    // Face count, one displacement per pass: a compare
+                    // and a byte add per pixel, no branches.
+                    for (int d : fd_line) {
+                        const int32_t* nb = cur + flat_disps[d];
+                        for (int64_t x = 0; x < n; ++x) {
+                            cnt[x] += (uint8_t)(nb[x] == cur[x]);
+                        }
+                    }
+                    for (int64_t x = 0; x < n; ++x) {
+                        const int32_t A = cur[x];
+                        if (A == 0) continue;
+                        const int64_t i = base + x0 + x;
+                        const uint8_t c = cnt[x];
+                        if (c >= 3) { nbr_count[(size_t)i] = SATURATED; continue; }
+                        if (c <= 1) {
+                            nbr_count[(size_t)i] = c;
+                            out.emplace_back(i, A);
+                            continue;
+                        }
+                        // c == 2: a corner match saturates; otherwise the
+                        // two face matches decide by antipodality.
+                        bool sat = false;
+                        for (int d : cd_line) {
+                            if (labels[i + flat_disps[d]] == A) { sat = true; break; }
+                        }
+                        if (sat) { nbr_count[(size_t)i] = SATURATED; continue; }
+                        nbr_count[(size_t)i] = 2;
+                        int a = -1, b = -1;
+                        for (int d : fd_line) {
+                            if (labels[i + flat_disps[d]] == A) {
+                                if (a < 0) a = d; else { b = d; break; }
+                            }
+                        }
+                        if (pair_idx[a] == b) out.emplace_back(i, A);
+                    }
+                }
+                end_pixel(W - 1);
+            }
+
+            for (int d = N - 2; d >= 0; --d) {
+                if (++lc[d] < shape[d]) break;
+                lc[d] = 0;
+            }
         }
     };
 
     // Phase-level timing gated on NCOLOR_BRIDGE_PROFILE env var. When
     // the env var is unset, BFDEBUG is false and the chrono::now() calls
     // are still executed (~50 ns each, negligible); the fprintf below
-    // is the only branch with non-trivial cost. Useful to keep so a
-    // future investigation can re-enable with no code change.
+    // is the only branch with non-trivial cost.
     static const bool BFDEBUG = std::getenv("NCOLOR_BRIDGE_PROFILE") != nullptr;
     auto t_p1_start = std::chrono::steady_clock::now();
 
+    const int64_t cnt_len = std::min<int64_t>(W, RUN_BLOCK);
     if (nt > 1 && total >= 1024) {
-        const int64_t outer = shape[0];
-        const int64_t slab = total / outer;
         std::vector<std::vector<QEnt>> per_thread(nt);
         std::atomic<int> tid_counter{0};
-        std::atomic<int64_t> next_slab{0};
-        const int64_t chunk_slabs = std::max<int64_t>(1, outer / (nt * 4));
+        std::atomic<int64_t> next_line{0};
+        // Fine chunks so cores of unequal speed (the performance /
+        // efficiency mix on Apple Silicon) balance instead of the slowest
+        // one holding the barrier; the fetch_add per chunk is negligible.
+        const int64_t chunk = std::max<int64_t>(1, n_lines / (nt * 16));
         pool->parallel([&]() {
-            int my_tid = tid_counter.fetch_add(1);
+            const int my_tid = tid_counter.fetch_add(1);
             if (my_tid >= nt) return;
+            std::vector<uint8_t> cnt((size_t)cnt_len);
             auto& local = per_thread[my_tid];
-            while (true) {
-                int64_t s_lo = next_slab.fetch_add(chunk_slabs);
-                if (s_lo >= outer) break;
-                int64_t s_hi = std::min(outer, s_lo + chunk_slabs);
-                scan_kernel(s_lo * slab, s_hi * slab, local);
+            for (;;) {
+                const int64_t lo = next_line.fetch_add(chunk);
+                if (lo >= n_lines) break;
+                scan_lines(lo, std::min(n_lines, lo + chunk), local, cnt.data());
             }
         });
         size_t sz = 0;
@@ -465,8 +500,15 @@ inline int64_t bridge_check_subspace_nd(
         for (auto& v : per_thread) {
             queue.insert(queue.end(), v.begin(), v.end());
         }
+        // Threads claim chunks in whatever order they wake, so the merged
+        // queue order varies run to run, and the peel-back cascade below
+        // is order-sensitive at the margin (a few pixels per image).
+        // Sorting by pixel index makes the result identical to the serial
+        // scan's, whatever the thread count. The queue is tiny.
+        std::sort(queue.begin(), queue.end());
     } else {
-        scan_kernel(0, total, queue);
+        std::vector<uint8_t> cnt((size_t)cnt_len);
+        scan_lines(0, n_lines, queue, cnt.data());
     }
 
     auto t_p1_end = std::chrono::steady_clock::now();
@@ -949,6 +991,45 @@ inline void chamfer_st_l1_axis(int32_t* lbl, int32_t* dist,
 }
 
 
+// Strided barrier-aware sweep of axis B in an (A, B, C) layout: the
+// barrier-aware row kernel walking each line in place with stride C, so
+// the two full-array transposes are skipped. Same selection rule as the
+// plain expand (see STRIDED_SLAB_LIMIT).
+inline void envelope_pass_strided_abc_barrier(
+        int32_t* h_lbl, int32_t* h_dist,
+        int64_t A, int64_t B, int64_t C,
+        ForkJoinPool& pool, int n_threads,
+        std::vector<EnvelopeScratch>& scratch) {
+    if (n_threads < 1) n_threads = 1;
+    const int64_t n_lines = A * C;
+    const int eff_threads = static_cast<int>(compute_threads(
+        static_cast<size_t>(n_threads),
+        static_cast<size_t>(n_lines),
+        static_cast<size_t>(B)));
+    if (static_cast<int>(scratch.size()) < eff_threads) scratch.resize(eff_threads);
+    const size_t cap = static_cast<size_t>(B) + 1;
+    for (int t = 0; t < eff_threads; ++t) scratch[t].resize(cap);
+
+    dispatch_parallel_with_scratch(pool, eff_threads,
+        static_cast<size_t>(n_lines),
+        static_cast<size_t>(eff_threads) * DISPATCH_CHUNKS_PER_THREAD,
+        scratch,
+        [&](EnvelopeScratch& sc, size_t k0, size_t k1) {
+            int32_t* vp = sc.v.data(); int32_t* lp = sc.lblstk.data();
+            int32_t* gp = sc.g.data();
+            double* zp = sc.z.data();  double* vdp = sc.vd.data();
+            double* vdsqp = sc.vd_sq.data();
+            for (size_t k = k0; k < k1; ++k) {
+                const int64_t a = static_cast<int64_t>(k) / C;
+                const int64_t c = static_cast<int64_t>(k) % C;
+                const int64_t base = a * B * C + c;
+                envelope_pass_row_barrier(h_lbl + base, h_dist + base, B,
+                                          /*stride=*/C, vp, lp, gp, zp, vdp, vdsqp);
+            }
+        });
+}
+
+
 // Per-axis L2 sweep driver, barrier-aware. Mirrors the inner loop body
 // of expand_labels_inplace for one axis, with the expand_clean_detail
 // barrier-aware envelope_pass when needed.
@@ -976,10 +1057,21 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
     for (int d = ax + 1; d < ndim; ++d) C *= shape[d];
     const int64_t B = n;
 
-    // For ND > 2: prefer strided slab sweep when it's available; for the
-    // bridge-free path we route everything through transpose for now
-    // (barrier-aware strided not yet implemented). For ND = 2, strided
-    // doesn't apply (A=1) so we use transpose.
+    // Same strided-versus-transpose rule as the plain expand: strided
+    // needs an outer slab axis (A >= 2, never true in 2D) and a slab
+    // that fits in cache. Before any barrier exists the plain kernels
+    // apply unchanged.
+    const bool use_strided = (A >= 2) && (B * C <= STRIDED_SLAB_LIMIT);
+    if (use_strided) {
+        if (barriers_present) {
+            envelope_pass_strided_abc_barrier(h_lbl, h_dist, A, B, C,
+                                              pool, n_threads, scratch);
+        } else {
+            envelope_pass_strided_abc(h_lbl, h_dist, A, B, C,
+                                      pool, n_threads, scratch, /*wrap=*/false);
+        }
+        return;
+    }
     batch_transpose<int32_t>(h_lbl, h_dist, t_lbl, t_dist, A, B, C, pool, n_threads);
     if (barriers_present) {
         envelope_pass_barrier(t_lbl, t_dist, A * C, B, pool, n_threads, scratch);

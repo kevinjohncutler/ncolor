@@ -44,6 +44,11 @@ namespace ncolor_cpp {
 
 using ::ForkJoinPool;
 
+// Strided slab sweeps beat transpose + contiguous + transpose only while
+// one slab (B*C elements) fits in L2: 4M ints (16 MiB). Shared by the
+// plain and the barrier-aware axis drivers.
+constexpr int64_t STRIDED_SLAB_LIMIT = 4 * 1024 * 1024;
+
 #if defined(NCOLOR_SIMD_X86)
 // 32-bit lane-wise multiply. One instruction from SSE4.1 up; on a plain
 // SSE2 target it is two 32x32->64 multiplies on the even and odd lanes
@@ -726,7 +731,6 @@ inline void expand_labels_inplace(
         //
         // Threshold: A >= 2 (have a slab axis) AND B*C <= 4M ints (~16
         // MiB ≤ M1 Ultra shared L2). Tuned on M1 Ultra / AMD Ryzen / Threadripper.
-        constexpr int64_t STRIDED_SLAB_LIMIT = 4 * 1024 * 1024;
         const bool use_strided = (A >= 2) && (B * C <= STRIDED_SLAB_LIMIT);
         if (use_strided) {
             envelope_pass_strided_abc(h_lbl, h_dist, A, B, C,

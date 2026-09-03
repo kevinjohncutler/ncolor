@@ -17,6 +17,7 @@ the L1 inner loops MSVC's auto-vectorizer punts on.
 """
 from __future__ import annotations
 
+import glob
 import os
 import sys
 from setuptools import Extension, find_packages, setup
@@ -163,6 +164,9 @@ else:
 native_ext = Extension(
     "ncolor._backend._impl",
     sources=["cpp/binding.cpp"],
+    # The engine is header-only; without this list a header edit does
+    # not trigger a rebuild of the single translation unit.
+    depends=sorted(glob.glob("cpp/*.hpp")) + ["cpp/threadpool.h"],
     include_dirs=[pybind11.get_include(), "cpp"],
     extra_compile_args=extra_compile_args,
     extra_link_args=extra_link_args,
