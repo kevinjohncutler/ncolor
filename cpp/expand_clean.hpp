@@ -247,7 +247,8 @@ inline int64_t bridge_check_subspace_nd(
     int32_t* labels, int32_t* dist,
     const std::vector<int64_t>& shape,
     const std::vector<int>& subset_axes,
-    ForkJoinPool* pool = nullptr, int n_threads = 1)
+    ForkJoinPool* pool = nullptr, int n_threads = 1,
+    std::vector<uint8_t>* nbr_scratch = nullptr)
 {
     const int N = (int)shape.size();
     const int k = (int)subset_axes.size();
@@ -322,7 +323,14 @@ inline int64_t bridge_check_subspace_nd(
     //                    else queued iff the two face matches are
     //                    antipodal
     constexpr uint8_t SATURATED = 255;
-    std::vector<uint8_t> nbr_count((size_t)total, 0);
+    // One byte per pixel. Every labeled pixel is written by the scan
+    // before the peel-back reads it, and background pixels are never
+    // read, so the buffer needs no zeroing and can persist across calls
+    // (a fresh 16 MB allocation plus memset per call at 256 cubed).
+    std::vector<uint8_t> nbr_local;
+    std::vector<uint8_t>& nbr_vec = nbr_scratch ? *nbr_scratch : nbr_local;
+    if (nbr_vec.size() < (size_t)total) nbr_vec.resize((size_t)total);
+    uint8_t* const nbr_count = nbr_vec.data();
 
     using QEnt = std::pair<int64_t, int32_t>;
     std::vector<QEnt> queue;
@@ -684,10 +692,9 @@ inline int64_t bridge_check_2d(
 
 // Barrier-respecting envelope_pass_row. Identical to envelope_pass_row_impl
 // (in expand.hpp), but the Phase 2 segment fill reads dist[i] before
-// writing and skips pixels where dist[i] == BRIDGE_BARRIER_DIST. Scalar
-// fill only — SIMD masked stores aren't worth the complexity for this
-// (rare) path; non-bridge-free expand still uses the SIMD fill via the
-// original envelope_pass_row.
+// writing and skips pixels where dist[i] == BRIDGE_BARRIER_DIST. The
+// contiguous case uses the masked SIMD fill (envelope_fill_barrier_simd);
+// the strided case stays scalar.
 //
 // Phase 1 already handles barriers implicitly: a barrier pixel has
 // lbl=0 so it doesn't get pushed as a seed.
@@ -756,12 +763,17 @@ inline void envelope_pass_row_barrier_impl(
         const int32_t lbl_j = lblstk[j];
         const int32_t g_j = g[j];
         const int32_t v_j = v[j];
-        for (int64_t i = i_start; i < i_end; ++i) {
-            const int64_t idx = Contig ? i : i * stride;
-            if (dist[idx] == BRIDGE_BARRIER_DIST) continue;
-            const int32_t di = static_cast<int32_t>(i) - v_j;
-            lbl[idx] = lbl_j;
-            dist[idx] = g_j + di * di;
+        if constexpr (Contig) {
+            envelope_fill_barrier_simd(lbl, dist, i_start, i_end,
+                                       lbl_j, g_j, v_j, BRIDGE_BARRIER_DIST);
+        } else {
+            for (int64_t i = i_start; i < i_end; ++i) {
+                const int64_t idx = i * stride;
+                if (dist[idx] == BRIDGE_BARRIER_DIST) continue;
+                const int32_t di = static_cast<int32_t>(i) - v_j;
+                lbl[idx] = lbl_j;
+                dist[idx] = g_j + di * di;
+            }
         }
         i_start = i_end;
     }
@@ -1136,7 +1148,8 @@ inline void expand_labels_clean_nd_inplace(
             std::vector<int> subset_axes(subspace_size);
             for (int j = 0; j < subspace_size; ++j) subset_axes[j] = ax + j;
             int64_t n_new = bridge_check_subspace_nd(
-                h_lbl, h_dist, shape, subset_axes, &pool, n_threads);
+                h_lbl, h_dist, shape, subset_axes, &pool, n_threads,
+                &bufs.nbr_scratch());
             if (n_new > 0) barriers_present = true;
         }
     }

@@ -1492,6 +1492,12 @@ public:
     }
     int get_last_n_conflicts() const { return last_n_conflicts_; }
     double get_last_n_soft_violations() const { return n_soft_violations_last_; }
+    // Soft (delta-kernel) pairs from the most recent label() call: an
+    // (M, 2) int32 array of 1-indexed (lo, hi) label ids, hard pairs
+    // excluded. Empty when the call built no auto-soft kernel.
+    py::array_t<int32_t> get_last_soft_pairs() const {
+        return pairs_to_array(fused_soft_pairs_);
+    }
 
 private:
     // Validate or allocate the uint8 output buffer. Returns the (possibly
@@ -1929,6 +1935,10 @@ PYBIND11_MODULE(_impl, m) {
              "whose endpoints share a color after the post-solve local\n"
              "search. 0 means all soft preferences satisfied. Only nonzero\n"
              "when soft_extra_edges was passed to label().")
+        .def("get_last_soft_pairs", &Solver::get_last_soft_pairs,
+             "Soft (delta-kernel) pairs from the most recent label() call as\n"
+             "an (M, 2) int32 array of 1-indexed (lo, hi) label ids, hard\n"
+             "pairs excluded. Empty when no auto-soft kernel was built.")
         .def("release", &Solver::release,
              "Free every persistent scratch buffer (the working set of the\n"
              "largest image processed so far); the next call reallocates.");

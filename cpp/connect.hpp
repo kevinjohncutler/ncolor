@@ -13,6 +13,7 @@
 #define NCOLOR_CONNECT_HPP
 
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <utility>
 #include <atomic>
@@ -357,10 +358,21 @@ static inline void scan_inner_axis_fast(
 // pixel data stay in registers/L1 for both checks. Templated on both
 // counts so each loop body unrolls separately. Used by the soft
 // auto-builder's fused dual scan; Mode=Off only.
+//
+// Interior skip. The delta offsets are ordered by Chebyshev distance,
+// so the first ``n_delta_near`` of them are the distance-1 ones. When
+// every distance-1 forward neighbor (base and delta) carries the
+// pixel's own label, the distance-2 delta offsets are not read: any
+// pair they could emit is also emitted from the stepping neighbor one
+// step toward the far pixel, either as a hard pair or as a distance-1
+// soft pair (the driver removes hard pairs from the soft set, which
+// makes the two routes equivalent). Exact for soft radius <= 2; the
+// driver disables the skip (n_delta_near == n_delta) beyond that. For
+// a cell interior this replaces 12 reads by 4 in 2D and 33 by 9 in 3D.
 template <typename T, int N_BASE, int N_DELTA>
 static inline void scan_inner_axis_dual_fast(
         const T* row, int64_t x_start, int64_t x_end,
-        const int64_t* nb_flat,
+        const int64_t* nb_flat, int n_delta_near,
         uint64_t* ht_base, uint64_t base_mask,
         uint64_t* ht_soft, uint64_t soft_mask) {
     int64_t nb_b[N_BASE];
@@ -371,12 +383,15 @@ static inline void scan_inner_axis_dual_fast(
         const T vi = row[x];
         if (vi == 0) continue;
         const T* p = row + x;
+        bool all_same = true;
 #if defined(__GNUC__) || defined(__clang__)
 #  pragma GCC unroll 16
 #endif
         for (int k = 0; k < N_BASE; ++k) {
             const T vj = p[nb_b[k]];
-            if (vj == 0 || vj == vi) continue;
+            if (vj == vi) continue;
+            all_same = false;
+            if (vj == 0) continue;
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
             ht_insert(ht_base, base_mask,
@@ -386,8 +401,11 @@ static inline void scan_inner_axis_dual_fast(
 #  pragma GCC unroll 16
 #endif
         for (int k = 0; k < N_DELTA; ++k) {
+            if (k == n_delta_near && all_same) break;
             const T vj = p[nb_s[k]];
-            if (vj == 0 || vj == vi) continue;
+            if (vj == vi) continue;
+            all_same = false;
+            if (vj == 0) continue;
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
             ht_insert(ht_soft, soft_mask,
@@ -401,24 +419,30 @@ static inline void scan_inner_axis_dual_fast(
 template <typename T>
 static inline void scan_inner_axis_dual_runtime(
         const T* row, int64_t x_start, int64_t x_end,
-        int n_base, int n_delta, const int64_t* nb_flat,
+        int n_base, int n_delta, const int64_t* nb_flat, int n_delta_near,
         uint64_t* ht_base, uint64_t base_mask,
         uint64_t* ht_soft, uint64_t soft_mask) {
     for (int64_t x = x_start; x < x_end; ++x) {
         const T vi = row[x];
         if (vi == 0) continue;
         const T* p = row + x;
+        bool all_same = true;
         for (int k = 0; k < n_base; ++k) {
             const T vj = p[nb_flat[k]];
-            if (vj == 0 || vj == vi) continue;
+            if (vj == vi) continue;
+            all_same = false;
+            if (vj == 0) continue;
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
             ht_insert(ht_base, base_mask,
                        (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
         }
         for (int k = 0; k < n_delta; ++k) {
+            if (k == n_delta_near && all_same) break;
             const T vj = p[nb_flat[n_base + k]];
-            if (vj == 0 || vj == vi) continue;
+            if (vj == vi) continue;
+            all_same = false;
+            if (vj == 0) continue;
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
             ht_insert(ht_soft, soft_mask,
@@ -431,23 +455,26 @@ static inline void scan_inner_axis_dual_runtime(
 template <typename T>
 static inline void scan_inner_axis_dual_dispatch(
         const T* row, int64_t x_start, int64_t x_end,
-        int n_base, int n_delta, const int64_t* nb_flat,
+        int n_base, int n_delta, const int64_t* nb_flat, int n_delta_near,
         uint64_t* ht_base, uint64_t base_mask,
         uint64_t* ht_soft, uint64_t soft_mask) {
     // 2D conn=1 r=1 base (N_BASE=2) is the dominant case; delta sizes
     // 2/8/10 cover the realistic soft kernels (conn=1 r=2, conn=2 r=1,
     // conn=2 r=2). 2D conn=2 r=1 base (N_BASE=4) with delta=8 covers
-    // the conn=2 r=1 → conn=2 r=2 path.
+    // the conn=2 r=1 → conn=2 r=2 path. 3D conn=1 r=1 base (N_BASE=3)
+    // with the default conn=2 r=2 soft kernel is delta=30.
     if (n_base == 2 && n_delta == 2)
-        scan_inner_axis_dual_fast<T, 2, 2>(row, x_start, x_end, nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 2, 2>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
     else if (n_base == 2 && n_delta == 8)
-        scan_inner_axis_dual_fast<T, 2, 8>(row, x_start, x_end, nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 2, 8>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
     else if (n_base == 2 && n_delta == 10)
-        scan_inner_axis_dual_fast<T, 2, 10>(row, x_start, x_end, nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 2, 10>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
     else if (n_base == 4 && n_delta == 8)
-        scan_inner_axis_dual_fast<T, 4, 8>(row, x_start, x_end, nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 4, 8>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+    else if (n_base == 3 && n_delta == 30)
+        scan_inner_axis_dual_fast<T, 3, 30>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
     else
-        scan_inner_axis_dual_runtime<T>(row, x_start, x_end, n_base, n_delta, nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_runtime<T>(row, x_start, x_end, n_base, n_delta, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
 }
 
 // Runtime-N_NBS fallback for cases that don't hit the dispatch table
@@ -564,8 +591,10 @@ inline void scan_band_unpadded(
                 int64_t neigh_flat = 0;
                 for (int d = 0; d < ndim; ++d) {
                     int64_t nc = coords[d] + dc[d];
+                    // A radius larger than the axis needs a real modulo,
+                    // not a single wrap-around.
+                    nc %= shape[d];
                     if (nc < 0) nc += shape[d];
-                    else if (nc >= shape[d]) nc -= shape[d];
                     neigh_flat += nc * strides[d];
                 }
                 int32_t dj = 0;
@@ -865,8 +894,9 @@ inline void build_forward_neighbors_dual(
         std::vector<int64_t>& strides_out,
         std::vector<int64_t>& nb_flat_out,
         std::vector<int8_t>& nb_dc_out,
-        int& n_base_out) {
+        int& n_base_out, int* n_delta_near_out = nullptr) {
     const int ndim = static_cast<int>(shape.size());
+    if (n_delta_near_out) *n_delta_near_out = 0;
     strides_out.assign(ndim, 1);
     for (int d = ndim - 2; d >= 0; --d) strides_out[d] = strides_out[d + 1] * shape[d + 1];
     nb_flat_out.clear();
@@ -911,6 +941,7 @@ inline void build_forward_neighbors_dual(
         });
     for (auto& c : cands) {
         if (std::get<0>(c) == 0) ++n_base_out;
+        else if (std::get<1>(c) == 1 && n_delta_near_out) ++*n_delta_near_out;
         nb_flat_out.push_back(std::get<2>(c));
         for (int8_t v : std::get<3>(c)) nb_dc_out.push_back(v);
     }
@@ -925,7 +956,7 @@ template <typename T, bool Wrap = false>
 inline void scan_band_unpadded_dual(
         const T* lbl, const std::vector<int64_t>& shape,
         const int64_t* strides, const int64_t* nb_flat,
-        const int8_t* nb_dc, int n_base, int n_nbs,
+        const int8_t* nb_dc, int n_base, int n_nbs, int n_delta_near,
         int64_t outer_start, int64_t outer_end,
         uint64_t* ht_base, uint64_t* ht_soft,
         uint64_t base_mask, uint64_t soft_mask,
@@ -938,10 +969,16 @@ inline void scan_band_unpadded_dual(
         const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
         ht_insert(h, mask, (lo << 32) | hi);
     };
+    // Same interior skip as the fast inner loop (see
+    // scan_inner_axis_dual_fast); an out-of-bounds near neighbor counts
+    // as "different" so the far offsets are still checked.
+    const int n_near = n_base + n_delta_near;
     auto scan_pixel_checked = [&](const int64_t* coords, uint32_t bnd_mask, int64_t flat) {
         const T vi = lbl[flat];
         if (vi == 0) return;
+        bool all_same = true;
         for (int k = 0; k < n_nbs; ++k) {
+            if (k == n_near && all_same) break;
             const int8_t* dc = nb_dc + k * ndim;
             const bool is_base = (k < n_base);
             uint64_t* h = is_base ? ht_base : ht_soft;
@@ -950,11 +987,15 @@ inline void scan_band_unpadded_dual(
                 int64_t neigh_flat = 0;
                 for (int d = 0; d < ndim; ++d) {
                     int64_t nc = coords[d] + dc[d];
+                    // A radius larger than the axis needs a real modulo,
+                    // not a single wrap-around.
+                    nc %= shape[d];
                     if (nc < 0) nc += shape[d];
-                    else if (nc >= shape[d]) nc -= shape[d];
                     neigh_flat += nc * strides[d];
                 }
-                emit(h, mask, vi, lbl[neigh_flat]);
+                const T vj = lbl[neigh_flat];
+                if (vj != vi) all_same = false;
+                emit(h, mask, vi, vj);
             } else {
                 bool valid = true;
                 uint32_t m = bnd_mask;
@@ -964,7 +1005,13 @@ inline void scan_band_unpadded_dual(
                     const int64_t nc = coords[d] + dc[d];
                     if (nc < 0 || nc >= shape[d]) { valid = false; break; }
                 }
-                if (valid) emit(h, mask, vi, lbl[flat + nb_flat[k]]);
+                if (valid) {
+                    const T vj = lbl[flat + nb_flat[k]];
+                    if (vj != vi) all_same = false;
+                    emit(h, mask, vi, vj);
+                } else {
+                    all_same = false;
+                }
             }
         }
     };
@@ -1000,7 +1047,7 @@ inline void scan_band_unpadded_dual(
             if (n_base > 0 && n_delta > 0) {
                 scan_inner_axis_dual_dispatch<T>(
                     lbl + row_base, radius, W - radius, n_base, n_delta,
-                    nb_flat, ht_base, base_mask, ht_soft, soft_mask);
+                    nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
             } else if (n_base > 0) {
                 scan_inner_axis_dispatch<T>(
                     lbl + row_base, radius, W - radius, n_base,
@@ -1053,11 +1100,18 @@ inline void find_pairs_dual_unpadded_impl(
     std::vector<int64_t> nb_flat;
     std::vector<int8_t> nb_dc;
     int n_base = 0;
+    int n_delta_near = 0;
     detail::build_forward_neighbors_dual(
         shape, base_conn, base_radius, soft_conn, soft_radius,
-        strides, nb_flat, nb_dc, n_base);
+        strides, nb_flat, nb_dc, n_base, &n_delta_near);
     const int n_nbs = static_cast<int>(nb_flat.size());
     if (n_nbs == 0) return;
+    // The interior skip (scan_inner_axis_dual_fast) is exact only up to
+    // soft radius 2: beyond that a far pair's witness chain can pass
+    // through a third label. NCOLOR_NO_INTERIOR_SKIP=1 disables it for
+    // A/B checks.
+    static const bool no_skip = std::getenv("NCOLOR_NO_INTERIOR_SKIP") != nullptr;
+    if (no_skip || soft_radius > 2) n_delta_near = n_nbs - n_base;
     const int radius = std::max(1, soft_radius);
     const uint64_t base_mask = base_ht_size - 1;
     const uint64_t soft_mask = soft_ht_size - 1;
@@ -1081,7 +1135,7 @@ inline void find_pairs_dual_unpadded_impl(
         std::fill_n(soft_hts, soft_ht_size, HT_EMPTY);
         scan_band_unpadded_dual<T, Wrap>(
             lbl, shape, strides.data(), nb_flat.data(),
-            nb_dc.data(), n_base, n_nbs, 0, shape[0],
+            nb_dc.data(), n_base, n_nbs, n_delta_near, 0, shape[0],
             base_hts, soft_hts, base_mask, soft_mask, radius);
     } else {
         std::atomic<int> next{0};
@@ -1098,7 +1152,7 @@ inline void find_pairs_dual_unpadded_impl(
                 if (z0 < z1) {
                     scan_band_unpadded_dual<T, Wrap>(
                         lbl, shape, strides.data(), nb_flat.data(),
-                        nb_dc.data(), n_base, n_nbs, z0, z1,
+                        nb_dc.data(), n_base, n_nbs, n_delta_near, z0, z1,
                         hb, hs, base_mask, soft_mask, radius);
                 }
             }
@@ -1134,6 +1188,12 @@ inline void find_pairs_dual_unpadded_impl(
     for (uint64_t h = 0; h < soft_ht_size; ++h) {
         const uint64_t key = soft_hts[h];
         if (key == HT_EMPTY) continue;
+        // A soft pair that is also a hard pair can never be violated; it
+        // only distorts the soft weights. Dropping it also makes the soft
+        // set independent of the interior skip above, which may or may
+        // not have seen such a pair through a far offset.
+        const uint64_t hb = ht_probe(base_hts, base_mask, key);
+        if (hb <= base_mask && base_hts[hb] == key) continue;
         out_soft.emplace_back((int32_t)(key >> 32),
                                (int32_t)(key & 0xFFFFFFFFull));
     }

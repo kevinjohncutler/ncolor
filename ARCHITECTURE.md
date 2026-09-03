@@ -139,6 +139,20 @@ A few choices that aren't obvious from the code itself:
     5 times the cost of the plain expand on Apple Silicon. The merged
     bridge queue is sorted before the peel-back so the result does not
     depend on which thread finished first.
+13. **The soft adjacency scan skips cell interiors.** In the fused
+    hard-plus-soft `find_pairs` the delta offsets are ordered by
+    Chebyshev distance. When every distance-1 forward neighbor of a
+    pixel carries its own label, the distance-2 offsets are not read:
+    for any far pixel q with a different label, the neighbor m one
+    step toward q has the pixel's label and sits within distance 1 of
+    q, so the pair (m, q) is emitted from m or q, either as a hard pair
+    (face offset) or as a distance-1 soft pair, and m or q is itself
+    not interior. Hard pairs are removed from the soft set at the end,
+    which makes the two routes equivalent. The argument needs the
+    stepping neighbor to carry the pixel's label, which holds for a
+    radius of 2 but not beyond (a chain through a third label), so the
+    driver disables the skip for `soft_radius > 2`. For a cell interior
+    this is 4 reads instead of 12 in 2D and 9 instead of 33 in 3D.
 
 ### Scaling pattern across image sizes
 

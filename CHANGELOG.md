@@ -83,6 +83,24 @@ and versions follow [semantic versioning](https://semver.org/).
   strided-slab path the plain sweep already had for 3D, and a header
   edit now triggers a rebuild (`setup.py` lists the headers as
   dependencies).
+- **The soft-kernel adjacency scan skips cell interiors.** The fused
+  hard-plus-soft `find_pairs` read every soft-radius offset for every
+  pixel: 12 reads per pixel in 2D and 33 in 3D with the default
+  `soft_conn=2, soft_radius=2`. A pixel whose distance-1 neighbors all
+  carry its own label now skips the distance-2 offsets: any pair those
+  could yield is also seen from the neighbor one step toward the far
+  pixel, as a hard pair or as a distance-1 soft pair, so the pair set
+  is unchanged (verified on 426 image and kernel combinations,
+  wrap-around included). Soft pairs that are also hard pairs are now
+  dropped from the soft set; they can never be violated and only
+  distorted the soft weights (color counts and soft-violation counts on
+  the reference images are unchanged). `find_pairs` at 2048 squared
+  went from 2.1 to 0.9 ms and at 256 cubed from 33 to 21 ms on an M5
+  Max. The skip is exact only up to soft radius 2 and is disabled
+  automatically beyond that; `NCOLOR_NO_INTERIOR_SKIP=1` disables it
+  for comparisons. The clean expand also keeps its per-pixel
+  neighbor-count buffer between calls instead of allocating and zeroing
+  it on every call, and its barrier-aware fill is a masked SIMD loop.
 - **One thread pool for the whole package.** `Solver` and
   `ExpandEngine` instances that resolve to the same thread count share
   a single `ForkJoinPool`, and the format engine is the expand engine.
@@ -112,6 +130,12 @@ and versions follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- **Out-of-bounds read in `wrap=True` adjacency scans** when an axis is
+  shorter than the neighbor radius (a `connect_radius` or `soft_radius`
+  of 2 on an image with a dimension of 1 or 2): the wrap-around was a
+  single subtraction rather than a modulo, so the index could stay
+  negative. Found by the pair-set harness; such inputs now wrap
+  correctly.
 - **Crash on concurrent `expand_labels` / `format_labels`.** 2.0.1
   serialized `label` and `connect`, but the expand and format engines
   were left unguarded and two threads calling them at once corrupted

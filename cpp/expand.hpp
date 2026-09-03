@@ -156,6 +156,64 @@ static inline void envelope_fill_simd(
     }
 }
 
+// Barrier-aware variant of envelope_fill_simd for the clean expand:
+// pixels whose dist equals ``barrier`` are left untouched (both arrays),
+// everything else is filled exactly as above. Vector lanes are selected
+// with a compare mask, so the barrier check costs no branch.
+static inline void envelope_fill_barrier_simd(
+        int32_t* __restrict lbl, int32_t* __restrict dist,
+        int64_t i_start, int64_t i_end,
+        int32_t lbl_j, int32_t g_j, int32_t v_j, int32_t barrier) {
+    int64_t i = i_start;
+#if defined(NCOLOR_SIMD_NEON)
+    const int32x4_t v_lbl = vdupq_n_s32(lbl_j);
+    const int32x4_t v_g   = vdupq_n_s32(g_j);
+    const int32x4_t v_vj  = vdupq_n_s32(v_j);
+    const int32x4_t v_bar = vdupq_n_s32(barrier);
+    const int32x4_t v_inc = {0, 1, 2, 3};
+    const int32x4_t v_four = vdupq_n_s32(4);
+    int32x4_t v_i = vaddq_s32(vdupq_n_s32(static_cast<int32_t>(i_start)), v_inc);
+    for (; i + 4 <= i_end; i += 4) {
+        const int32x4_t d_old = vld1q_s32(dist + i);
+        const uint32x4_t keep = vceqq_s32(d_old, v_bar);
+        const int32x4_t v_di = vsubq_s32(v_i, v_vj);
+        const int32x4_t d_new = vaddq_s32(vmulq_s32(v_di, v_di), v_g);
+        const int32x4_t l_old = vld1q_s32(lbl + i);
+        vst1q_s32(lbl + i, vbslq_s32(keep, l_old, v_lbl));
+        vst1q_s32(dist + i, vbslq_s32(keep, d_old, d_new));
+        v_i = vaddq_s32(v_i, v_four);
+    }
+#elif defined(NCOLOR_SIMD_X86)
+    {
+        const __m128i v_lbl = _mm_set1_epi32(lbl_j);
+        const __m128i v_g   = _mm_set1_epi32(g_j);
+        const __m128i v_vj  = _mm_set1_epi32(v_j);
+        const __m128i v_bar = _mm_set1_epi32(barrier);
+        const __m128i v_four = _mm_set1_epi32(4);
+        __m128i v_i = _mm_add_epi32(_mm_set1_epi32(static_cast<int32_t>(i)),
+                                    _mm_set_epi32(3, 2, 1, 0));
+        for (; i + 4 <= i_end; i += 4) {
+            const __m128i d_old = _mm_loadu_si128(reinterpret_cast<const __m128i*>(dist + i));
+            const __m128i keep  = _mm_cmpeq_epi32(d_old, v_bar);
+            const __m128i v_di  = _mm_sub_epi32(v_i, v_vj);
+            const __m128i d_new = _mm_add_epi32(mullo_epi32_sse(v_di, v_di), v_g);
+            const __m128i l_old = _mm_loadu_si128(reinterpret_cast<const __m128i*>(lbl + i));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(lbl + i),
+                             _mm_or_si128(_mm_and_si128(keep, l_old), _mm_andnot_si128(keep, v_lbl)));
+            _mm_storeu_si128(reinterpret_cast<__m128i*>(dist + i),
+                             _mm_or_si128(_mm_and_si128(keep, d_old), _mm_andnot_si128(keep, d_new)));
+            v_i = _mm_add_epi32(v_i, v_four);
+        }
+    }
+#endif
+    for (; i < i_end; ++i) {
+        if (dist[i] == barrier) continue;
+        const int32_t di = static_cast<int32_t>(i) - v_j;
+        lbl[i] = lbl_j;
+        dist[i] = g_j + di * di;
+    }
+}
+
 // Templated on (Wrap, Contig) so each (wrap × stride==1) pair gets its own
 // inlined specialization with all branches resolved at compile time:
 //   - Wrap=false : Phase 1 = real seeds only (one [0,N) sweep).
@@ -656,14 +714,19 @@ public:
         std::vector<int32_t>().swap(t_lbl_);
         std::vector<int32_t>().swap(t_dist_);
         std::vector<EnvelopeScratch>().swap(scratch_);
+        std::vector<uint8_t>().swap(nbr_);
         capacity_ = 0;
         size_ = 0;
     }
+    // Per-pixel neighbor-count scratch for the clean expand's bridge
+    // check (one byte per pixel, no zeroing needed between calls).
+    std::vector<uint8_t>& nbr_scratch() { return nbr_; }
 private:
     std::vector<int32_t> h_lbl_, h_dist_, t_lbl_, t_dist_;
     int64_t capacity_ = 0;
     int64_t size_ = 0;
     std::vector<EnvelopeScratch> scratch_;
+    std::vector<uint8_t> nbr_;
 };
 
 
