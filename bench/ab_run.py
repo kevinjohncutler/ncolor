@@ -22,6 +22,11 @@ import time
 import numpy as np
 
 TARGET_S = 0.20          # wall time to spend per (case, op)
+# Graphs for the picker itself. The corpus images are nearly all easy
+# for it: a slot wins almost at once, so they say little about how the
+# race behaves when it has to work. These are hard enough that the
+# search runs, which is where a change to the race would show.
+HARD_GRAPHS = ((800, 6, 0), (1500, 5, 1), (2000, 8, 2), (3000, 5, 3))
 MIN_ITERS, MAX_ITERS = 5, 40
 
 
@@ -75,6 +80,34 @@ def concurrent_rate(mod, m, n_threads=4):
     return [once() for _ in range(3)]
 
 
+def rand_graph(n, deg, seed):
+    """A deterministic random graph, same for every build."""
+    rng = np.random.default_rng(seed)
+    e = set()
+    for u in range(n):
+        for v in rng.integers(0, n, deg):
+            if v != u:
+                e.add((min(u, int(v)), max(u, int(v))))
+    return np.array(sorted(e), np.int32)
+
+
+def time_graphs(mod):
+    out = {}
+    for n, deg, seed in HARD_GRAPHS:
+        edges = rand_graph(n, deg, seed)
+        fn = lambda e=edges, k=n: mod.color_graph(e, k)
+        fn()
+        t0 = time.perf_counter(); fn(); one = time.perf_counter() - t0
+        iters = int(min(20, max(3, 0.5 / max(one, 1e-6))))
+        ts = []
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            fn()
+            ts.append((time.perf_counter() - t0) * 1e3)
+        out[f"g{n}_d{deg}"] = {"color_graph": ts}
+    return out
+
+
 def digest(a):
     a = np.ascontiguousarray(np.asarray(a))
     return hashlib.blake2b(a.tobytes(), digest_size=12).hexdigest()
@@ -102,7 +135,8 @@ def main():
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--build", default="?")
-    ap.add_argument("--mode", choices=("serial", "concurrent", "verify"), default="serial")
+    ap.add_argument("--mode", choices=("serial", "concurrent", "verify", "graphs"),
+                    default="serial")
     ap.add_argument("--cases", default="")
     ap.add_argument("--shuffle", type=int, default=-1,
                     help="seed to measure the cases in a random order; -1 keeps "
@@ -110,6 +144,15 @@ def main():
     args = ap.parse_args()
 
     import ncolor
+    if args.mode == "graphs":
+        res = time_graphs(ncolor)
+        meta = {"build": args.build, "mode": "graphs",
+                "host": socket.gethostname().split(".")[0],
+                "ncolor": getattr(ncolor, "__version__", "?")}
+        with open(args.out, "w") as fh:
+            json.dump({"meta": meta, "results": res}, fh)
+        print(f"[{meta['host']}] {args.build:9s} graphs", flush=True)
+        return
     npz = np.load(args.corpus)
     names = args.cases.split(",") if args.cases else list(npz.files)
     # Measuring in a fixed order lets one case sit in another's shadow.

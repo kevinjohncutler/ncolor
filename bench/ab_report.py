@@ -35,8 +35,8 @@ def load(host_dir):
     process that ran slow throughout counts once rather than forty
     times.
     """
-    data = {"serial": defaultdict(lambda: defaultdict(lambda: defaultdict(list))),
-            "concurrent": defaultdict(lambda: defaultdict(lambda: defaultdict(list)))}
+    data = {m: defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+            for m in ("serial", "concurrent", "graphs")}
     for p in sorted(Path(host_dir).glob("*.json")):
         if p.name.startswith("verify"):
             continue

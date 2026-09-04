@@ -15,15 +15,19 @@ PY=${PY:-$HOME/.pyenv/shims/python}
 RUNNER="${TREES[-1]#*=}/bench/ab_run.py"
 mkdir -p "$OUT"
 
+# Always rebuild. Skipping when a .so is already there looks like a
+# cheap win and is a trap: the rsync that refreshes a tree excludes
+# *.so, so --delete cannot remove the binary left by whatever was in
+# that directory before. The build would then be skipped and the
+# measurement would silently be of the previous tree.
 for spec in "${TREES[@]}"; do
   name=${spec%%=*}; d=${spec#*=}
-  if [ -z "$(ls "$d"/src/ncolor/_backend/_impl*.so 2>/dev/null)" ]; then
-    ( cd "$d"
-      SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION:-2.0.3.dev0} \
-      NCOLOR_NO_CALIBRATE=1 "$PY" setup.py build_ext --inplace > "build_$name.log" 2>&1 \
-        || { tail -30 "build_$name.log"; exit 1; } )
-    echo "[$(hostname -s)] built $name"
-  fi
+  ( cd "$d"
+    rm -rf build src/ncolor/_backend/_impl*.so
+    SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION:-2.0.3.dev0} \
+    NCOLOR_NO_CALIBRATE=1 "$PY" setup.py build_ext --inplace > "build_$name.log" 2>&1 \
+      || { tail -30 "build_$name.log"; exit 1; } )
+  echo "[$(hostname -s)] built $name"
 done
 
 run() {  # run <tree> <name> <mode> <outfile> [shuffle-seed]
@@ -46,6 +50,7 @@ for r in $(seq 1 "$REPS"); do
     # Same case order for every tree within a repetition, a different
     # one each repetition.
     run "$d" "$name" serial     "$OUT/serial_${name}_r${r}.json" "$r"
+    run "$d" "$name" graphs     "$OUT/graphs_${name}_r${r}.json" "$r"
     run "$d" "$name" concurrent "$OUT/conc_${name}_r${r}.json"   "$r"
   done
 done
