@@ -44,17 +44,40 @@ and versions follow [semantic versioning](https://semver.org/).
   integer dtypes already supported. The cast to the engine's int32 runs
   in parallel inside the call; `expand_labels` no longer pays a
   single-threaded `numpy.astype` pass first.
-- **`ncolor.Engine`, for coloring several images at once.** Every call
-  shares one thread pool, and only one call may be in flight per pool,
-  so calls from several threads took turns: threading four images
-  through the module-level functions ran no faster than doing them one
-  after another (measured 1.03x). An `Engine` holds its own pool and its
-  own scratch buffers, so several of them work at the same time; four
-  engines of four threads each colored 16 images in half the time of the
-  shared engine on an 18-core machine. Callers doing one image at a time
-  need nothing new, since a single call already uses every core. Size
-  `n_engines * n_threads` to about the core count, and budget roughly 20
-  bytes per pixel of the largest image each engine sees.
+- **`ncolor.label` threads by itself, and `ncolor.Engine` for doing it
+  by hand.** Every call shared one thread pool, and only one call may be
+  in flight per pool, so calls from several threads took turns:
+  threading four images through the module-level functions ran no faster
+  than doing them one after another (measured 1.03x). Now a lone call
+  gets the full-width engine as before, while calls that overlap are
+  handed narrower engines whose threads add up to about one machine.
+  Four threads through plain `ncolor.label` run 1.3 to 2.2x faster than
+  the same work in sequence on an 18-core machine, with nothing asked of
+  the caller; when the parallel phase ends, calls go back to full width.
+
+  Two things had to be true for that to pay off, and both were measured
+  rather than assumed. Running the full-width engine alongside the
+  narrow ones is the worst of both and was *slower* than serial (0.65x),
+  because the pools spin against each other, so the wide one sits out
+  while anything else is in flight. And an engine is bound to its thread
+  rather than borrowed per call: handing one lock between four threads
+  cost 2.3 ms a call, several times the work itself.
+
+  Splitting is only worth it where a single call cannot already use the
+  whole machine, so it is on above 16 threads and off at or below, where
+  calls take turns exactly as they used to. Measured with four threads
+  against the same work in sequence: 1.3-1.9x on an 18-core M5 Max and
+  1.3x on a 64-core Threadripper, against 0.9x on a 16-core Ryzen and
+  0.8x on an 8-core i9, which is why those keep the old path.
+  `NCOLOR_AUTO_THREADS=0` or `1` forces it either way.
+
+  Engines are built only when calls actually overlap, so a
+  single-threaded program still holds exactly one. At most
+  `NCOLOR_MAX_ENGINES` (4 by default) are created, which bounds the
+  worker threads and the memory alike, since each keeps the working set
+  of the largest image it has seen (roughly 20 bytes per pixel).
+  `ncolor.Engine` is the same thing under the caller's control, for
+  sizing the threads by hand or running more workers than the limit.
 - **`ncolor.release_buffers()`.** The engines keep the working set of the
   largest image processed so far (about 22 bytes per pixel for `label`)
   allocated between calls. After one whole-slide image that is

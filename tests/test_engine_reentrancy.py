@@ -1,15 +1,13 @@
-"""``Engine`` instances run concurrently; the default engine serializes.
+"""Concurrency: automatic for ``ncolor.label``, explicit with ``Engine``.
 
-Only one call may be in flight per thread pool, so the module-level
-functions, which share one, take turns. That is right for one image at a
-time and it is what kept concurrent calls from corrupting the pool, but
-it means threading several images through the shared engine buys
-nothing. An ``Engine`` holds its own pool and buffers, so several of them
-work at once.
+Only one call may be in flight per thread pool. A lone caller gets the
+full-width engine; callers that overlap are given narrower engines whose
+threads add up to about one machine, so ``ncolor.label`` threads without
+the caller arranging anything. ``Engine`` is the same thing by hand.
 
-The timing check here is deliberately loose: it asks only that per-engine
-threading beats shared-engine threading, which is a structural property
-(one lock versus several), not a tuned speedup.
+The timing checks are deliberately loose: they ask only that threading
+beats doing the images one after another, which is structural, not a
+tuned speedup. They use enough work per call to stay clear of noise.
 """
 import threading
 import time
@@ -132,3 +130,85 @@ def test_separate_engines_overlap_where_a_shared_one_cannot(n_threads):
     assert private < shared, (
         f"per-engine threading ({private*1e3:.1f} ms) should beat the shared "
         f"engine ({shared*1e3:.1f} ms)")
+
+
+# ------------------------------------------------- the automatic path
+
+
+def test_plain_label_threads_without_an_engine():
+    """``ncolor.label`` from several threads beats doing them in turn.
+
+    Only where splitting is on. Below the machine-size threshold a single
+    call already uses every core, so calls take turns as they always
+    have and there is nothing to beat.
+    """
+    from ncolor import _engines
+    if not _engines._auto_split():
+        pytest.skip("machine too small for concurrent calls to pay off")
+    images = [_image(s, n=512) for s in range(4)]
+    reps = 4
+
+    def serial():
+        for m in images:
+            for _ in range(reps):
+                ncolor.label(m)
+
+    def threaded():
+        ts = [threading.Thread(
+            target=lambda m=m: [ncolor.label(m) for _ in range(reps)])
+            for m in images]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+
+    serial()
+    threaded()                      # build the per-thread engines first
+    t_serial = _elapsed(serial)
+    t_threaded = _elapsed(threaded)
+    assert t_threaded < t_serial, (
+        f"threaded {t_threaded*1e3:.1f} ms should beat serial "
+        f"{t_serial*1e3:.1f} ms")
+
+
+def test_a_lone_caller_gets_the_full_width_engine():
+    """Before any concurrency, and again once it is over."""
+    from ncolor import _engines
+    m = _image(0, n=128)
+    ncolor.label(m)
+    assert _engines._last_used() is _engines._all[0]
+
+    def work():
+        for _ in range(2):
+            ncolor.label(m)
+
+    ts = [threading.Thread(target=work) for _ in range(3)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    # Nothing else running now, so the wide engine comes back.
+    ncolor.label(m)
+    assert _engines._last_used() is _engines._all[0]
+
+
+def test_engine_count_is_bounded():
+    """However many threads call, the pool stops growing."""
+    from ncolor import _engines
+    if not _engines._auto_split():
+        pytest.skip("no splitting on this machine, so one engine only")
+    m = _image(1, n=128)
+
+    def work():
+        for _ in range(2):
+            ncolor.label(m)
+
+    ts = [threading.Thread(target=work) for _ in range(12)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    # One full-width engine plus at most NCOLOR_MAX_ENGINES narrow ones.
+    assert len(_engines._all) <= 1 + _engines._max_engines()
+    assert all(e.n_threads >= 1 for e in _engines._all)

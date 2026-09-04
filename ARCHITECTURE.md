@@ -37,8 +37,14 @@ one `ForkJoinPool`. Only one `parallel()` may be in flight per thread
 pool, so a pool and the mutex serializing calls on it are one object
 (`PoolSlot`): every engine method takes its pool's mutex for the
 duration of the call. Engines sharing a pool therefore take turns, and
-engines built with `private_pool=True` run at the same time, which is
-what `ncolor.Engine` hands out. The mutex is taken only after the GIL is
+engines in different pool groups run at the same time. `ncolor._engines`
+uses that to thread the module-level functions: a lone call takes the
+full-width engine, while overlapping calls are bound to narrower engines
+whose threads sum to about one machine. The wide engine sits out while
+anything else is in flight, since running it alongside the narrow ones
+measured slower than serial, and engines are bound per thread rather
+than borrowed per call, since a lock on that path cost more than the
+call. The mutex is taken only after the GIL is
 released, so a thread waiting on it can never block one that needs the
 GIL to finish. Both engines keep the working set of the largest image they
 have seen; `ncolor.release_buffers()` frees it.

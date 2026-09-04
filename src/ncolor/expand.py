@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._engines import _expand_for
+from ._engines import _use
 
 
 def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
@@ -64,7 +64,7 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
 
     # The engine casts to int32 itself (checked, in parallel), so no
     # numpy astype pass here.
-    engine = _expand_for(_engine)
-    if mode == "standard":
-        return engine.expand_labels(arr, p=p, wrap=bool(wrap))
-    return engine.expand_labels_clean(arr, p=int(p))
+    with _use(_engine) as eng:
+        if mode == "standard":
+            return eng._expand.expand_labels(arr, p=p, wrap=bool(wrap))
+        return eng._expand.expand_labels_clean(arr, p=int(p))

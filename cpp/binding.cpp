@@ -23,6 +23,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <type_traits>
 #include <vector>
 
@@ -182,28 +183,25 @@ struct PoolSlot {
     std::mutex mu;
 };
 
-// Engines that resolve to the same thread count share one pool by
-// default. The package keeps a Solver and an ExpandEngine alive for the
-// life of the process; with a pool each that was 2 x (threads - 1)
-// parked workers. The registry holds weak references, so a pool dies
-// with the last engine using it (the SMT calibration builds and discards
-// engines with two different counts back to back).
-static std::shared_ptr<PoolSlot> acquire_shared_pool(int n_threads) {
+// Pools are shared by (thread count, group). Group 0 is the process-wide
+// default: the Solver and the ExpandEngine the module functions use both
+// land on it, so the package holds one pool rather than one each. A
+// caller wanting to work on several images at once takes a fresh group
+// per worker (``ncolor.Engine``); the two engines within one group still
+// share, since they are never in a call at the same time. The registry
+// holds weak references, so a pool dies with the last engine using it
+// (the SMT calibration builds and discards engines with two different
+// counts back to back).
+static std::shared_ptr<PoolSlot> resolve_pool(int n_threads, int pool_group) {
+    const int n = n_threads <= 1 ? 1 : n_threads;
     static std::mutex registry_mutex;
-    static std::map<int, std::weak_ptr<PoolSlot>> registry;
+    static std::map<std::pair<int, int>, std::weak_ptr<PoolSlot>> registry;
     std::lock_guard<std::mutex> lk(registry_mutex);
-    auto& slot = registry[n_threads];
+    auto& slot = registry[{n, pool_group}];
     if (auto live = slot.lock()) return live;
-    auto fresh = std::make_shared<PoolSlot>(n_threads);
+    auto fresh = std::make_shared<PoolSlot>(n);
     slot = fresh;
     return fresh;
-}
-
-// A pool of its own, shared with nobody, so this engine's calls never
-// wait behind another engine's. Costs its own worker threads.
-static std::shared_ptr<PoolSlot> resolve_pool(int n_threads, bool private_pool) {
-    const int n = n_threads <= 1 ? 1 : n_threads;
-    return private_pool ? std::make_shared<PoolSlot>(n) : acquire_shared_pool(n);
 }
 
 // Persistent-pool wrapper for expand_labels + parallel LUT apply.
@@ -211,9 +209,9 @@ static std::shared_ptr<PoolSlot> resolve_pool(int n_threads, bool private_pool) 
 // across calls so the only per-call cost is task enqueue.
 class ExpandEngine {
 public:
-    explicit ExpandEngine(double n_threads, bool private_pool = false)
+    explicit ExpandEngine(double n_threads, int pool_group = 0)
         : n_threads_(resolve_threads(n_threads)),
-          pool_(resolve_pool(n_threads_, private_pool)) {}
+          pool_(resolve_pool(n_threads_, pool_group)) {}
 
     int n_threads() const { return n_threads_; }
 
@@ -618,9 +616,9 @@ static constexpr int64_t MIN_HT_SIZE = 16;
 // build / coloring / apply_lut.
 class Solver {
 public:
-    explicit Solver(double n_threads, bool private_pool = false)
+    explicit Solver(double n_threads, int pool_group = 0)
         : n_threads_(resolve_threads(n_threads)),
-          pool_(resolve_pool(n_threads_, private_pool)) {}
+          pool_(resolve_pool(n_threads_, pool_group)) {}
 
     int n_threads() const { return n_threads_; }
 
@@ -1827,8 +1825,8 @@ PYBIND11_MODULE(_impl, m) {
         "Persistent threadpool wrapper for expand_labels + format_labels.\n"
         "One engine per pipeline; the pool and intermediate buffers are\n"
         "reused across calls.")
-        .def(py::init<double, bool>(), py::arg("n_threads") = -1.0,
-             py::arg("private_pool") = false)
+        .def(py::init<double, int>(), py::arg("n_threads") = -1.0,
+             py::arg("pool_group") = 0)
         .def_property_readonly("n_threads", &ExpandEngine::n_threads)
         .def("expand_labels", &ExpandEngine::expand_labels,
              py::arg("labels"), py::arg("p") = 2, py::arg("wrap") = false,
@@ -1907,8 +1905,8 @@ PYBIND11_MODULE(_impl, m) {
         "  0 < x < 1                  → fraction × os.cpu_count() (e.g. 0.5)\n"
         "  1                          → serial\n"
         "  N >= 1                     → exact thread count")
-        .def(py::init<double, bool>(), py::arg("n_threads") = -1.0,
-             py::arg("private_pool") = false)
+        .def(py::init<double, int>(), py::arg("n_threads") = -1.0,
+             py::arg("pool_group") = 0)
         .def_property_readonly("n_threads", &Solver::n_threads)
         .def("label", &Solver::label,
              py::arg("mask"), py::arg("n_colors") = 4,

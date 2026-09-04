@@ -75,13 +75,21 @@ def test_concurrent_engine_calls_neither_crash_nor_corrupt():
 
 
 def test_engines_share_one_thread_pool():
-    """Both engines resolve to the same thread count and so share a pool;
-    touching every entry point must not spawn a second set of workers."""
+    """A single-threaded program holds exactly one engine.
+
+    Engines are created only when calls actually contend, and the two
+    halves of one engine share a pool, so touching every entry point from
+    one thread must not add workers.
+    """
     from ncolor import _engines
     base = np.zeros((32, 32), np.int32)
     base[4:12, 4:12] = 1
     base[20:28, 20:28] = 2
+    before = len(_engines._all)
     ncolor.label(base)
     ncolor.expand_labels(base)
     ncolor.format_labels(base)
-    assert _engines._SOLVER.n_threads == _engines._EXPAND.n_threads
+    ncolor.connect(base)
+    assert len(_engines._all) == max(1, before)
+    primary = _engines._all[0]
+    assert primary._solver.n_threads == primary._expand.n_threads

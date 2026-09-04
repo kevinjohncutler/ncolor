@@ -1,99 +1,284 @@
-"""Engine objects, the process-wide default, and the lock that guards it.
+"""Engines, and the pool the module-level functions draw from.
 
 The C++ engines (``Solver`` for label / connect / color_graph,
 ``ExpandEngine`` for expand_labels / format_labels) each keep persistent
 scratch buffers and run on a thread pool. Only one call may be in flight
-per pool, so each engine takes its pool's mutex for the duration of a
-call.
+per pool, so a call holds its engine for its duration.
 
-The module-level functions share one default pair of engines, and so one
-pool: calls from several threads take turns, which is what the pool
-requires and what a single-image-at-a-time caller wants. Processing
-several images at once instead wants an :class:`Engine` per thread; each
-holds a pool and buffers of its own and so runs alongside the others.
+A call made while nothing else is running gets the full-width engine,
+which shares its pool the way the package always has: one image at a
+time is unchanged. Calls that overlap instead share a set of narrower
+engines whose threads add up to about one machine, so several images
+color at once without the pools fighting over the cores. Running one
+wide engine alongside the narrow ones is the worst of both, and measured
+slower than doing the images one after another, so the wide one sits out
+whenever anything else is in flight.
 
-The engines are created on first use, so a bare ``import ncolor`` starts
-no threads.
+The narrow engines are built only when calls actually overlap, so a
+single-threaded program holds exactly one engine. There are at most
+``NCOLOR_MAX_ENGINES`` of them (4 by default); past that callers wait,
+as they used to. That bounds the worker threads and the memory alike,
+since each engine keeps the scratch of the largest image it has seen.
+
+:class:`Engine` is the same thing by hand, for callers who would rather
+hold one per worker than share this pool.
 """
 from __future__ import annotations
 
+import os
 import threading
 
-# Guards creation of the default engines. The C++ side serializes the
-# calls themselves, so this is only for the check-then-set below.
-LOCK = threading.RLock()
-_SOLVER = None
-_EXPAND = None
+# Engines the module-level functions may create. Past this a call waits
+# for a free one rather than adding more; each engine also costs the
+# scratch of the largest image it sees (about 20 bytes per pixel), so
+# this bounds memory as much as it bounds threads.
+def _max_engines():
+    try:
+        n = int(os.environ.get("NCOLOR_MAX_ENGINES", "4"))
+    except ValueError:
+        n = 4
+    return max(1, n)
+
+
+_LOCK = threading.Lock()
+_all = []            # every engine created, in creation order
+_narrow = []         # the engines overlapping calls share
+_bound = 0           # engines handed to threads so far
+_in_flight = 0       # calls running right now
+_concurrent = False  # has more than one thread ever called?
+_next_group = 1      # pool group 0 is the process-wide default
+_tls = threading.local()
+
+# Kept for callers that reach for the lock directly.
+LOCK = _LOCK
+
+
+def _new_group():
+    """A pool group nobody else uses."""
+    global _next_group
+    g = _next_group
+    _next_group += 1
+    return g
+
+
+# Splitting concurrent calls across narrower engines pays only where a
+# single call cannot already use the whole machine. Measured with four
+# threads, against the same work done one after another: 1.3-2.2x on an
+# 18-core M5 Max and 1.3-1.5x on a 64-core Threadripper, but 0.9x on a
+# 16-core Ryzen and 0.8x on an 8-core i9, where one call scales well
+# enough that splitting only adds overhead. So it is on above 16 threads
+# and off at or below, where calls take turns exactly as they used to.
+# NCOLOR_AUTO_THREADS=0/1 forces it either way.
+_SPLIT_ABOVE = 16
+
+
+_split_cached = None
+
+
+def _auto_split():
+    """Whether overlapping calls should be spread over narrow engines.
+
+    Worked out once: it consults the calibration, which reads a file, and
+    this is on the path of every call.
+    """
+    global _split_cached
+    if _split_cached is None:
+        forced = os.environ.get("NCOLOR_AUTO_THREADS")
+        if forced is not None:
+            _split_cached = forced not in ("0", "", "false", "False")
+        else:
+            from ._backend import _smt
+            _split_cached = _smt.auto_threads() > _SPLIT_ABOVE
+    return _split_cached
+
+
+def _narrow_threads():
+    """Thread count for the engines that overlapping calls share.
+
+    They divide one machine between them, so all of them running at once
+    comes to about the core count rather than a multiple of it. Measured
+    on an 18-core machine, four threads coloring 1024 by 1024 images:
+    sharing a machine this way ran 2.0x faster than doing them one after
+    another, while adding the full-width engine to the mix (18 + 3 x 4
+    threads on 18 cores) was *slower* than serial, because the pools
+    spin against each other.
+    """
+    from ._backend import _smt
+    return max(1, _smt.auto_threads() // _max_engines())
+
+
+def _primary():
+    """The full-width engine, created on first use."""
+    with _LOCK:
+        if not _all:
+            _all.append(Engine(_pool_group=0))
+        return _all[0]
 
 
 def solver():
     """The process-wide ``Solver`` (label / connect / color_graph)."""
-    global _SOLVER
-    if _SOLVER is None:
-        with LOCK:
-            if _SOLVER is None:
-                from ._backend import Solver
-                _SOLVER = Solver()
-    return _SOLVER
+    return _primary()._solver
 
 
 def expand_engine():
     """The process-wide ``ExpandEngine`` (expand_labels / format_labels)."""
-    global _EXPAND
-    if _EXPAND is None:
-        with LOCK:
-            if _EXPAND is None:
-                from ._backend import ExpandEngine
-                _EXPAND = ExpandEngine()
-    return _EXPAND
+    return _primary()._expand
+
+
+def _bind():
+    """Give the calling thread an engine, and remember it.
+
+    Taken once per thread, and again for the thread holding the
+    full-width engine when a second thread turns up. Everything after
+    that is a thread-local read, because taking a lock per call cost more
+    than the call: four threads handing one lock back and forth measured
+    2.3 ms of overhead per call, several times the work itself.
+    """
+    global _concurrent, _bound
+    primary = _primary()
+    if not _auto_split():
+        # Calls take turns on the one engine, as they always have.
+        _tls.engine = primary
+        return primary
+    with _LOCK:
+        _bound += 1
+        if _bound > 1:
+            _concurrent = True
+        if not _concurrent:
+            _tls.engine = primary
+            return primary
+        _tls.engine = None
+        # Overlapping callers share the narrow engines: one machine's
+        # worth of threads between them, however many threads call.
+        if len(_narrow) < _max_engines():
+            eng = Engine(n_threads=_narrow_threads())
+            _narrow.append(eng)
+            _all.append(eng)
+        else:
+            # More callers than engines: they share, and take turns.
+            # Round-robin on the number handed out, so threads that
+            # arrive later spread over the engines instead of piling
+            # onto one (thread ids get recycled, so they cannot be the
+            # thing that distributes them).
+            eng = _narrow[(_bound - 1) % len(_narrow)]
+        _tls.engine = eng
+        return eng
+
+
+def _borrow():
+    """The engine this thread should use. No lock on the steady path.
+
+    Nothing else running means the full-width engine, whichever thread
+    asks, so a program that finishes its parallel phase goes back to full
+    speed. While calls overlap, everyone uses the narrow engines: a wide
+    pool running alongside them fights for the same cores and measured
+    slower than doing the images one after another.
+    """
+    if (_in_flight == 0 or not _auto_split()) and _all:
+        eng = _all[0]
+        _tls.last = eng
+        return eng
+    eng = getattr(_tls, "engine", None)
+    if eng is None or eng is (_all[0] if _all else None):
+        eng = _bind()
+    _tls.last = eng
+    return eng
+
+
+def _last_used():
+    """The engine that ran this thread's most recent call."""
+    return getattr(_tls, "last", None) or _primary()
 
 
 def release_buffers():
-    """Free the scratch memory the default engines keep between calls.
+    """Free the scratch memory the engines keep between calls.
 
     ncolor keeps the working set of the largest image it has processed
     (about 20 bytes per pixel, so 327 MB after one 4096 by 4096 image)
     allocated between calls, so repeated calls on same-sized images never
-    pay for allocation. Call this to give it back; the next call simply
-    reallocates. The thread pool is kept, so there is no start-up cost
-    afterwards. :class:`Engine` has a method of the same name for its own
-    buffers.
+    pay for allocation. This gives it back for every engine the module
+    functions have created; the next call simply reallocates. Thread
+    pools are kept, so there is no start-up cost afterwards.
+    :class:`Engine` has a method of the same name for its own buffers.
     """
-    with LOCK:
-        for engine in (_SOLVER, _EXPAND):
-            if engine is not None:
-                engine.release()
+    with _LOCK:
+        engines = list(_all)
+    for eng in engines:
+        eng.release_buffers()
+
+
+class _Borrowed:
+    """Yields the engine a call runs on."""
+
+    __slots__ = ("engine",)
+
+    def __init__(self, engine=None):
+        self.engine = engine
+
+    def __enter__(self):
+        global _in_flight
+        if self.engine is None:
+            self.engine = _borrow()
+        # Plain increments: a lock here cost more than the call itself,
+        # and a miscount only means one call picks the other engine.
+        _in_flight += 1
+        return self.engine
+
+    def __exit__(self, *exc):
+        global _in_flight
+        _in_flight -= 1
+        return False
+
+
+def _use(engine):
+    """Context manager yielding the engine a call should run on.
+
+    ``engine`` is an explicit :class:`Engine` to use as-is, or None to
+    borrow one from the pool.
+    """
+    return _Borrowed(engine)
+
+
+def release_buffers():
+    """Free the scratch memory the engines keep between calls.
+
+    ncolor keeps the working set of the largest image it has processed
+    (about 20 bytes per pixel, so 327 MB after one 4096 by 4096 image)
+    allocated between calls, so repeated calls on same-sized images never
+    pay for allocation. This gives it back for every engine the module
+    functions have created; the next call simply reallocates. Thread
+    pools are kept, so there is no start-up cost afterwards.
+    :class:`Engine` has a method of the same name for its own buffers.
+    """
+    with _LOCK:
+        engines = list(_all)
+    for eng in engines:
+        eng.release_buffers()
 
 
 class Engine:
-    """An independent engine, for coloring several images at once.
+    """An engine of one's own, with its own pool and scratch buffers.
 
-    The module-level functions all share one thread pool, so calls from
-    different threads queue behind each other. That is the right
-    arrangement for one image at a time, where a single call already uses
-    every core. To work on several images concurrently, give each thread
-    an ``Engine``: it holds its own pool and its own scratch buffers, so
-    it runs alongside the others.
-
-        import concurrent.futures as cf, ncolor
-
-        def run(image, engine=None):
-            return (engine or ncolor.Engine(n_threads=4)).label(image)
+    The module-level functions already spread concurrent calls over a
+    small pool of these, so most callers never need one. Hold one per
+    worker when the work is long-lived and you would rather size the
+    threads yourself than share the pool, or when more than
+    ``NCOLOR_MAX_ENGINES`` workers should run at once.
 
         engines = [ncolor.Engine(n_threads=4) for _ in range(4)]
-        with cf.ThreadPoolExecutor(4) as pool:
+        with ThreadPoolExecutor(4) as pool:
             out = list(pool.map(lambda a: a[0].label(a[1]),
                                 zip(engines, images)))
 
     Two things to size against each other. Threads: engines do not know
     about one another, so ``n_engines * n_threads`` should be about the
-    core count, not a multiple of it. Memory: each engine keeps the
-    working set of the largest image *it* has seen, roughly 20 bytes per
-    pixel, so four engines on 4096 by 4096 images hold about 1.3 GB
-    between them. :meth:`release_buffers` gives one engine's share back.
+    core count. Memory: each engine keeps the working set of the largest
+    image *it* has seen, roughly 20 bytes per pixel, so four engines on
+    4096 by 4096 images hold about 1.3 GB between them.
+    :meth:`release_buffers` gives one engine's share back.
 
     An ``Engine`` is safe to call from several threads; those calls take
-    turns, exactly as the module-level functions do.
+    turns.
 
     Parameters
     ----------
@@ -106,10 +291,13 @@ class Engine:
 
     __slots__ = ("_solver", "_expand", "_n_threads")
 
-    def __init__(self, n_threads=-1):
+    def __init__(self, n_threads=-1, *, _pool_group=None):
         from ._backend import ExpandEngine, Solver
-        self._solver = Solver(n_threads, private_pool=True)
-        self._expand = ExpandEngine(n_threads, private_pool=True)
+        # One pool per engine, shared by its two halves: they are never
+        # in a call at the same time, so they need only one between them.
+        group = _new_group() if _pool_group is None else _pool_group
+        self._solver = Solver(n_threads, pool_group=group)
+        self._expand = ExpandEngine(n_threads, pool_group=group)
         self._n_threads = self._solver.n_threads
 
     @property
@@ -149,15 +337,3 @@ class Engine:
 
     def __repr__(self):
         return f"<ncolor.Engine n_threads={self._n_threads}>"
-
-
-# ---- internals used by the wrappers ---------------------------------------
-
-def _solver_for(engine):
-    """The Solver to use: an Engine's own, or the process-wide default."""
-    return solver() if engine is None else engine._solver
-
-
-def _expand_for(engine):
-    """The ExpandEngine to use: an Engine's own, or the default."""
-    return expand_engine() if engine is None else engine._expand

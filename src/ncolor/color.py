@@ -6,19 +6,19 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._engines import _solver_for
+from ._engines import _use
 from .format import format_labels, _compact_wide_labels
 
 
 def _get_solver():
     """The process-wide ``Solver``.
 
-    The engine to use is normally chosen per call by ``_solver_for``;
-    this names the default one for tests and benchmarks that read its
-    accessors (stage timings, last LUT, soft pairs) after a call made
-    through the module-level functions.
+    The engine bound to the calling thread, which is the one that ran
+    that thread's last call, so tests and benchmarks can read its
+    accessors (stage timings, last LUT, soft pairs) afterwards.
     """
-    return _solver_for(None)
+    from ._engines import _last_used
+    return _last_used()._solver
 
 
 def label(lab, n=4, conn=1, max_depth=30, expand=True,
@@ -184,7 +184,6 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
             "(GeoDataFrame / GeoSeries / GeoJSON) use ncolor.geo.label().")
 
     lab_arr = np.asarray(lab)
-    solver = _solver_for(_engine)
 
     # Normalize weight_objective: accept str ("max"/"min"/"off") or int (+1/-1/0).
     if isinstance(weight_objective, str):
@@ -237,26 +236,31 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
         soft_radius=int(soft_radius),
         clean_mask=bool(clean_mask),
         capture_stages=bool(verbose))
-    # The engine serializes calls on its own pool; no lock needed here.
-    try:
-        out_array, n_used = solver.label(lab_arr, **call_kwargs)
-    except OverflowError:
-        # int64 / uint32 / uint64 / float input holding a value the
-        # int32 engine cannot represent. Rare, so it is handled off
-        # the fast path: compact the labels in numpy and go again.
-        lab_arr = _compact_wide_labels(lab_arr)
-        out_array, n_used = solver.label(lab_arr, **call_kwargs)
+    # The engine is held for the call and the accessor reads that follow,
+    # since those report on its most recent call.
+    with _use(_engine) as engine:
+        solver = engine._solver
+        try:
+            out_array, n_used = solver.label(lab_arr, **call_kwargs)
+        except OverflowError:
+            # int64 / uint32 / uint64 / float input holding a value the
+            # int32 engine cannot represent. Rare, so it is handled off
+            # the fast path: compact the labels in numpy and go again.
+            lab_arr = _compact_wide_labels(lab_arr)
+            out_array, n_used = solver.label(lab_arr, **call_kwargs)
+        stages = solver.get_last_stages() if verbose else ()
+        sv = solver.get_last_n_soft_violations() if verbose else 0.0
+        lut = solver.get_last_lut() if return_lut else None
+        conflicts = (solver.get_last_n_conflicts()
+                     if (check_conflicts or return_conflicts) else 0)
     out = out_array
 
     if verbose:
-        # Stage-level diagnostic summary. Activated by passing
-        # verbose=True; reads the stage timings captured by the cpp
-        # solver via capture_stages and prints a one-line shape +
-        # stage breakdown to stderr.
+        # Stage-level diagnostic summary, from the timings the cpp solver
+        # captured via capture_stages: a one-line shape + stage breakdown
+        # on stderr.
         import sys as _sys
-        stages = solver.get_last_stages()
         total = sum(ms for _, ms in stages) if stages else 0.0
-        sv = solver.get_last_n_soft_violations()
         _shape = "x".join(str(s) for s in lab_arr.shape)
         _cells = int(lab_arr.max()) if lab_arr.size else 0
         head = (f"[ncolor.label] ({_shape}, {_cells} cells)  n_used={n_used}"
@@ -265,17 +269,14 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
         _sys.stderr.write(head + "\n               " + breakdown + "\n")
 
     if return_lut or check_conflicts or return_conflicts:
-        lut = solver.get_last_lut() if return_lut else None
-        conflicts = solver.get_last_n_conflicts() \
-            if (check_conflicts or return_conflicts) else 0
         if check_conflicts and conflicts:
             raise ValueError(
                 f"Coloring conflict detected: {conflicts} adjacent pairs share a color.")
         if return_lut:
             if return_n and return_conflicts:
-                return lut, int(np.max(lut)) if lut.size else 0, conflicts
+                return lut, int(n_used), conflicts
             if return_n:
-                return lut, int(np.max(lut)) if lut.size else 0
+                return lut, int(n_used)
             if return_conflicts:
                 return lut, conflicts
             return lut
@@ -301,7 +302,8 @@ def connect(img, conn=1, _engine=None):
     :func:`ncolor.format_labels` first (the pairs would otherwise refer
     to renumbered labels).
     """
-    return _solver_for(_engine).connect(img, conn=int(conn))
+    with _use(_engine) as engine:
+        return engine._solver.connect(img, conn=int(conn))
 
 
 def connected_components(mask, conn=2):
@@ -407,13 +409,13 @@ def color_graph(edges, n_vertices=None, n=4, soft_edges=None, max_depth=30,
                 f"soft_edges must be an (E, 2) int array of 0-indexed "
                 f"vertex pairs; got shape {soft_arr.shape}")
 
-    solver = _solver_for(_engine)
-    colors, n_used = solver.color_graph(
-        edges_arr, int(n_vertices), n_colors=int(n),
-        max_depth=int(max_depth), soft_edges=soft_arr)
-
-    conflicts = solver.get_last_n_conflicts() \
-        if (check_conflicts or return_conflicts) else 0
+    with _use(_engine) as engine:
+        solver = engine._solver
+        colors, n_used = solver.color_graph(
+            edges_arr, int(n_vertices), n_colors=int(n),
+            max_depth=int(max_depth), soft_edges=soft_arr)
+        conflicts = (solver.get_last_n_conflicts()
+                     if (check_conflicts or return_conflicts) else 0)
     if check_conflicts and conflicts:
         raise ValueError(
             f"Coloring conflict detected: {conflicts} adjacent pairs share a color.")

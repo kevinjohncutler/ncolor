@@ -28,17 +28,16 @@ ncolor.release_buffers()                              # free the scratch kept be
 
 Expand-labels is on by default (so that close-but-not-touching cells tend to be assigned distinct colors). Pass `expand=False` for 3D inputs where cells can over-expand. Thanks to Ryan Peters ([@ryanirl](https://github.com/ryanirl)) for the original suggestion.
 
-Calls share one thread pool, so a single call already uses every core and calls from several threads take turns. To work on several images at once, give each thread an `ncolor.Engine`, which holds a pool and buffers of its own:
+Threading needs nothing special. A lone call uses every core; calls that overlap are handed narrower engines whose threads add up to about one machine, so several images color at once:
 
 ```python
 import concurrent.futures as cf, ncolor
 
-engines = [ncolor.Engine(n_threads=4) for _ in range(4)]
 with cf.ThreadPoolExecutor(4) as pool:
-    colored = list(pool.map(lambda a: a[0].label(a[1]), zip(engines, images)))
+    colored = list(pool.map(ncolor.label, images))   # 1.3-2x on 4 threads
 ```
 
-Size `n_engines * n_threads` to about the core count, and note each engine keeps the working set of the largest image it has seen (roughly 20 bytes per pixel).
+This pays off only where a single call cannot already use the whole machine, so it is on above 16 threads and off at or below, where calls take turns as they always have (`NCOLOR_AUTO_THREADS=0` or `1` forces it). Engines are built only when calls actually overlap, so a single-threaded program holds one, and once the parallel phase is over calls go back to full width. At most `NCOLOR_MAX_ENGINES` (4) are created; each keeps the working set of the largest image it has seen, roughly 20 bytes per pixel. `ncolor.Engine` does the same by hand for callers who would rather size the threads themselves.
 
 Any integer, bool or float label array is accepted; the cast to the engine's int32 runs in parallel inside the call. Labels beyond the int32 range are compacted automatically by `label` and `format_labels`. The engine keeps the scratch memory of the largest image it has processed until `release_buffers()` is called.
 
