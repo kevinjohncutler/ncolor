@@ -459,10 +459,12 @@ static inline void scan_inner_axis_dual_dispatch(
         uint64_t* ht_base, uint64_t base_mask,
         uint64_t* ht_soft, uint64_t soft_mask) {
     // 2D conn=1 r=1 base (N_BASE=2) is the dominant case; delta sizes
-    // 2/8/10 cover the realistic soft kernels (conn=1 r=2, conn=2 r=1,
-    // conn=2 r=2). 2D conn=2 r=1 base (N_BASE=4) with delta=8 covers
-    // the conn=2 r=1 → conn=2 r=2 path. 3D conn=1 r=1 base (N_BASE=3)
-    // with the default conn=2 r=2 soft kernel is delta=30.
+    // 2/10 cover conn=1 r=2 or conn=2 r=1, and the default conn=2 r=2.
+    // N_BASE=4, N_DELTA=8 covers a 2D conn=2 r=1 base widened to r=2.
+    // In 3D a conn=1 r=1 base has 3 offsets; the common soft kernels add
+    // 3 offsets (conn=1 r=2), 6 (conn=2 r=1), or 27 (conn=2 r=2).
+    // The last count is 27, not 30: 30 is the size of the whole soft
+    // kernel, including the 3 offsets already partitioned into the base.
     if (n_base == 2 && n_delta == 2)
         scan_inner_axis_dual_fast<T, 2, 2>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
     else if (n_base == 2 && n_delta == 8)
@@ -471,6 +473,12 @@ static inline void scan_inner_axis_dual_dispatch(
         scan_inner_axis_dual_fast<T, 2, 10>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
     else if (n_base == 4 && n_delta == 8)
         scan_inner_axis_dual_fast<T, 4, 8>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+    else if (n_base == 3 && n_delta == 3)
+        scan_inner_axis_dual_fast<T, 3, 3>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+    else if (n_base == 3 && n_delta == 6)
+        scan_inner_axis_dual_fast<T, 3, 6>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+    else if (n_base == 3 && n_delta == 27)
+        scan_inner_axis_dual_fast<T, 3, 27>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
     else if (n_base == 3 && n_delta == 30)
         scan_inner_axis_dual_fast<T, 3, 30>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
     else
@@ -543,8 +551,8 @@ static inline void scan_inner_axis_dispatch(
     }
 }
 
-// Internal scan kernel: walks one strip of axis-0, emits forward-neighbor
-// pairs into a single hashtable. Generic ND odometer — interior pixels use
+// Internal scan kernel: walks a contiguous range of inner-axis lines and
+// emits forward-neighbor pairs into a single hashtable. Generic ND odometer — interior pixels use
 // the pre-computed flat offsets in nb_flat; boundary pixels rebuild offsets
 // per-axis (with optional wrap). `Wrap` is templated so the boundary path
 // has no runtime cost when it's off.
@@ -553,7 +561,7 @@ inline void scan_band_unpadded(
         const T* lbl, const std::vector<int64_t>& shape,
         const int64_t* strides, const int64_t* nb_flat,
         const int8_t* nb_dc, int n_nbs,
-        int64_t outer_start, int64_t outer_end,
+        int64_t line_start, int64_t line_end,
         uint64_t* ht, uint64_t ht_mask,
         const int32_t* dist = nullptr,
         double* primary = nullptr, int32_t* counts = nullptr,
@@ -630,16 +638,20 @@ inline void scan_band_unpadded(
     const int64_t W = shape[inner];           // inner-axis length
     const uint32_t inner_bit = 1u << inner;
     int64_t coords[FIND_PAIRS_MAX_NDIM] = {0};
-    coords[0] = outer_start;
-    uint32_t outer_bnd = 0;                   // bnd mask for coords[0..ndim-2]
-    for (int d = 0; d < inner; ++d) {
-        if (coords[d] < radius || coords[d] >= shape[d] - radius) outer_bnd |= (1u << d);
+    int64_t q = line_start;
+    for (int d = inner - 1; d >= 0; --d) {
+        coords[d] = q % shape[d];
+        q /= shape[d];
     }
-    // Compute base flat offset for (coords[0..ndim-2], inner=0).
-    int64_t row_base = 0;
-    for (int d = 0; d < inner; ++d) row_base += coords[d] * strides[d];
-    const int64_t end_outer = outer_end;
-    while (coords[0] < end_outer) {
+    for (int64_t line = line_start; line < line_end; ++line) {
+        uint32_t outer_bnd = 0;               // bnd mask for coords[0..ndim-2]
+        for (int d = 0; d < inner; ++d) {
+            if (coords[d] < radius || coords[d] >= shape[d] - radius)
+                outer_bnd |= (1u << d);
+        }
+        // C-contiguous layout: each flattened outer coordinate owns one
+        // complete W-element row.
+        const int64_t row_base = line * W;
         if (outer_bnd != 0 || W < 2 * radius + 1) {
             // Full per-pixel boundary checks across the entire inner axis.
             for (int64_t x = 0; x < W; ++x) {
@@ -670,22 +682,11 @@ inline void scan_band_unpadded(
             }
         }
         // Advance the outer odometer (axes [0 .. ndim-2]).
-        if (ndim == 1) break;
         int d = inner - 1;
-        ++coords[d];
-        row_base += strides[d];
-        while (coords[d] >= shape[d] && d > 0) {
-            row_base -= coords[d] * strides[d];
+        while (d >= 0 && ++coords[d] >= shape[d]) {
             coords[d] = 0;
-            outer_bnd |= (1u << d);
             --d;
-            ++coords[d];
-            row_base += strides[d];
         }
-        if (coords[d] >= shape[d]) break;
-        const bool is_bnd = (coords[d] < radius || coords[d] >= shape[d] - radius);
-        if (is_bnd) outer_bnd |= (1u << d);
-        else outer_bnd &= ~(1u << d);
     }
 }
 
@@ -764,29 +765,31 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
         return counts_ptr ? counts_ptr + static_cast<size_t>(t) * ht_size : nullptr;
     };
 
-    if (n_threads == 1 || shape[0] < 2) {
+    int64_t n_lines = 1;
+    for (size_t d = 0; d + 1 < shape.size(); ++d) n_lines *= shape[d];
+    if (n_threads == 1 || n_lines < 2) {
         std::fill_n(hts_ptr, ht_size, HT_EMPTY);
         scan_band_unpadded<T, Wrap, Mode>(
             lbl, shape, strides.data(), nb_flat.data(),
-            nb_dc.data(), n_nbs, 0, shape[0],
+            nb_dc.data(), n_nbs, 0, n_lines,
             hts_ptr, ht_mask, dist,
             thread_primary(0), thread_counts(0), radius);
     } else {
         // Phase 1: per-worker scan + first-touch HT (NUCA-local).
         std::atomic<int> next{0};
-        const int64_t per = (shape[0] + n_threads - 1) / n_threads;
+        const int64_t per = (n_lines + n_threads - 1) / n_threads;
         pool.parallel([&]() {
             int t;
             while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_threads) {
                 uint64_t* ht = hts_ptr + static_cast<size_t>(t) * ht_size;
                 std::fill_n(ht, ht_size, HT_EMPTY);
                 // primary/counts only valid where ht[h] != HT_EMPTY; no init needed.
-                const int64_t z0 = static_cast<int64_t>(t) * per;
-                const int64_t z1 = std::min(z0 + per, shape[0]);
-                if (z0 < z1) {
+                const int64_t line0 = static_cast<int64_t>(t) * per;
+                const int64_t line1 = std::min(line0 + per, n_lines);
+                if (line0 < line1) {
                     scan_band_unpadded<T, Wrap, Mode>(
                         lbl, shape, strides.data(), nb_flat.data(),
-                        nb_dc.data(), n_nbs, z0, z1, ht, ht_mask,
+                        nb_dc.data(), n_nbs, line0, line1, ht, ht_mask,
                         dist, thread_primary(t), thread_counts(t), radius);
                 }
             }
@@ -957,7 +960,7 @@ inline void scan_band_unpadded_dual(
         const T* lbl, const std::vector<int64_t>& shape,
         const int64_t* strides, const int64_t* nb_flat,
         const int8_t* nb_dc, int n_base, int n_nbs, int n_delta_near,
-        int64_t outer_start, int64_t outer_end,
+        int64_t line_start, int64_t line_end,
         uint64_t* ht_base, uint64_t* ht_soft,
         uint64_t base_mask, uint64_t soft_mask,
         int radius) {
@@ -1019,15 +1022,18 @@ inline void scan_band_unpadded_dual(
     const int64_t W = shape[inner];
     const uint32_t inner_bit = 1u << inner;
     int64_t coords[FIND_PAIRS_MAX_NDIM] = {0};
-    coords[0] = outer_start;
-    uint32_t outer_bnd = 0;
-    for (int d = 0; d < inner; ++d) {
-        if (coords[d] < radius || coords[d] >= shape[d] - radius) outer_bnd |= (1u << d);
+    int64_t q = line_start;
+    for (int d = inner - 1; d >= 0; --d) {
+        coords[d] = q % shape[d];
+        q /= shape[d];
     }
-    int64_t row_base = 0;
-    for (int d = 0; d < inner; ++d) row_base += coords[d] * strides[d];
-    const int64_t end_outer = outer_end;
-    while (coords[0] < end_outer) {
+    for (int64_t line = line_start; line < line_end; ++line) {
+        uint32_t outer_bnd = 0;
+        for (int d = 0; d < inner; ++d) {
+            if (coords[d] < radius || coords[d] >= shape[d] - radius)
+                outer_bnd |= (1u << d);
+        }
+        const int64_t row_base = line * W;
         if (outer_bnd != 0 || W < 2 * radius + 1) {
             for (int64_t x = 0; x < W; ++x) {
                 const uint32_t bnd = outer_bnd |
@@ -1062,29 +1068,18 @@ inline void scan_band_unpadded_dual(
                 scan_pixel_checked(coords, inner_bit, row_base + x);
             }
         }
-        if (ndim == 1) break;
         int d = inner - 1;
-        ++coords[d];
-        row_base += strides[d];
-        while (coords[d] >= shape[d] && d > 0) {
-            row_base -= coords[d] * strides[d];
+        while (d >= 0 && ++coords[d] >= shape[d]) {
             coords[d] = 0;
-            outer_bnd |= (1u << d);
             --d;
-            ++coords[d];
-            row_base += strides[d];
         }
-        if (coords[d] >= shape[d]) break;
-        const bool is_bnd = (coords[d] < radius || coords[d] >= shape[d] - radius);
-        if (is_bnd) outer_bnd |= (1u << d);
-        else outer_bnd &= ~(1u << d);
     }
 }
 
 // Driver: same parallel structure as find_pairs_unpadded_impl but with
 // two hashtables per thread. Mode=Off only.
 template <typename T, bool Wrap = false>
-inline void find_pairs_dual_unpadded_impl(
+inline int find_pairs_dual_unpadded_impl(
         const T* lbl, const std::vector<int64_t>& shape,
         int base_conn, int base_radius, int soft_conn, int soft_radius,
         uint64_t base_ht_size, uint64_t soft_ht_size,
@@ -1105,7 +1100,7 @@ inline void find_pairs_dual_unpadded_impl(
         shape, base_conn, base_radius, soft_conn, soft_radius,
         strides, nb_flat, nb_dc, n_base, &n_delta_near);
     const int n_nbs = static_cast<int>(nb_flat.size());
-    if (n_nbs == 0) return;
+    if (n_nbs == 0) return 0;
     // The interior skip (scan_inner_axis_dual_fast) is exact only up to
     // soft radius 2: beyond that a far pair's witness chain can pass
     // through a third label. NCOLOR_NO_INTERIOR_SKIP=1 disables it for
@@ -1130,16 +1125,18 @@ inline void find_pairs_dual_unpadded_impl(
         soft_hts = soft_ht_scratch->data();
     } else { soft_local.resize(soft_total); soft_hts = soft_local.data(); }
 
-    if (n_threads == 1 || shape[0] < 2) {
+    int64_t n_lines = 1;
+    for (size_t d = 0; d + 1 < shape.size(); ++d) n_lines *= shape[d];
+    if (n_threads == 1 || n_lines < 2) {
         std::fill_n(base_hts, base_ht_size, HT_EMPTY);
         std::fill_n(soft_hts, soft_ht_size, HT_EMPTY);
         scan_band_unpadded_dual<T, Wrap>(
             lbl, shape, strides.data(), nb_flat.data(),
-            nb_dc.data(), n_base, n_nbs, n_delta_near, 0, shape[0],
+            nb_dc.data(), n_base, n_nbs, n_delta_near, 0, n_lines,
             base_hts, soft_hts, base_mask, soft_mask, radius);
     } else {
         std::atomic<int> next{0};
-        const int64_t per = (shape[0] + n_threads - 1) / n_threads;
+        const int64_t per = (n_lines + n_threads - 1) / n_threads;
         pool.parallel([&]() {
             int t;
             while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_threads) {
@@ -1147,12 +1144,12 @@ inline void find_pairs_dual_unpadded_impl(
                 uint64_t* hs = soft_hts + (size_t)t * soft_ht_size;
                 std::fill_n(hb, base_ht_size, HT_EMPTY);
                 std::fill_n(hs, soft_ht_size, HT_EMPTY);
-                const int64_t z0 = (int64_t)t * per;
-                const int64_t z1 = std::min(z0 + per, shape[0]);
-                if (z0 < z1) {
+                const int64_t line0 = (int64_t)t * per;
+                const int64_t line1 = std::min(line0 + per, n_lines);
+                if (line0 < line1) {
                     scan_band_unpadded_dual<T, Wrap>(
                         lbl, shape, strides.data(), nb_flat.data(),
-                        nb_dc.data(), n_base, n_nbs, n_delta_near, z0, z1,
+                        nb_dc.data(), n_base, n_nbs, n_delta_near, line0, line1,
                         hb, hs, base_mask, soft_mask, radius);
                 }
             }
@@ -1185,9 +1182,11 @@ inline void find_pairs_dual_unpadded_impl(
                                (int32_t)(key & 0xFFFFFFFFull));
     }
     out_soft.reserve(64);
+    uint64_t soft_occupancy = 0;
     for (uint64_t h = 0; h < soft_ht_size; ++h) {
         const uint64_t key = soft_hts[h];
         if (key == HT_EMPTY) continue;
+        ++soft_occupancy;
         // A soft pair that is also a hard pair can never be violated; it
         // only distorts the soft weights. Dropping it also makes the soft
         // set independent of the interior skip above, which may or may
@@ -1197,11 +1196,20 @@ inline void find_pairs_dual_unpadded_impl(
         out_soft.emplace_back((int32_t)(key >> 32),
                                (int32_t)(key & 0xFFFFFFFFull));
     }
+    // A completely full private table can drop later unseen keys. If any
+    // private table filled, its complete key set also fills the fixed-size
+    // root during the union merge, so root occupancy detects both scan-time
+    // and merge-time overflow. Report each family independently; the caller
+    // doubles only the table(s) that filled and reruns the fused scan.
+    int full_mask = 0;
+    if (out_base.size() == base_ht_size) full_mask |= 1;
+    if (soft_occupancy == soft_ht_size) full_mask |= 2;
+    return full_mask;
 }
 
 // Public entry — wraps Wrap dispatch.
 template <typename T>
-inline void find_pairs_dual_nd_unpadded(
+inline int find_pairs_dual_nd_unpadded(
         const T* lbl, const std::vector<int64_t>& shape,
         int base_conn, int base_radius, int soft_conn, int soft_radius,
         uint64_t base_ht_size, uint64_t soft_ht_size,
@@ -1213,16 +1221,16 @@ inline void find_pairs_dual_nd_unpadded(
     out_base.clear();
     out_soft.clear();
     const int ndim = static_cast<int>(shape.size());
-    if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM) return;
-    if (base_conn < 1 || base_conn > ndim) return;
-    if (soft_conn < 1 || soft_conn > ndim) return;
+    if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM) return 0;
+    if (base_conn < 1 || base_conn > ndim) return 0;
+    if (soft_conn < 1 || soft_conn > ndim) return 0;
     if (wrap) {
-        find_pairs_dual_unpadded_impl<T, true>(
+        return find_pairs_dual_unpadded_impl<T, true>(
             lbl, shape, base_conn, base_radius, soft_conn, soft_radius,
             base_ht_size, soft_ht_size, n_threads, pool,
             out_base, out_soft, base_ht_scratch, soft_ht_scratch);
     } else {
-        find_pairs_dual_unpadded_impl<T, false>(
+        return find_pairs_dual_unpadded_impl<T, false>(
             lbl, shape, base_conn, base_radius, soft_conn, soft_radius,
             base_ht_size, soft_ht_size, n_threads, pool,
             out_base, out_soft, base_ht_scratch, soft_ht_scratch);

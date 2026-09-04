@@ -130,6 +130,29 @@ and versions follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- **One `label()` call could inherit the previous call's soft
+  constraints.** The engine is a process-global singleton, and the soft
+  pair list was cleared by the branches that build one rather than at
+  the start of the call. A call using `weight_objective` or
+  `min_contact` therefore reused the pairs of whatever image ran
+  before; those are label ids of a different image, and the ones that
+  happened to fall inside the new label range were applied as soft
+  constraints. Out-of-range ids were already dropped, so this was never
+  a memory error, but the coloring of the second image depended on the
+  first. The list is now cleared before the branch runs.
+- **Hard edges could be dropped when the soft kernel did not contain
+  the hard one.** The fused scan enumerates one offset set at the soft
+  connectivity and radius and marks the subset that is hard, which
+  cannot represent a hard kernel with offsets outside the soft one
+  (`conn=2, connect_radius=1` against `soft_conn=1, soft_radius=2`, and
+  the mirror case). Those combinations now scan each kernel
+  independently and subtract the hard pairs from the soft set; the
+  fused path is used only when the soft kernel contains the hard one.
+- **The fused scan now retries when a hash table fills.** The
+  single-kernel scan already doubled its table and rescanned; the fused
+  path did not, so a graph with more distinct adjacencies than the
+  initial estimate could silently lose pairs. Each table's occupancy is
+  reported separately and only the one that filled is doubled.
 - **Out-of-bounds read in `wrap=True` adjacency scans** when an axis is
   shorter than the neighbor radius (a `connect_radius` or `soft_radius`
   of 2 on an image with a dimension of 1 or 2): the wrap-around was a

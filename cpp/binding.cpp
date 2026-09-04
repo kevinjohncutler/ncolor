@@ -16,10 +16,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -1020,6 +1022,14 @@ public:
             std::vector<std::pair<int32_t, int32_t>> pairs;
             std::vector<double> pair_primary;
             std::vector<int32_t> pair_counts;
+            // Start every call with an empty soft list. Only some branches
+            // below produce one, and the Solver is a process-global
+            // singleton: without this, a call taking the weighted or
+            // min_contact branch would inherit the previous call's soft
+            // pairs. Those are label ids of a different image, so the ones
+            // that happen to fall inside the new label range get applied
+            // as soft constraints and can push the color count up.
+            fused_soft_pairs_.clear();
             if (wobj != 0) {
                 // Fused weighted find_pairs: same parallel scan computes
                 // a per-pair reducer over (d_i + d_j) at boundary pixels.
@@ -1081,6 +1091,8 @@ public:
                 }
                 pairs.resize(kept);
             } else if (soft_conn > 0 && soft_radius > 0 &&
+                        soft_conn >= conn &&
+                        soft_radius >= connect_radius &&
                         (soft_conn > conn || soft_radius > connect_radius) &&
                         max_label > 0) {
                 // Fused base+soft pair-find: one pixel walk emits both
@@ -1101,18 +1113,53 @@ public:
                     2 * n_fwd_base * (int64_t)max_label;
                 const int64_t soft_ht_raw =
                     2 * n_fwd_delta * (int64_t)max_label;
-                const uint64_t base_ht_size = (uint64_t)ipow2_ge(
+                uint64_t base_ht_size = (uint64_t)ipow2_ge(
                     std::max<int64_t>(base_ht_raw, MIN_HT_SIZE));
-                const uint64_t soft_ht_size = (uint64_t)ipow2_ge(
+                uint64_t soft_ht_size = (uint64_t)ipow2_ge(
                     std::max<int64_t>(soft_ht_raw, MIN_HT_SIZE));
-                ncolor_cpp::find_pairs_dual_nd_unpadded<int32_t>(
-                    expanded, shape, conn, connect_radius,
-                    soft_conn, soft_radius,
-                    base_ht_size, soft_ht_size,
-                    n_threads_, *pool_, wrap,
-                    pairs, fused_soft_pairs_,
-                    /*base_ht_scratch=*/&fp_ht_buf_,
-                    /*soft_ht_scratch=*/&fp_soft_ht_buf_);
+                for (;;) {
+                    const int full =
+                        ncolor_cpp::find_pairs_dual_nd_unpadded<int32_t>(
+                            expanded, shape, conn, connect_radius,
+                            soft_conn, soft_radius,
+                            base_ht_size, soft_ht_size,
+                            n_threads_, *pool_, wrap,
+                            pairs, fused_soft_pairs_,
+                            /*base_ht_scratch=*/&fp_ht_buf_,
+                            /*soft_ht_scratch=*/&fp_soft_ht_buf_);
+                    if (full == 0) break;
+                    bool can_retry = true;
+                    if ((full & 1) != 0) {
+                        if (base_ht_size >= HT_SIZE_CAP) can_retry = false;
+                        else base_ht_size <<= 1;
+                    }
+                    if ((full & 2) != 0) {
+                        if (soft_ht_size >= HT_SIZE_CAP) can_retry = false;
+                        else soft_ht_size <<= 1;
+                    }
+                    if (!can_retry)
+                        throw std::overflow_error(
+                            "Solver.label: adjacency table exceeded safety cap");
+                }
+            } else if (soft_conn > 0 && soft_radius > 0 &&
+                       (soft_conn > conn || soft_radius > connect_radius) &&
+                       max_label > 0) {
+                // The hard and soft kernels are incomparable: one has the
+                // richer connectivity while the other has the larger radius.
+                // The dual builder enumerates a containing soft kernel, so it
+                // cannot represent this union. Scan each kernel independently
+                // and remove hard pairs from the soft preference set.
+                pairs = find_pairs_(expanded, shape, conn, wrap,
+                                    max_label, connect_radius);
+                auto soft_all = find_pairs_(expanded, shape, soft_conn, wrap,
+                                            max_label, soft_radius);
+                std::sort(pairs.begin(), pairs.end());
+                std::sort(soft_all.begin(), soft_all.end());
+                fused_soft_pairs_.clear();
+                std::set_difference(
+                    soft_all.begin(), soft_all.end(),
+                    pairs.begin(), pairs.end(),
+                    std::back_inserter(fused_soft_pairs_));
             } else {
                 // Unified pair-find: `connect_radius` widens the
                 // neighbor offset window (Chebyshev distance) for

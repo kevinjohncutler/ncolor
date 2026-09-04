@@ -85,3 +85,49 @@ def test_soft_pairs_exclude_hard_pairs():
     hard = {tuple(p) for p in ncolor.connect(m).tolist()}
     assert soft and hard
     assert not (soft & hard)
+
+
+@pytest.mark.parametrize(
+    "hard_conn,hard_radius,soft_conn,soft_radius,delta",
+    [
+        (2, 1, 1, 2, (1, 1)),  # hard diagonal absent from axial soft kernel
+        (1, 2, 2, 1, (0, 2)),  # hard radius-2 offset absent from r=1 soft kernel
+    ],
+)
+def test_incomparable_hard_and_soft_kernels_keep_hard_edges(
+        hard_conn, hard_radius, soft_conn, soft_radius, delta):
+    """A fused scan is valid only when the soft kernel contains the hard one."""
+    m = np.zeros((7, 7), np.int32)
+    p = (3, 2)
+    q = (p[0] + delta[0], p[1] + delta[1])
+    m[p] = 1
+    m[q] = 2
+
+    lut = ncolor.label(
+        m, n=2, expand=False, format_input=False, return_lut=True,
+        conn=hard_conn, connect_radius=hard_radius,
+        soft_conn=soft_conn, soft_radius=soft_radius,
+    )
+    assert lut[1] != lut[2]
+
+
+def test_dual_scan_retries_when_base_hash_table_fills():
+    """The fused path must not silently drop hard pairs from a full table."""
+    n_labels = 16
+    ii, jj = np.triu_indices(n_labels, k=1)
+    edges = np.column_stack((ii + 1, jj + 1)).astype(np.int32)
+
+    # Every label pair appears as an isolated horizontal contact. There are
+    # 120 hard edges, more than the dual path's initial 64-slot base table.
+    # Blank rows prevent contacts between neighboring encoded pairs.
+    m = np.zeros((2 * len(edges), 3), np.int32)
+    m[::2, :2] = edges
+
+    assert len(ncolor.connect(m, conn=1)) == len(edges)
+    lut, n_used, conflicts = ncolor.label(
+        m, n=n_labels, expand=False, format_input=False,
+        return_lut=True, return_n=True, return_conflicts=True,
+    )
+    assert conflicts == 0
+    assert n_used == n_labels
+    assert np.all(lut[edges[:, 0]] != lut[edges[:, 1]])
