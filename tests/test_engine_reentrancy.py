@@ -75,17 +75,32 @@ def test_engines_are_independent():
 
 
 def test_many_threads_on_one_engine_are_serialized_not_corrupted():
-    """Sharing an Engine across threads is allowed; calls take turns."""
+    """Sharing an Engine across threads is allowed; calls take turns.
+
+    Checked for validity, not for a matching coloring. The picker races
+    several searches under a wall-clock budget, so a loaded machine can
+    get a different, equally valid coloring of the same image: measured
+    directly, the alternatives had zero conflicts, the same foreground
+    and the same four colors, and differed only in which cell got which.
+    Asserting equality here makes the test fail under load and prove
+    nothing about corruption, which is what it is for.
+    """
     eng = ncolor.Engine(n_threads=2)
     images = [_image(s) for s in range(4)]
-    refs = [eng.label(m) for m in images]
+    fgs = [np.asarray(eng.label(m)) != 0 for m in images]
     errors = []
 
     def work(i):
         try:
             for _ in range(4):
-                if not np.array_equal(eng.label(images[i]), refs[i]):
-                    errors.append(i)
+                out, n, conflicts = eng.label(images[i], return_n=True,
+                                              return_conflicts=True)
+                out = np.asarray(out)
+                colors = sorted(set(np.unique(out).tolist()) - {0})
+                if (conflicts
+                        or not np.array_equal(out != 0, fgs[i])
+                        or colors != list(range(1, n + 1))):
+                    errors.append((i, int(conflicts), int(n), colors[:6]))
         except BaseException as e:  # noqa: BLE001
             errors.append(repr(e))
 
