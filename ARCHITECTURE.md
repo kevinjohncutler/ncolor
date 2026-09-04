@@ -86,7 +86,7 @@ does. `cpp/ncolor.hpp` includes all of them and
 | `cc_label.hpp` | Connected-components labeling (drop-in for `skimage.measure.label`) |
 | `format_labels.hpp` | Compact non-sequential labels to `1..N`; range-checked parallel casts from bool, any integer width and float |
 | `color.hpp` | BFS coloring + Welsh-Powell + repair |
-| `picker.hpp` | The coloring picker: the per-color-count race of strategies that `label` and `color_graph` run |
+| `picker.hpp` | The coloring picker: the per-color-count race of strategies that `label` and `color_graph` run. The winner is the lowest-numbered search that succeeds, and a search is abandoned only once a lower-numbered one has won, so the coloring does not depend on the thread schedule |
 | `bb_dsatur.hpp` | Iterative branch-and-bound exact DSATUR for the race |
 | `tabucol.hpp`, `hea.hpp`, `kempe_sa.hpp`, `clique_lb.hpp` | Picker fallbacks: TabuCol, HEA, Kempe SA, clique lower bound |
 | `soft_color.hpp` | Soft-edge local search (ILS + triangle weights) |

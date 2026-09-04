@@ -70,19 +70,46 @@ def verdict(lo, hi, band=0.02):
     return "same"
 
 
-def report(root, detail=False):
+def report(root, detail=False, pairs=(("base", "cand"),)):
     rng = np.random.default_rng(0)
     hosts = sorted(p for p in Path(root).iterdir() if p.is_dir())
     all_rows = []
 
     for h in hosts:
         data = load(h)
-        base, cand = data["serial"].get("base"), data["serial"].get("cand")
+        for a_name, b_name in pairs:
+            report_pair(h, data, a_name, b_name, rng, detail, all_rows,
+                        len(pairs) > 1)
+    summarize(all_rows)
+
+
+def summarize(all_rows):
+    if not all_rows:
+        return
+    by_pair = defaultdict(list)
+    for row in all_rows:
+        by_pair[row[0]].append(row)
+    print("\n### All hosts together\n")
+    print("| comparison | measurements | geometric mean | faster | slower |")
+    print("|---|---|---|---|---|")
+    for pair, rows in by_pair.items():
+        r = np.array([x[6] for x in rows])
+        print(f"| {pair} | {len(rows)} | {np.exp(np.mean(np.log(r))):.3f}x | "
+              f"{sum(1 for x in rows if verdict(x[7], x[8]) == 'faster')} | "
+              f"{sum(1 for x in rows if verdict(x[7], x[8]) == 'SLOWER')} |")
+
+
+def report_pair(h, data, a_name, b_name, rng, detail, all_rows, multi):
+    """Speedup of b over a on one host."""
+    if True:
+        base, cand = data["serial"].get(a_name), data["serial"].get(b_name)
+        label = f"{a_name} -> {b_name}"
         if not base or not cand:
-            print(f"\n### {h.name}: incomplete\n")
-            continue
+            if not multi:
+                print(f"\n### {h.name}: incomplete\n")
+            return
         reps = {c: len(v[OPS[0]]) for c, v in base.items()}
-        print(f"\n### {h.name}  ({min(reps.values())}-{max(reps.values())} "
+        print(f"\n### {h.name}: {label}  ({min(reps.values())}-{max(reps.values())} "
               f"repetitions per case and op, per build)\n")
 
         rows = []
@@ -93,7 +120,7 @@ def report(root, detail=False):
                 pt, lo, hi = boot_ratio(base[case][op], cand[case][op], rng)
                 rows.append((case, op, statistics.median(base[case][op]),
                              statistics.median(cand[case][op]), pt, lo, hi))
-        all_rows += [(h.name,) + r for r in rows]
+        all_rows += [(label, h.name) + r for r in rows]
 
         ratios = np.array([r[4] for r in rows])
         gm = float(np.exp(np.mean(np.log(ratios))))
@@ -116,13 +143,13 @@ def report(root, detail=False):
               f"{min(ratios):.2f}x |")
 
         if slower:
-            print(f"\nRegressions on {h.name}:\n")
+            print(f"\nRegressions on {h.name} ({label}):\n")
             print("| case | op | base ms | cand ms | speedup | 95% CI |")
             print("|---|---|---|---|---|---|")
             for c, o, b, cd, pt, lo, hi in sorted(slower, key=lambda r: r[4]):
                 print(f"| {c} | {o} | {b:.3f} | {cd:.3f} | {pt:.3f}x | {lo:.3f} to {hi:.3f} |")
 
-        cb, cc = data["concurrent"].get("base"), data["concurrent"].get("cand")
+        cb, cc = data["concurrent"].get(a_name), data["concurrent"].get(b_name)
         if cb and cc:
             crows = []
             for case in sorted(cb):
@@ -143,20 +170,13 @@ def report(root, detail=False):
                       f"{lo:.3f} to {hi:.3f} | {verdict(lo, hi)} |")
             print("\n</details>")
 
-    if all_rows:
-        r = np.array([x[5] for x in all_rows])
-        print(f"\n### All hosts together\n")
-        print(f"| metric | value |")
-        print(f"|---|---|")
-        print(f"| measurements | {len(all_rows)} |")
-        print(f"| geometric mean speedup | {np.exp(np.mean(np.log(r))):.3f}x |")
-        print(f"| faster beyond noise | {sum(1 for x in all_rows if verdict(x[6], x[7]) == 'faster')} |")
-        print(f"| slower beyond noise | {sum(1 for x in all_rows if verdict(x[6], x[7]) == 'SLOWER')} |")
-
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default="bench_outputs/ab")
     ap.add_argument("--detail", action="store_true")
+    ap.add_argument("--pairs", default="base:cand",
+                    help="comma-separated a:b comparisons, e.g. base:mid,mid:cand")
     a = ap.parse_args()
-    report(a.dir, a.detail)
+    report(a.dir, a.detail,
+           tuple(tuple(x.split(":")) for x in a.pairs.split(",")))

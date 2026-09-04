@@ -1,46 +1,52 @@
 #!/usr/bin/env bash
-# Paired A/B of two ncolor trees on one machine.
+# Paired A/B of two or more ncolor trees on one machine.
 #
-#   bench/ab_bench.sh <base_dir> <cand_dir> <corpus.npz> <out_dir> <reps>
+#   bench/ab_bench.sh <corpus.npz> <out_dir> <reps> name=dir [name=dir ...]
 #
-# Both trees are built, then measured in alternating order, one
-# repetition at a time, so thermal drift and background load land on
-# both sides equally. PY overrides the interpreter.
+# Every tree is built, then measured in a rotating order, one repetition
+# at a time, so thermal drift and background load land on all of them
+# equally and no tree always follows the same one. PY overrides the
+# interpreter.
 set -euo pipefail
-BASE=$1; CAND=$2; CORPUS=$3; OUT=$4; REPS=${5:-6}
+CORPUS=$1; OUT=$2; REPS=$3; shift 3
+TREES=("$@")
 PY=${PY:-$HOME/.pyenv/shims/python}
-RUNNER="$CAND/bench/ab_run.py"          # one measurement script for both
+# One measurement script for every tree, taken from the last one given.
+RUNNER="${TREES[-1]#*=}/bench/ab_run.py"
 mkdir -p "$OUT"
 
-build() {
-  local d=$1 tag=$2
-  [ -n "$(ls "$d"/src/ncolor/_backend/_impl*.so 2>/dev/null)" ] && return 0
-  ( cd "$d"
-    SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION:-2.0.3.dev0} \
-    NCOLOR_NO_CALIBRATE=1 "$PY" setup.py build_ext --inplace > "build_$tag.log" 2>&1 \
-      || { tail -30 "build_$tag.log"; exit 1; } )
-  echo "[$(hostname -s)] built $tag"
-}
-build "$BASE" base
-build "$CAND" cand
+for spec in "${TREES[@]}"; do
+  name=${spec%%=*}; d=${spec#*=}
+  if [ -z "$(ls "$d"/src/ncolor/_backend/_impl*.so 2>/dev/null)" ]; then
+    ( cd "$d"
+      SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION:-2.0.3.dev0} \
+      NCOLOR_NO_CALIBRATE=1 "$PY" setup.py build_ext --inplace > "build_$name.log" 2>&1 \
+        || { tail -30 "build_$name.log"; exit 1; } )
+    echo "[$(hostname -s)] built $name"
+  fi
+done
 
-run() {  # run <tree> <label> <mode> <outfile> [shuffle-seed]
+run() {  # run <tree> <name> <mode> <outfile> [shuffle-seed]
   NCOLOR_NO_CALIBRATE=1 PYTHONPATH="$1/src" "$PY" "$RUNNER" \
     --corpus "$CORPUS" --build "$2" --mode "$3" --out "$4" --shuffle "${5:--1}"
 }
 
-run "$BASE" base verify "$OUT/verify_base.json"
-run "$CAND" cand verify "$OUT/verify_cand.json"
+for spec in "${TREES[@]}"; do
+  name=${spec%%=*}; d=${spec#*=}
+  run "$d" "$name" verify "$OUT/verify_$name.json"
+done
 
+n=${#TREES[@]}
 for r in $(seq 1 "$REPS"); do
-  if [ $((r % 2)) -eq 1 ]; then order="base cand"; else order="cand base"; fi
-  for who in $order; do
-    if [ "$who" = base ]; then d=$BASE; else d=$CAND; fi
-    # Same order for both builds within a repetition, a different one
-    # each repetition, so no case keeps sitting behind the same
-    # neighbor.
-    run "$d" "$who" serial     "$OUT/serial_${who}_r${r}.json" "$r"
-    run "$d" "$who" concurrent "$OUT/conc_${who}_r${r}.json"   "$r"
+  # Rotate which tree goes first, so none of them is always warmed by
+  # the same neighbor.
+  for k in $(seq 0 $((n - 1))); do
+    spec=${TREES[$(( (r + k) % n ))]}
+    name=${spec%%=*}; d=${spec#*=}
+    # Same case order for every tree within a repetition, a different
+    # one each repetition.
+    run "$d" "$name" serial     "$OUT/serial_${name}_r${r}.json" "$r"
+    run "$d" "$name" concurrent "$OUT/conc_${name}_r${r}.json"   "$r"
   done
 done
-echo "[$(hostname -s)] A/B done: $REPS reps in $OUT"
+echo "[$(hostname -s)] A/B done: $REPS reps over $n trees in $OUT"

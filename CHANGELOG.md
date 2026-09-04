@@ -171,6 +171,29 @@ and versions follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- **`label` returns the same coloring every time.** The picker races
+  several searches per color count and keeps the lowest-numbered one
+  that succeeds, but it abandoned every other search the moment any of
+  them landed. That let the thread schedule pick the winner: a
+  low-numbered search that would have won was cut off by a high-numbered
+  one that happened to finish first, so the same image came back with
+  different, equally valid, colorings from one call to the next. It
+  showed up as flaky output on a busy machine and only above one thread.
+
+  A search is now abandoned only once a *lower-numbered* one has
+  succeeded, which by definition cannot change the answer. The early
+  exit is kept, so the race still ends as soon as the first slot is
+  settled rather than running all sixteen to their budgets, and coloring
+  is no slower.
+
+  `ncolor.label` is now bit-identical across machines: the same twenty
+  images gave byte-identical colorings, and the same number of colors,
+  on an Apple M5 Max, an Intel i9-9900K, an AMD Ryzen 7950X and a
+  Threadripper 3995WX, at each machine's own thread count (8, 16, 18 and
+  64) and at a fixed four. One thread is the exception, and by design:
+  it runs the picker's sequential path, a different algorithm rather
+  than a different schedule.
+
 - **One `label()` call could inherit the previous call's soft
   constraints.** The engine is a process-global singleton, and the soft
   pair list was cleared by the branches that build one rather than at

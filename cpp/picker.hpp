@@ -197,13 +197,41 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
             const int32_t* ip = indptr_.data();
             const int32_t* ix = indices_.data();
 
-            // Shared early-exit flag: as soon as any parallel
-            // attempt finds a 0-conflict coloring, other workers
-            // (a) skip subsequent slots and (b) abort any
-            // in-flight per-attempt tabucol. Without (b), race
-            // latency = slowest worker's full tabucol budget; with
-            // it, race latency = first success.
-            std::atomic<bool> winner_found{false};
+            // Lowest slot index that has succeeded so far, or
+            // attempts_per_n while none has.
+            //
+            // The winner is the lowest successful index, so a slot may
+            // be abandoned once a *lower-numbered* one has won: its
+            // result could not have been used. Abandoning on any
+            // success, which is what this did, let thread scheduling
+            // decide the answer, because a low slot that would have
+            // won got cut off by a high one that happened to finish
+            // first. That is what made ncolor.label return different
+            // (valid) colorings for the same image from one call to
+            // the next, and only above one thread.
+            //
+            // The early exit itself is kept: every slot above the
+            // current best still stops immediately, both by not being
+            // started and by having its in-flight tabucol cancelled,
+            // so the race still ends as soon as slot 0 is settled
+            // rather than running all 16 to their full budget.
+            std::atomic<int> best_ok{attempts_per_n};
+            std::vector<std::atomic<bool>> slot_cancel(attempts_per_n);
+            for (auto& f : slot_cancel) {
+                f.store(false, std::memory_order_relaxed);
+            }
+            // Publish idx as the best if it is lower than what is
+            // there, then cancel everything above it.
+            auto claim_success = [&](int idx) {
+                int prev = best_ok.load(std::memory_order_relaxed);
+                while (idx < prev
+                       && !best_ok.compare_exchange_weak(
+                              prev, idx, std::memory_order_relaxed)) {
+                }
+                for (int j = idx + 1; j < attempts_per_n; ++j) {
+                    slot_cancel[j].store(true, std::memory_order_relaxed);
+                }
+            };
 
             // Run-one-attempt body factored out so we can call it
             // once sequentially as a warmup before paying pool-
@@ -346,10 +374,13 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 pool_->parallel([&]() {
                     int idx;
                     while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < attempts_per_n) {
-                        if (winner_found.load(std::memory_order_relaxed)) break;
+                        // Indices only grow for this worker, so once
+                        // one is above the best it took, so is the
+                        // rest of its share.
+                        if (idx > best_ok.load(std::memory_order_relaxed)) break;
                         const auto t0 = std::chrono::steady_clock::now();
                         const bool ok_slot = run_one_attempt(
-                            idx, &winner_found, /*allow_tabucol=*/true,
+                            idx, &slot_cancel[idx], /*allow_tabucol=*/true,
                             race_deadline_ns);
                         if (dbg_slots) {
                             const auto t1 = std::chrono::steady_clock::now();
@@ -357,7 +388,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                             slot_done[idx] = ok_slot ? 1 : 2;
                         }
                         if (ok_slot) {
-                            winner_found.store(true, std::memory_order_relaxed);
+                            claim_success(idx);
                         }
                     }
                 });
