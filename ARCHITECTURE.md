@@ -166,6 +166,37 @@ dominates dispatch. The C++ engine's primary value is therefore at
 small-to-medium sizes (interactive use, viewer pipelines) and on macOS
 (where numba could only build the `workqueue` layer).
 
+### Where the remaining time goes
+
+Measured on an idle i9-9900K, where repeated runs agree to 0.1 ms, and
+on an M5 Max. Figures below are the M5.
+
+| case | total | expand | find_pairs | of which the soft kernel |
+|---|---|---|---|---|
+| 2D 2048² | 6.2 ms | 3.6 | 1.1 | 0.3 |
+| 3D 256³ | 59 ms | 27 | 23.0 | 19.6 |
+
+Two things dominate. Expand runs at 30–37 GB/s effective, near what
+these machines give for a separable sweep over two int32 arrays, so it
+is bandwidth-bound rather than badly written. The soft kernel is the
+other: 85% of `find_pairs` in 3D and a third of total `label` time,
+because the default `soft_conn=2, soft_radius=2` reads 33 offsets per
+voxel against 3 for the hard graph.
+
+A finer version of the interior skip was tried on the soft kernel and
+reverted. Instead of skipping every distance-2 offset only when all
+distance-1 neighbors match, each far offset can be skipped on its own
+whenever the neighbor one step along it matches; the pair it would emit
+is emitted from that neighbor instead. The rule is sound (checked
+against exhaustive enumeration on 120 random images, and by diffing
+full pair sets over 426 image and kernel combinations), but it needs a
+runtime bound inside a loop the compiler currently unrolls with
+constant offsets. Across four implementations it bought up to 12% of
+3D `find_pairs` while costing 20–35% of the much smaller 2D one, so it
+never became a clean win. Anyone resuming it should keep the offset
+counts on both sides of the near/far split compile-time constants so
+both loops stay fully unrolled.
+
 ## Calibration cache & NAS-mounted source
 
 `ncolor` stores two things in the per-user cache directory resolved by
