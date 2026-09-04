@@ -182,9 +182,21 @@ and versions follow [semantic versioning](https://semver.org/).
 
   A search is now abandoned only once a *lower-numbered* one has
   succeeded, which by definition cannot change the answer. The early
-  exit is kept, so the race still ends as soon as the first slot is
-  settled rather than running all sixteen to their budgets, and coloring
-  is no slower.
+  exit is kept, so the race still ends as soon as the lowest slot is
+  settled rather than running all sixteen to their budgets.
+
+  Measured against the same tree without the change, 416 paired
+  measurements over four machines: 1.004x, which is no change. It is not
+  free everywhere, though, and the exception is worth knowing. The
+  answer is now the lowest-numbered search that succeeds, so the race
+  cannot finish until every search below the winner has been decided.
+  Where a low search is slow to *fail* while a higher one succeeds
+  quickly, that costs: on one input in the benchmark corpus, `label`
+  went from 3.0 to 3.6 ms, and the same case regressed on all four
+  machines (0.77x to 0.84x). Instrumented, slot 3 wins it in 0.1 ms but
+  slots 1 and 2 each take 0.8 ms to fail. Every other measurement,
+  including the hard random graphs that make the picker work hardest,
+  is unchanged.
 
   `ncolor.label` is now bit-identical across machines: the same twenty
   images gave byte-identical colorings, and the same number of colors,
