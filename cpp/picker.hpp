@@ -215,21 +215,59 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
             // started and by having its in-flight tabucol cancelled,
             // so the race still ends as soon as slot 0 is settled
             // rather than running all 16 to their full budget.
-            std::atomic<int> best_ok{attempts_per_n};
+            // A slot can succeed two ways: from greedy plus repair
+            // alone, which takes about a tenth of a millisecond, or by
+            // going on to tabucol, which takes closer to a
+            // millisecond. Both are tracked, and a cheap success
+            // outranks a dear one however the indices fall.
+            //
+            // That ranking is what makes the race cheap to settle. The
+            // winner is the lowest-numbered success, so every slot
+            // below the winner has to be decided before the race can
+            // end, and deciding a slot the dear way is ten times the
+            // work. Ranking cheap first means that once any slot has
+            // come back cheaply, no slot's tabucol can affect the
+            // answer any more, so all of them stop at once. One image
+            // in the corpus was paying 0.6 ms for exactly this: slot 3
+            // colored it cheaply while slots 1 and 2 each spent 0.8 ms
+            // failing the dear way, for a result that could not have
+            // been used.
+            //
+            // Still one pass. Sorting the two kinds into separate
+            // passes was tried and is worse: greedy and tabucol stop
+            // overlapping across slots, so the race pays two barriers
+            // instead of one, and the hard graphs that need tabucol
+            // everywhere lost 25%.
+            constexpr int OK_NONE = 0, OK_CHEAP = 1, OK_TABU = 2;
+            std::atomic<int> best_cheap{attempts_per_n};
+            std::atomic<int> best_tabu{attempts_per_n};
             std::vector<std::atomic<bool>> slot_cancel(attempts_per_n);
             for (auto& f : slot_cancel) {
                 f.store(false, std::memory_order_relaxed);
             }
-            // Publish idx as the best if it is lower than what is
-            // there, then cancel everything above it.
-            auto claim_success = [&](int idx) {
-                int prev = best_ok.load(std::memory_order_relaxed);
+            auto claim_min = [](std::atomic<int>& best, int idx) {
+                int prev = best.load(std::memory_order_relaxed);
                 while (idx < prev
-                       && !best_ok.compare_exchange_weak(
+                       && !best.compare_exchange_weak(
                               prev, idx, std::memory_order_relaxed)) {
                 }
-                for (int j = idx + 1; j < attempts_per_n; ++j) {
-                    slot_cancel[j].store(true, std::memory_order_relaxed);
+            };
+            auto claim_success = [&](int idx, int kind) {
+                if (kind == OK_CHEAP) {
+                    claim_min(best_cheap, idx);
+                    // No tabucol result can win now, at any index, so
+                    // every in-flight one may stop. Only tabucol and
+                    // the exact search watch this flag; the greedy pass
+                    // does not, and a lower slot may still come back
+                    // cheaply and take the race.
+                    for (auto& f : slot_cancel) {
+                        f.store(true, std::memory_order_relaxed);
+                    }
+                } else {
+                    claim_min(best_tabu, idx);
+                    for (int j = idx + 1; j < attempts_per_n; ++j) {
+                        slot_cancel[j].store(true, std::memory_order_relaxed);
+                    }
                 }
             };
 
@@ -239,7 +277,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
             // only on warmup failure.
             auto run_one_attempt = [&, local_cur_n, local_depth, ip, ix](
                     int idx, const std::atomic<bool>* cancel,
-                    bool allow_tabucol, int64_t race_deadline_ns) -> bool {
+                    bool allow_tabucol, int64_t race_deadline_ns) -> int {
                 auto& cv = per_attempt_colors_[idx];
                 const int attempt_offset = local_depth + idx;
                 // Special slot: branch-and-bound exact coloring
@@ -269,8 +307,9 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                     const bool bb_ok = ncolor_cpp::bb_dsatur(
                         ip, ix, N, local_cur_n, cv, node_budget,
                         cancel, race_deadline_ns);
-                    per_attempt_ok_[idx] = bb_ok ? 1 : 0;
-                    return bb_ok;
+                    // The exact search is a dear win like tabucol.
+                    per_attempt_ok_[idx] = bb_ok ? OK_TABU : OK_NONE;
+                    return bb_ok ? OK_TABU : OK_NONE;
                 }
                 // Slot 0 = user-preferred algorithm; remaining
                 // slots = alternate algorithm with different
@@ -310,7 +349,20 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 // through to the parallel race (which has
                 // sibling-cancellable tabucol) than burn up to
                 // 5 ms of un-cancellable budget here.
-                if (!a_ok && local_cur_n == n_colors && allow_tabucol) {
+                if (a_ok) {
+                    const bool clean_wp_ok =
+                        !(wp && !weighted_attempt) || !conflict;
+                    per_attempt_ok_[idx] = clean_wp_ok ? OK_CHEAP : OK_NONE;
+                    return clean_wp_ok ? OK_CHEAP : OK_NONE;
+                }
+                // Nothing tabucol produces can win once some slot has
+                // come back cheaply, or once a lower slot has already
+                // won the dear way, so in either case do not run it.
+                const bool tabu_could_matter =
+                    best_cheap.load(std::memory_order_relaxed) == attempts_per_n
+                    && idx < best_tabu.load(std::memory_order_relaxed);
+                if (!a_ok && local_cur_n == n_colors && allow_tabucol
+                        && tabu_could_matter) {
                     for (int32_t u = 0; u < N; ++u) {
                         if (cv[u] < 1 || cv[u] > local_cur_n) {
                             cv[u] = (uint8_t)(1 + (u % local_cur_n));
@@ -335,8 +387,8 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 // wobj off there's no clean-WP gate (wp is false).
                 const bool clean_wp_required = wp && !weighted_attempt;
                 const bool slot_ok = a_ok && (!clean_wp_required || !conflict);
-                per_attempt_ok_[idx] = slot_ok ? 1 : 0;
-                return slot_ok;
+                per_attempt_ok_[idx] = slot_ok ? OK_TABU : OK_NONE;
+                return slot_ok ? OK_TABU : OK_NONE;
             };
 
             // All attempts go through the parallel race. The earlier
@@ -377,18 +429,20 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                         // Indices only grow for this worker, so once
                         // one is above the best it took, so is the
                         // rest of its share.
-                        if (idx > best_ok.load(std::memory_order_relaxed)) break;
+                        // A cheap win below this index settles the
+                        // race whatever this slot would have done.
+                        if (idx > best_cheap.load(std::memory_order_relaxed)) break;
                         const auto t0 = std::chrono::steady_clock::now();
-                        const bool ok_slot = run_one_attempt(
+                        const int kind = run_one_attempt(
                             idx, &slot_cancel[idx], /*allow_tabucol=*/true,
                             race_deadline_ns);
                         if (dbg_slots) {
                             const auto t1 = std::chrono::steady_clock::now();
                             slot_ms[idx] = std::chrono::duration<double, std::milli>(t1 - t0).count();
-                            slot_done[idx] = ok_slot ? 1 : 2;
+                            slot_done[idx] = kind != OK_NONE ? 1 : 2;
                         }
-                        if (ok_slot) {
-                            claim_success(idx);
+                        if (kind != OK_NONE) {
+                            claim_success(idx, kind);
                         }
                     }
                 });
@@ -410,15 +464,18 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                         }
                     }
                 }
-                // Lowest-index successful attempt wins
-                // (deterministic preference for the first random
-                // offset).
-                for (int a = 0; a < attempts_per_n; ++a) {
-                    if (per_attempt_ok_[a]) {
-                        colors_.swap(per_attempt_colors_[a]);
-                        ok = true;
-                        break;
-                    }
+                // The lowest-numbered cheap success wins; failing
+                // that, the lowest-numbered dear one.
+                int winner = -1;
+                for (int a = 0; a < attempts_per_n && winner < 0; ++a) {
+                    if (per_attempt_ok_[a] == OK_CHEAP) winner = a;
+                }
+                for (int a = 0; a < attempts_per_n && winner < 0; ++a) {
+                    if (per_attempt_ok_[a] == OK_TABU) winner = a;
+                }
+                if (winner >= 0) {
+                    colors_.swap(per_attempt_colors_[winner]);
+                    ok = true;
                 }
             }
         } else {
