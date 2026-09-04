@@ -64,12 +64,17 @@ and versions follow [semantic versioning](https://semver.org/).
   cost 2.3 ms a call, several times the work itself.
 
   Splitting is only worth it where a single call cannot already use the
-  whole machine, so it is on above 16 threads and off at or below, where
-  calls take turns exactly as they used to. Measured with four threads
-  against the same work in sequence: 1.3-1.9x on an 18-core M5 Max and
-  1.3x on a 64-core Threadripper, against 0.9x on a 16-core Ryzen and
-  0.8x on an 8-core i9, which is why those keep the old path.
-  `NCOLOR_AUTO_THREADS=0` or `1` forces it either way.
+  whole machine, and that does not read off the core count: measured
+  with four threads against the same work in sequence, it was 1.3-1.9x
+  on an 18-core M5 Max and 1.3x on a 64-core Threadripper, but 0.9x on a
+  16-core Ryzen and 0.8x on an 8-core i9. So the machine decides for
+  itself, the same way it already decides its thread count: the first
+  time calls actually overlap, ncolor times the two arrangements against
+  each other and keeps the answer in the calibration cache, keyed by host
+  and CPU. That costs 0.2 to 0.4 s once per machine, and only for a
+  program that threads at all; where it comes out against splitting,
+  calls take turns exactly as they used to. `NCOLOR_AUTO_THREADS=0` or
+  `1` skips the measurement and forces the answer.
 
   Engines are built only when calls actually overlap, so a
   single-threaded program still holds exactly one. At most

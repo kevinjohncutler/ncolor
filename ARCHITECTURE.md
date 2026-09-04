@@ -44,7 +44,18 @@ whose threads sum to about one machine. The wide engine sits out while
 anything else is in flight, since running it alongside the narrow ones
 measured slower than serial, and engines are bound per thread rather
 than borrowed per call, since a lock on that path cost more than the
-call. The mutex is taken only after the GIL is
+call.
+
+Whether to split at all is measured, not assumed: it depends on how well
+one call already uses the machine, which does not follow from the core
+count (it paid on an 18-core M5 Max and a 64-core Threadripper, and did
+not on a 16-core Ryzen or an 8-core i9). The first time calls overlap,
+``_engines._probe_split`` times k concurrent narrow calls against k
+sequential wide ones on the calibration mask and caches the verdict in
+the same file as the thread count, keyed by host and CPU. It times the
+arrangement it is choosing between rather than a proxy: concurrent calls
+also multiply the working set, which timing one call at two widths would
+miss. The mutex is taken only after the GIL is
 released, so a thread waiting on it can never block one that needs the
 GIL to finish. Both engines keep the working set of the largest image they
 have seen; `ncolor.release_buffers()` frees it.

@@ -61,34 +61,97 @@ def _new_group():
     return g
 
 
-# Splitting concurrent calls across narrower engines pays only where a
-# single call cannot already use the whole machine. Measured with four
-# threads, against the same work done one after another: 1.3-2.2x on an
-# 18-core M5 Max and 1.3-1.5x on a 64-core Threadripper, but 0.9x on a
-# 16-core Ryzen and 0.8x on an 8-core i9, where one call scales well
-# enough that splitting only adds overhead. So it is on above 16 threads
-# and off at or below, where calls take turns exactly as they used to.
-# NCOLOR_AUTO_THREADS=0/1 forces it either way.
-_SPLIT_ABOVE = 16
-
-
+# Whether spreading overlapping calls across narrower engines is worth
+# it depends on the machine, and not in a way that reads off the core
+# count: it comes down to whether one call already uses the whole machine
+# well enough that splitting only adds per-call overhead and multiplies
+# the working set. Measured with four threads against the same work in
+# sequence, it was 1.3-1.9x on an 18-core M5 Max and 1.3x on a 64-core
+# Threadripper, but 0.9x on a 16-core Ryzen and 0.8x on an 8-core i9.
+#
+# So it is measured rather than guessed, the same way the thread count
+# itself is (see ncolor._backend._smt): the first time calls actually
+# overlap, time the two arrangements against each other on a synthetic
+# mask and keep the answer in the calibration cache, keyed by host and
+# CPU. About a quarter of a second, once per machine, and only for a
+# program that threads at all. NCOLOR_AUTO_THREADS=0/1 skips the
+# measurement and forces the answer.
+_SPLIT_MARGIN = 0.95     # must be a real gain, not noise
 _split_cached = None
+
+
+def _probe_split(mask=None):
+    """Time k concurrent narrow calls against k sequential wide ones.
+
+    Returns True if splitting was faster. Measures the arrangement it is
+    deciding between rather than a proxy for it: concurrent calls also
+    multiply the working set, which timing one call at two widths would
+    miss.
+    """
+    import time
+    from ._backend import _smt
+    k = _max_engines()
+    if k < 2:
+        return False
+    if mask is None:
+        mask = _smt._make_calibration_mask(1024)
+
+    wide = _primary()
+    narrow = [Engine(n_threads=_narrow_threads()) for _ in range(k)]
+    try:
+        for _ in range(2):                       # warm both arrangements
+            wide.label(mask)
+        for e in narrow:
+            e.label(mask)
+
+        best_serial = float("inf")
+        best_split = float("inf")
+        for _ in range(3):
+            t0 = time.perf_counter()
+            for _ in range(k):
+                wide.label(mask)
+            best_serial = min(best_serial, time.perf_counter() - t0)
+
+            ts = [threading.Thread(target=e.label, args=(mask,)) for e in narrow]
+            t0 = time.perf_counter()
+            for th in ts:
+                th.start()
+            for th in ts:
+                th.join()
+            best_split = min(best_split, time.perf_counter() - t0)
+        return best_split < best_serial * _SPLIT_MARGIN
+    finally:
+        for e in narrow:
+            e.release_buffers()
 
 
 def _auto_split():
     """Whether overlapping calls should be spread over narrow engines.
 
-    Worked out once: it consults the calibration, which reads a file, and
-    this is on the path of every call.
+    Worked out once per process: it reads a file, and this is on the path
+    of every call.
     """
     global _split_cached
-    if _split_cached is None:
-        forced = os.environ.get("NCOLOR_AUTO_THREADS")
-        if forced is not None:
-            _split_cached = forced not in ("0", "", "false", "False")
-        else:
-            from ._backend import _smt
-            _split_cached = _smt.auto_threads() > _SPLIT_ABOVE
+    if _split_cached is not None:
+        return _split_cached
+    forced = os.environ.get("NCOLOR_AUTO_THREADS")
+    if forced is not None:
+        _split_cached = forced not in ("0", "", "false", "False")
+        return _split_cached
+    from ._backend import _smt
+    key = _smt._cache_key() + "|split"
+    cache = _smt._load_cache()
+    if key in cache:
+        _split_cached = bool(cache[key])
+        return _split_cached
+    try:
+        _split_cached = _probe_split()
+        cache = _smt._load_cache()               # re-read; another process may have written
+        cache[key] = bool(_split_cached)
+        _smt._save_cache(cache)
+    except Exception:                            # noqa: BLE001
+        # A machine we could not measure keeps the old behavior.
+        _split_cached = False
     return _split_cached
 
 

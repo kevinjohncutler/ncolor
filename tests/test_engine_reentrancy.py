@@ -104,32 +104,43 @@ def _elapsed(fn):
 
 
 @pytest.mark.parametrize("n_threads", [4])
-def test_separate_engines_overlap_where_a_shared_one_cannot(n_threads):
-    images = [_image(s) for s in range(n_threads)]
-    reps = 3
-    engines = [ncolor.Engine(n_threads=2) for _ in range(n_threads)]
+def test_explicit_engines_overlap(n_threads):
+    """An Engine per thread beats doing the images one after another.
 
-    for m in images:                       # warm both paths
-        ncolor.label(m)
-    for e, m in zip(engines, images):
+    Skipped where the machine says splitting does not pay: there one call
+    already uses every core, and the same is true by hand as
+    automatically.
+    """
+    from ncolor import _engines
+    if not _engines._auto_split():
+        pytest.skip("machine too small for concurrent calls to pay off")
+    images = [_image(s, n=512) for s in range(n_threads)]
+    reps = 3
+    engines = [ncolor.Engine(n_threads=_engines._narrow_threads())
+               for _ in range(n_threads)]
+    for e, m in zip(engines, images):       # warm the engines
         e.label(m)
 
-    def run(call):
-        ts = [threading.Thread(target=call, args=(i,)) for i in range(n_threads)]
+    def sequential():
+        for e, m in zip(engines, images):
+            for _ in range(reps):
+                e.label(m)
+
+    def overlapped():
+        ts = [threading.Thread(
+            target=lambda e=e, m=m: [e.label(m) for _ in range(reps)])
+            for e, m in zip(engines, images)]
         for t in ts:
             t.start()
         for t in ts:
             t.join()
 
-    shared = _elapsed(lambda: run(
-        lambda i: [ncolor.label(images[i]) for _ in range(reps)]))
-    private = _elapsed(lambda: run(
-        lambda i: [engines[i].label(images[i]) for _ in range(reps)]))
-
-    # Structural, not tuned: separate pools overlap, one pool cannot.
-    assert private < shared, (
-        f"per-engine threading ({private*1e3:.1f} ms) should beat the shared "
-        f"engine ({shared*1e3:.1f} ms)")
+    sequential(); overlapped()              # warm both arrangements
+    one_at_a_time = _elapsed(sequential)
+    together = _elapsed(overlapped)
+    assert together < one_at_a_time, (
+        f"engines run together ({together*1e3:.1f} ms) should beat one at a "
+        f"time ({one_at_a_time*1e3:.1f} ms)")
 
 
 # ------------------------------------------------- the automatic path
@@ -143,7 +154,7 @@ def test_plain_label_threads_without_an_engine():
     have and there is nothing to beat.
     """
     from ncolor import _engines
-    if not _engines._auto_split():
+    if not _engines._auto_split():           # also settles the one-time
         pytest.skip("machine too small for concurrent calls to pay off")
     images = [_image(s, n=512) for s in range(4)]
     reps = 4
