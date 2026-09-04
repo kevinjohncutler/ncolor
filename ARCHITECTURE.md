@@ -46,22 +46,27 @@ measured slower than serial, and engines are bound per thread rather
 than borrowed per call, since a lock on that path cost more than the
 call.
 
-Whether to split at all is measured, not assumed: it depends on how well
-one call already uses the machine, which does not follow from the core
-count (it paid on an 18-core M5 Max and a 64-core Threadripper, and did
-not on a 16-core Ryzen or an 8-core i9). The first time calls overlap,
-``_engines._probe_split`` times k concurrent narrow calls against k
-sequential wide ones on the calibration mask and caches the verdict in
-the same file as the thread count, keyed by host and CPU. It runs only
-once calls genuinely overlap, so a single-threaded program never pays
-for it, and it compares medians over alternating rounds rather than best
-times, since the concurrent arrangement runs several threads and has the
-longer tail. Splitting must come out a fifth faster to be taken: the
-verdict is cached for the life of the machine, and one that is on the
-fence measures either way from run to run. It times the
-arrangement it is choosing between rather than a proxy: concurrent calls
-also multiply the working set, which timing one call at two widths would
-miss. The mutex is taken only after the GIL is
+Overlapping calls always get engines of their own; there is no
+per-machine verdict behind it, and nothing cached. An earlier version
+measured the two arrangements once per machine and remembered the
+answer. Sweeping four hosts across eight image sizes showed why that was
+wrong: the better arrangement is a property of the image at least as
+much as of the machine. On an 8-core i9 splitting ran 1.3x faster at 512
+by 512, 0.8x at 1024, and 1.1x at 4096; on a 16-core Ryzen it ran 2.4x
+at 512 and 0.9x at 2048. A verdict measured at one size and cached for
+the life of the machine is therefore fitted to whichever size happened
+to be measured, and 1024 (the calibration size) is close to the worst
+case on two of the four hosts. Averaged over sizes, splitting pays on
+every machine tested, by 1.07x on the i9, 1.3x on the Ryzen, 1.7x on an
+18-core M5 Max and 1.9x on a 64-core Threadripper; the worst single
+measurement is 0.76x. `NCOLOR_MAX_ENGINES=1` turns it off. Two
+alternatives were tried and rejected. A cheaper non-concurrent proxy
+(parallel efficiency at one call, two widths) predicts splitting on all
+four hosts including the ones where it then loses, because it cannot see
+that concurrent calls multiply the working set. And a floor on threads
+per engine does not exist: two threads per engine is fine on three of
+the four hosts, so the i9's regression band is not thin slicing. The
+mutex is taken only after the GIL is
 released, so a thread waiting on it can never block one that needs the
 GIL to finish. Both engines keep the working set of the largest image they
 have seen; `ncolor.release_buffers()` frees it.

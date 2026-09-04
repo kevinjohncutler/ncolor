@@ -14,6 +14,17 @@ wide engine alongside the narrow ones is the worst of both, and measured
 slower than doing the images one after another, so the wide one sits out
 whenever anything else is in flight.
 
+Overlapping callers always get their own engines. Whether that beats
+taking turns was measured across four machines and eight image sizes,
+and it varies far more with the image than with the machine: on an
+8-core i9 the same arrangement ran 1.3x faster at 512 by 512, 0.8x at
+1024, and 1.1x at 4096. No fact about the machine predicts that, so
+there is nothing worth measuring once and caching. Averaged over sizes
+it pays on every machine tested, from 1.07x on that i9 to 1.9x on a
+64-core Threadripper, and the worst single case is 0.76x. Set
+``NCOLOR_MAX_ENGINES=1`` to turn it off and have overlapping calls take
+turns on one pool, as they did before there was more than one.
+
 The narrow engines are built only when calls actually overlap, so a
 single-threaded program holds exactly one engine. There are at most
 ``NCOLOR_MAX_ENGINES`` of them (4 by default); past that callers wait,
@@ -32,12 +43,18 @@ import threading
 # for a free one rather than adding more; each engine also costs the
 # scratch of the largest image it sees (about 20 bytes per pixel), so
 # this bounds memory as much as it bounds threads.
+_max_engines_cached = None
+
+
 def _max_engines():
-    try:
-        n = int(os.environ.get("NCOLOR_MAX_ENGINES", "4"))
-    except ValueError:
-        n = 4
-    return max(1, n)
+    global _max_engines_cached
+    if _max_engines_cached is None:
+        try:
+            n = int(os.environ.get("NCOLOR_MAX_ENGINES", "4"))
+        except ValueError:
+            n = 4
+        _max_engines_cached = max(1, n)
+    return _max_engines_cached
 
 
 _LOCK = threading.Lock()
@@ -61,124 +78,6 @@ def _new_group():
     return g
 
 
-# Whether spreading overlapping calls across narrower engines is worth
-# it depends on the machine, and not in a way that reads off the core
-# count: it comes down to whether one call already uses the whole machine
-# well enough that splitting only adds per-call overhead and multiplies
-# the working set. Measured with four threads against the same work in
-# sequence, it was 1.3-1.9x on an 18-core M5 Max and 1.3x on a 64-core
-# Threadripper, but 0.9x on a 16-core Ryzen and 0.8x on an 8-core i9.
-#
-# So it is measured rather than guessed, the same way the thread count
-# itself is (see ncolor._backend._smt): the first time calls actually
-# overlap, time the two arrangements against each other on a synthetic
-# mask and keep the answer in the calibration cache, keyed by host and
-# CPU. About a quarter of a second, once per machine, and only for a
-# program that threads at all. NCOLOR_AUTO_THREADS=0/1 skips the
-# measurement and forces the answer.
-# Splitting has to be a clear win, not a marginal one. The verdict is
-# cached for the life of the machine, so where the two arrangements are
-# close the safe answer is the one that changes nothing, and a machine
-# that is genuinely on the fence will measure either way from run to
-# run: a 16-core Ryzen flipped at both a 5% and a 10% margin. A fifth
-# faster is past the noise, and a machine that clears it (an 18-core M5
-# Max at 1.9x, a 64-core Threadripper at 1.3x) clears it every time.
-_SPLIT_MARGIN = 0.80
-_SPLIT_REPS = 2          # calls per engine per round, as real use would
-_SPLIT_ROUNDS = 3
-_split_cached = None
-_split_lock = threading.Lock()
-
-
-def _probe_split(mask=None):
-    """Time k concurrent narrow calls against k sequential wide ones.
-
-    Returns True if splitting was faster. Measures the arrangement it is
-    deciding between rather than a proxy for it: concurrent calls also
-    multiply the working set, which timing one call at two widths would
-    miss.
-    """
-    import statistics
-    import time
-    from ._backend import _smt
-    k = _max_engines()
-    if k < 2:
-        return False
-    if mask is None:
-        mask = _smt._make_calibration_mask(1024)
-
-    wide = _primary()
-    narrow = [Engine(n_threads=_narrow_threads()) for _ in range(k)]
-    try:
-        for _ in range(2):                       # warm both arrangements
-            wide.label(mask)
-        for e in narrow:
-            e.label(mask)
-
-        def run_narrow():
-            ts = [threading.Thread(
-                target=lambda e=e: [e.label(mask) for _ in range(_SPLIT_REPS)])
-                for e in narrow]
-            for th in ts:
-                th.start()
-            for th in ts:
-                th.join()
-
-        run_narrow()                             # warm the concurrent path too
-        # Medians, not minima: the concurrent arrangement runs four
-        # threads and so has the longer tail, and taking the best of each
-        # would flatter it. Rounds alternate so drift affects both.
-        serial, split = [], []
-        for _ in range(_SPLIT_ROUNDS):
-            t0 = time.perf_counter()
-            for _ in range(k * _SPLIT_REPS):
-                wide.label(mask)
-            serial.append(time.perf_counter() - t0)
-
-            t0 = time.perf_counter()
-            run_narrow()
-            split.append(time.perf_counter() - t0)
-        return statistics.median(split) < statistics.median(serial) * _SPLIT_MARGIN
-    finally:
-        for e in narrow:
-            e.release_buffers()
-
-
-def _auto_split():
-    """Whether overlapping calls should be spread over narrow engines.
-
-    Worked out once per process: it reads a file, and this is on the path
-    of every call.
-    """
-    global _split_cached
-    if _split_cached is not None:
-        return _split_cached
-    # One thread measures while the others wait for its answer.
-    with _split_lock:
-        if _split_cached is not None:
-            return _split_cached
-        forced = os.environ.get("NCOLOR_AUTO_THREADS")
-        if forced is not None:
-            _split_cached = forced not in ("0", "", "false", "False")
-            return _split_cached
-        from ._backend import _smt
-        key = _smt._cache_key() + "|split"
-        cache = _smt._load_cache()
-        if key in cache:
-            _split_cached = bool(cache[key])
-            return _split_cached
-        try:
-            verdict = _probe_split()
-            cache = _smt._load_cache()           # re-read; another process may have written
-            cache[key] = bool(verdict)
-            _smt._save_cache(cache)
-            _split_cached = verdict
-        except Exception:                        # noqa: BLE001
-            # A machine we could not measure keeps the old behavior.
-            _split_cached = False
-        return _split_cached
-
-
 def _narrow_threads():
     """Thread count for the engines that overlapping calls share.
 
@@ -192,6 +91,15 @@ def _narrow_threads():
     """
     from ._backend import _smt
     return max(1, _smt.auto_threads() // _max_engines())
+
+
+def _splits():
+    """Whether overlapping calls get engines of their own at all.
+
+    One engine means they take turns on the full-width pool, which is
+    what ncolor did before it had more than one.
+    """
+    return _max_engines() > 1
 
 
 def _primary():
@@ -228,11 +136,7 @@ def _bind():
         if _bound > 1:
             _concurrent = True
         concurrent = _concurrent
-    # Only once a second thread has actually turned up is it worth asking
-    # whether splitting pays, because the asking costs a measurement. A
-    # program that never threads never pays for it. Asked outside the
-    # lock: the measurement itself colors images, which needs engines.
-    if not concurrent or not _auto_split():
+    if not concurrent or not _splits():
         # Calls take turns on the one engine, as they always have.
         _tls.engine = primary
         return primary
@@ -263,7 +167,7 @@ def _borrow():
     pool running alongside them fights for the same cores and measured
     slower than doing the images one after another.
     """
-    if (_in_flight == 0 or not _auto_split()) and _all:
+    if (_in_flight == 0 or not _splits()) and _all:
         eng = _all[0]
         _tls.last = eng
         return eng
@@ -277,23 +181,6 @@ def _borrow():
 def _last_used():
     """The engine that ran this thread's most recent call."""
     return getattr(_tls, "last", None) or _primary()
-
-
-def release_buffers():
-    """Free the scratch memory the engines keep between calls.
-
-    ncolor keeps the working set of the largest image it has processed
-    (about 20 bytes per pixel, so 327 MB after one 4096 by 4096 image)
-    allocated between calls, so repeated calls on same-sized images never
-    pay for allocation. This gives it back for every engine the module
-    functions have created; the next call simply reallocates. Thread
-    pools are kept, so there is no start-up cost afterwards.
-    :class:`Engine` has a method of the same name for its own buffers.
-    """
-    with _LOCK:
-        engines = list(_all)
-    for eng in engines:
-        eng.release_buffers()
 
 
 class _Borrowed:

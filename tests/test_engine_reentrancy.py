@@ -111,15 +111,8 @@ def _elapsed(fn, rounds=3):
 
 @pytest.mark.parametrize("n_threads", [4])
 def test_explicit_engines_overlap(n_threads):
-    """An Engine per thread beats doing the images one after another.
-
-    Skipped where the machine says splitting does not pay: there one call
-    already uses every core, and the same is true by hand as
-    automatically.
-    """
+    """An Engine per thread beats doing the images one after another."""
     from ncolor import _engines
-    if not _engines._auto_split():
-        pytest.skip("machine too small for concurrent calls to pay off")
     images = [_image(s, n=512) for s in range(n_threads)]
     reps = 3
     engines = [ncolor.Engine(n_threads=_engines._narrow_threads())
@@ -154,15 +147,7 @@ def test_explicit_engines_overlap(n_threads):
 
 
 def test_plain_label_threads_without_an_engine():
-    """``ncolor.label`` from several threads beats doing them in turn.
-
-    Only where splitting is on. Below the machine-size threshold a single
-    call already uses every core, so calls take turns as they always
-    have and there is nothing to beat.
-    """
-    from ncolor import _engines
-    if not _engines._auto_split():           # also settles the one-time
-        pytest.skip("machine too small for concurrent calls to pay off")
+    """``ncolor.label`` from several threads beats doing them in turn."""
     images = [_image(s, n=512) for s in range(4)]
     reps = 4
 
@@ -214,8 +199,6 @@ def test_a_lone_caller_gets_the_full_width_engine():
 def test_engine_count_is_bounded():
     """However many threads call, the pool stops growing."""
     from ncolor import _engines
-    if not _engines._auto_split():
-        pytest.skip("no splitting on this machine, so one engine only")
     m = _image(1, n=128)
 
     def work():

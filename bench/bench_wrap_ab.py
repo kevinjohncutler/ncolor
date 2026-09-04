@@ -50,7 +50,7 @@ def make_balls_3d(D, H, W, n, r_min=2, r_max=5, seed=0):
 
 def make_tight_crop_2d(H, W, n, seed=0):
     """Cells crammed close to the borders — where wrap is *most* expected to
-    change behaviour (many cells within reach of the toroidal seam)."""
+    change behavior (many cells within reach of the toroidal seam)."""
     rng = np.random.default_rng(seed)
     m = np.zeros((H, W), dtype=np.int32)
     for i in range(1, n + 1):

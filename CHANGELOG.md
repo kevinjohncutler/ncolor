@@ -63,22 +63,20 @@ and versions follow [semantic versioning](https://semver.org/).
   rather than borrowed per call: handing one lock between four threads
   cost 2.3 ms a call, several times the work itself.
 
-  Splitting is only worth it where a single call cannot already use the
-  whole machine, and that does not read off the core count: measured
-  with four threads against the same work in sequence, it was 1.3-1.9x
-  on an 18-core M5 Max and 1.3x on a 64-core Threadripper, but 0.9x on a
-  16-core Ryzen and 0.8x on an 8-core i9. So the machine decides for
-  itself, the same way it already decides its thread count: the first
-  time calls actually overlap, ncolor times the two arrangements against
-  each other and keeps the answer in the calibration cache, keyed by host
-  and CPU. That costs 0.15 to 0.45 s, once per machine, and only for a
-  program whose calls actually overlap; a single-threaded caller never
-  measures anything. Splitting has to come out a fifth faster to be
-  taken, because the verdict is cached for the life of the machine and a
-  machine on the fence measures either way from run to run: the 16-core
-  Ryzen flipped at a 5% and at a 10% margin, and settles on taking turns
-  at 20%. `NCOLOR_AUTO_THREADS=0` or `1` skips the measurement and forces
-  the answer.
+  Nothing is measured or configured for this, and that took some
+  finding out. Overlapping calls are always given engines of their own.
+  Whether that beats taking turns was swept over four machines and eight
+  image sizes, and the better arrangement turns out to be a property of
+  the image at least as much as of the machine: on an 8-core i9 it ran
+  1.3x faster at 512 by 512, 0.8x at 1024, and 1.1x at 4096, and on a
+  16-core Ryzen 2.4x at 512 and 0.9x at 2048. Any verdict measured once
+  and cached is therefore fitted to whichever size was measured. An
+  earlier version of this release did exactly that and cached the wrong
+  answer for two of the four hosts, because it measured at 1024, which
+  is near their worst case. Averaged over sizes, splitting pays on every
+  machine tested: 1.07x on the i9, 1.3x on the Ryzen, 1.7x on the M5 Max
+  and 1.9x on the Threadripper, with a worst single case of 0.76x.
+  `NCOLOR_MAX_ENGINES=1` turns it off and restores taking turns.
 
   Engines are built only when calls actually overlap, so a
   single-threaded program still holds exactly one. At most
