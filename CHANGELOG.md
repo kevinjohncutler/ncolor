@@ -171,6 +171,19 @@ and versions follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- **A cheap coloring now outranks an expensive one in the picker's
+  race.** Deciding the winner by lowest-numbered success meant the race
+  waited for every search below the winner, and a search decided the
+  expensive way costs about ten times one decided cheaply: greedy plus
+  repair returns in roughly 0.1 ms, going on to TabuCol takes roughly
+  0.8 ms. A slot now reports which way it won, and a cheap success wins
+  over an expensive one whatever the indices, so once any slot has come
+  back cheaply every in-flight TabuCol stops at once. Still
+  deterministic: the rule is a function of the results, not of the order
+  they arrive in. Worth 1.22x to 1.35x on the corpus image that had been
+  paying for this, on all four machines, and 1.000x overall across 416
+  paired measurements.
+
 - **`label` returns the same coloring every time.** The picker races
   several searches per color count and keeps the lowest-numbered one
   that succeeds, but it abandoned every other search the moment any of
@@ -186,17 +199,7 @@ and versions follow [semantic versioning](https://semver.org/).
   settled rather than running all sixteen to their budgets.
 
   Measured against the same tree without the change, 416 paired
-  measurements over four machines: 1.004x, which is no change. It is not
-  free everywhere, though, and the exception is worth knowing. The
-  answer is now the lowest-numbered search that succeeds, so the race
-  cannot finish until every search below the winner has been decided.
-  Where a low search is slow to *fail* while a higher one succeeds
-  quickly, that costs: on one input in the benchmark corpus, `label`
-  went from 3.0 to 3.6 ms, and the same case regressed on all four
-  machines (0.77x to 0.84x). Instrumented, slot 3 wins it in 0.1 ms but
-  slots 1 and 2 each take 0.8 ms to fail. Every other measurement,
-  including the hard random graphs that make the picker work hardest,
-  is unchanged.
+  measurements over four machines: 1.004x, which is no change.
 
   `ncolor.label` is now bit-identical across machines: the same twenty
   images gave byte-identical colorings, and the same number of colors,
