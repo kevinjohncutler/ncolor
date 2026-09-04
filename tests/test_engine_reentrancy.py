@@ -97,10 +97,16 @@ def test_many_threads_on_one_engine_are_serialized_not_corrupted():
     assert not errors
 
 
-def _elapsed(fn):
-    t = time.perf_counter()
-    fn()
-    return time.perf_counter() - t
+def _elapsed(fn, rounds=3):
+    """Best of several runs: these compare two arrangements on a machine
+    that is also doing other things, and the fastest run of each is the
+    one least polluted by that."""
+    best = float("inf")
+    for _ in range(rounds):
+        t = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - t)
+    return best
 
 
 @pytest.mark.parametrize("n_threads", [4])
@@ -138,6 +144,7 @@ def test_explicit_engines_overlap(n_threads):
     sequential(); overlapped()              # warm both arrangements
     one_at_a_time = _elapsed(sequential)
     together = _elapsed(overlapped)
+
     assert together < one_at_a_time, (
         f"engines run together ({together*1e3:.1f} ms) should beat one at a "
         f"time ({one_at_a_time*1e3:.1f} ms)")

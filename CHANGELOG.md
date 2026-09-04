@@ -71,10 +71,14 @@ and versions follow [semantic versioning](https://semver.org/).
   itself, the same way it already decides its thread count: the first
   time calls actually overlap, ncolor times the two arrangements against
   each other and keeps the answer in the calibration cache, keyed by host
-  and CPU. That costs 0.2 to 0.4 s once per machine, and only for a
-  program that threads at all; where it comes out against splitting,
-  calls take turns exactly as they used to. `NCOLOR_AUTO_THREADS=0` or
-  `1` skips the measurement and forces the answer.
+  and CPU. That costs 0.15 to 0.45 s, once per machine, and only for a
+  program whose calls actually overlap; a single-threaded caller never
+  measures anything. Splitting has to come out a fifth faster to be
+  taken, because the verdict is cached for the life of the machine and a
+  machine on the fence measures either way from run to run: the 16-core
+  Ryzen flipped at a 5% and at a 10% margin, and settles on taking turns
+  at 20%. `NCOLOR_AUTO_THREADS=0` or `1` skips the measurement and forces
+  the answer.
 
   Engines are built only when calls actually overlap, so a
   single-threaded program still holds exactly one. At most

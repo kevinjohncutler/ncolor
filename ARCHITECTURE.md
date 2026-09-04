@@ -52,7 +52,13 @@ count (it paid on an 18-core M5 Max and a 64-core Threadripper, and did
 not on a 16-core Ryzen or an 8-core i9). The first time calls overlap,
 ``_engines._probe_split`` times k concurrent narrow calls against k
 sequential wide ones on the calibration mask and caches the verdict in
-the same file as the thread count, keyed by host and CPU. It times the
+the same file as the thread count, keyed by host and CPU. It runs only
+once calls genuinely overlap, so a single-threaded program never pays
+for it, and it compares medians over alternating rounds rather than best
+times, since the concurrent arrangement runs several threads and has the
+longer tail. Splitting must come out a fifth faster to be taken: the
+verdict is cached for the life of the machine, and one that is on the
+fence measures either way from run to run. It times the
 arrangement it is choosing between rather than a proxy: concurrent calls
 also multiply the working set, which timing one call at two widths would
 miss. The mutex is taken only after the GIL is

@@ -76,8 +76,18 @@ def _new_group():
 # CPU. About a quarter of a second, once per machine, and only for a
 # program that threads at all. NCOLOR_AUTO_THREADS=0/1 skips the
 # measurement and forces the answer.
-_SPLIT_MARGIN = 0.95     # must be a real gain, not noise
+# Splitting has to be a clear win, not a marginal one. The verdict is
+# cached for the life of the machine, so where the two arrangements are
+# close the safe answer is the one that changes nothing, and a machine
+# that is genuinely on the fence will measure either way from run to
+# run: a 16-core Ryzen flipped at both a 5% and a 10% margin. A fifth
+# faster is past the noise, and a machine that clears it (an 18-core M5
+# Max at 1.9x, a 64-core Threadripper at 1.3x) clears it every time.
+_SPLIT_MARGIN = 0.80
+_SPLIT_REPS = 2          # calls per engine per round, as real use would
+_SPLIT_ROUNDS = 3
 _split_cached = None
+_split_lock = threading.Lock()
 
 
 def _probe_split(mask=None):
@@ -88,6 +98,7 @@ def _probe_split(mask=None):
     multiply the working set, which timing one call at two widths would
     miss.
     """
+    import statistics
     import time
     from ._backend import _smt
     k = _max_engines()
@@ -104,22 +115,30 @@ def _probe_split(mask=None):
         for e in narrow:
             e.label(mask)
 
-        best_serial = float("inf")
-        best_split = float("inf")
-        for _ in range(3):
-            t0 = time.perf_counter()
-            for _ in range(k):
-                wide.label(mask)
-            best_serial = min(best_serial, time.perf_counter() - t0)
-
-            ts = [threading.Thread(target=e.label, args=(mask,)) for e in narrow]
-            t0 = time.perf_counter()
+        def run_narrow():
+            ts = [threading.Thread(
+                target=lambda e=e: [e.label(mask) for _ in range(_SPLIT_REPS)])
+                for e in narrow]
             for th in ts:
                 th.start()
             for th in ts:
                 th.join()
-            best_split = min(best_split, time.perf_counter() - t0)
-        return best_split < best_serial * _SPLIT_MARGIN
+
+        run_narrow()                             # warm the concurrent path too
+        # Medians, not minima: the concurrent arrangement runs four
+        # threads and so has the longer tail, and taking the best of each
+        # would flatter it. Rounds alternate so drift affects both.
+        serial, split = [], []
+        for _ in range(_SPLIT_ROUNDS):
+            t0 = time.perf_counter()
+            for _ in range(k * _SPLIT_REPS):
+                wide.label(mask)
+            serial.append(time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            run_narrow()
+            split.append(time.perf_counter() - t0)
+        return statistics.median(split) < statistics.median(serial) * _SPLIT_MARGIN
     finally:
         for e in narrow:
             e.release_buffers()
@@ -134,25 +153,30 @@ def _auto_split():
     global _split_cached
     if _split_cached is not None:
         return _split_cached
-    forced = os.environ.get("NCOLOR_AUTO_THREADS")
-    if forced is not None:
-        _split_cached = forced not in ("0", "", "false", "False")
+    # One thread measures while the others wait for its answer.
+    with _split_lock:
+        if _split_cached is not None:
+            return _split_cached
+        forced = os.environ.get("NCOLOR_AUTO_THREADS")
+        if forced is not None:
+            _split_cached = forced not in ("0", "", "false", "False")
+            return _split_cached
+        from ._backend import _smt
+        key = _smt._cache_key() + "|split"
+        cache = _smt._load_cache()
+        if key in cache:
+            _split_cached = bool(cache[key])
+            return _split_cached
+        try:
+            verdict = _probe_split()
+            cache = _smt._load_cache()           # re-read; another process may have written
+            cache[key] = bool(verdict)
+            _smt._save_cache(cache)
+            _split_cached = verdict
+        except Exception:                        # noqa: BLE001
+            # A machine we could not measure keeps the old behavior.
+            _split_cached = False
         return _split_cached
-    from ._backend import _smt
-    key = _smt._cache_key() + "|split"
-    cache = _smt._load_cache()
-    if key in cache:
-        _split_cached = bool(cache[key])
-        return _split_cached
-    try:
-        _split_cached = _probe_split()
-        cache = _smt._load_cache()               # re-read; another process may have written
-        cache[key] = bool(_split_cached)
-        _smt._save_cache(cache)
-    except Exception:                            # noqa: BLE001
-        # A machine we could not measure keeps the old behavior.
-        _split_cached = False
-    return _split_cached
 
 
 def _narrow_threads():
@@ -199,18 +223,20 @@ def _bind():
     """
     global _concurrent, _bound
     primary = _primary()
-    if not _auto_split():
-        # Calls take turns on the one engine, as they always have.
-        _tls.engine = primary
-        return primary
     with _LOCK:
         _bound += 1
         if _bound > 1:
             _concurrent = True
-        if not _concurrent:
-            _tls.engine = primary
-            return primary
-        _tls.engine = None
+        concurrent = _concurrent
+    # Only once a second thread has actually turned up is it worth asking
+    # whether splitting pays, because the asking costs a measurement. A
+    # program that never threads never pays for it. Asked outside the
+    # lock: the measurement itself colors images, which needs engines.
+    if not concurrent or not _auto_split():
+        # Calls take turns on the one engine, as they always have.
+        _tls.engine = primary
+        return primary
+    with _LOCK:
         # Overlapping callers share the narrow engines: one machine's
         # worth of threads between them, however many threads call.
         if len(_narrow) < _max_engines():
