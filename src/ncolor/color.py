@@ -6,8 +6,19 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._engines import LOCK as _SOLVER_LOCK, solver as _get_solver
+from ._engines import _solver_for
 from .format import format_labels, _compact_wide_labels
+
+
+def _get_solver():
+    """The process-wide ``Solver``.
+
+    The engine to use is normally chosen per call by ``_solver_for``;
+    this names the default one for tests and benchmarks that read its
+    accessors (stage timings, last LUT, soft pairs) after a call made
+    through the module-level functions.
+    """
+    return _solver_for(None)
 
 
 def label(lab, n=4, conn=1, max_depth=30, expand=True,
@@ -18,7 +29,7 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
           extra_edges=None, connect_radius=1,
           min_contact=1, expand_mode="clean",
           soft_extra_edges=None, soft_conn=2, soft_radius=2,
-          clean_mask=False):
+          clean_mask=False, _engine=None):
     """4-color graph coloring of a label image.
 
     Returns a uint8 image where every foreground pixel of ``lab`` has
@@ -173,7 +184,7 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
             "(GeoDataFrame / GeoSeries / GeoJSON) use ncolor.geo.label().")
 
     lab_arr = np.asarray(lab)
-    solver = _get_solver()
+    solver = _solver_for(_engine)
 
     # Normalize weight_objective: accept str ("max"/"min"/"off") or int (+1/-1/0).
     if isinstance(weight_objective, str):
@@ -226,15 +237,15 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
         soft_radius=int(soft_radius),
         clean_mask=bool(clean_mask),
         capture_stages=bool(verbose))
-    with _SOLVER_LOCK:                 # engine calls must not overlap (shared pool)
-        try:
-            out_array, n_used = solver.label(lab_arr, **call_kwargs)
-        except OverflowError:
-            # int64 / uint32 / uint64 / float input holding a value the
-            # int32 engine cannot represent. Rare, so it is handled off
-            # the fast path: compact the labels in numpy and go again.
-            lab_arr = _compact_wide_labels(lab_arr)
-            out_array, n_used = solver.label(lab_arr, **call_kwargs)
+    # The engine serializes calls on its own pool; no lock needed here.
+    try:
+        out_array, n_used = solver.label(lab_arr, **call_kwargs)
+    except OverflowError:
+        # int64 / uint32 / uint64 / float input holding a value the
+        # int32 engine cannot represent. Rare, so it is handled off
+        # the fast path: compact the labels in numpy and go again.
+        lab_arr = _compact_wide_labels(lab_arr)
+        out_array, n_used = solver.label(lab_arr, **call_kwargs)
     out = out_array
 
     if verbose:
@@ -281,7 +292,7 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
     return out
 
 
-def connect(img, conn=1):
+def connect(img, conn=1, _engine=None):
     """Find adjacent label pairs in a label image.
 
     Returns an ``(M, 2)`` int array of unique (lo, hi) label pairs, in
@@ -290,8 +301,7 @@ def connect(img, conn=1):
     :func:`ncolor.format_labels` first (the pairs would otherwise refer
     to renumbered labels).
     """
-    with _SOLVER_LOCK:                 # shares the singleton solver / pool
-        return _get_solver().connect(img, conn=int(conn))
+    return _solver_for(_engine).connect(img, conn=int(conn))
 
 
 def connected_components(mask, conn=2):
@@ -331,7 +341,8 @@ def regionprops(labels, n_labels=0):
 
 
 def color_graph(edges, n_vertices=None, n=4, soft_edges=None, max_depth=30,
-                return_n=False, check_conflicts=False, return_conflicts=False):
+                return_n=False, check_conflicts=False, return_conflicts=False,
+                _engine=None):
     """Color an abstract graph given its edge list.
 
     The same picker :func:`ncolor.label` runs on the pixel-adjacency
@@ -396,11 +407,10 @@ def color_graph(edges, n_vertices=None, n=4, soft_edges=None, max_depth=30,
                 f"soft_edges must be an (E, 2) int array of 0-indexed "
                 f"vertex pairs; got shape {soft_arr.shape}")
 
-    solver = _get_solver()
-    with _SOLVER_LOCK:                 # shares the singleton solver / pool
-        colors, n_used = solver.color_graph(
-            edges_arr, int(n_vertices), n_colors=int(n),
-            max_depth=int(max_depth), soft_edges=soft_arr)
+    solver = _solver_for(_engine)
+    colors, n_used = solver.color_graph(
+        edges_arr, int(n_vertices), n_colors=int(n),
+        max_depth=int(max_depth), soft_edges=soft_arr)
 
     conflicts = solver.get_last_n_conflicts() \
         if (check_conflicts or return_conflicts) else 0

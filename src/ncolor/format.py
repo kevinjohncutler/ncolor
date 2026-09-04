@@ -1,6 +1,6 @@
 import numpy as np
 
-from ._engines import LOCK as _LOCK, expand_engine as _get_format_engine
+from ._engines import _expand_for
 
 
 _INT32_MIN = -(2 ** 31)
@@ -63,7 +63,7 @@ def _to_int32_labels(labels, allow_compact=True):
 
 def format_labels(labels, clean=False, min_area=9, despur=False,
                   verbose=False, background=None, ignore=False,
-                  first_seen=False):
+                  first_seen=False, _engine=None):
     """Compact labels into background=0, cells 1..N.
 
     ``clean=True`` splits disjoint components per label and drops
@@ -84,15 +84,14 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
     # min-shift / sign handling first, so it can't share this short-cut.
     if (not clean and not ignore and background is None and not verbose):
         arr = np.ascontiguousarray(labels)
-        with _LOCK:                    # engine calls must not overlap
-            eng = _get_format_engine()
-            try:
-                out, _n = eng.format_labels(arr, first_seen=bool(first_seen))
-            except OverflowError:
-                # A wide-dtype value outside int32: compact in numpy,
-                # then let the engine renumber that.
-                out, _n = eng.format_labels(_compact_wide_labels(arr),
-                                            first_seen=bool(first_seen))
+        eng = _expand_for(_engine)
+        try:
+            out, _n = eng.format_labels(arr, first_seen=bool(first_seen))
+        except OverflowError:
+            # A wide-dtype value outside int32: compact in numpy, then
+            # let the engine renumber that.
+            out, _n = eng.format_labels(_compact_wide_labels(arr),
+                                        first_seen=bool(first_seen))
         return out
 
     # Cellpose stores labels inside float arrays; cast back to int.
@@ -203,11 +202,10 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
                 labels = remap[comp_labels].astype(np.uint32, copy=False)
 
     # Compact to 1..N and downcast to the smallest unsigned int that fits.
-    with _LOCK:                        # engine calls must not overlap
-        out, n_used = _get_format_engine().format_labels(
-            np.ascontiguousarray(labels.astype(np.int32)),
-            first_seen=True,
-        )
+    out, n_used = _expand_for(_engine).format_labels(
+        np.ascontiguousarray(labels.astype(np.int32)),
+        first_seen=True,
+    )
     if n_used <= 0xFF:
         return out.astype(np.uint8, copy=False)
     if n_used <= 0xFFFF:

@@ -168,38 +168,42 @@ static inline py::array_t<int32_t> pairs_to_array(
     return out;
 }
 
-// ---- Shared thread pool ----------------------------------------------------
+// ---- Thread pools -------------------------------------------------------
 //
-// Engines that resolve to the same thread count share one ForkJoinPool.
-// The Python package keeps a Solver and an ExpandEngine alive for the
-// life of the process; with a pool each that was 2 × (threads - 1) parked
-// workers (and, before the format engine was merged into the expand one,
-// 3 ×). Sharing is safe because engine calls are serialized: the Python
-// wrappers hold one process-wide lock, and every engine method takes
-// ``engine_mutex()`` below as a backstop for callers that bypass the
-// wrappers. The registry holds weak references, so a pool dies with the
-// last engine using it (the SMT calibration builds and discards engines
-// with two different counts back to back).
-static std::shared_ptr<ncolor_cpp::ForkJoinPool> acquire_shared_pool(int n_threads) {
+// A pool and the mutex that serializes calls on it are one object. Only
+// one ``parallel()`` may be in flight per pool, so every engine method
+// takes its pool's mutex for the duration of the call: engines that
+// share a pool take turns, and engines holding private pools run at the
+// same time. The mutex is taken only after the GIL is released, so a
+// thread waiting here can never block one that needs the GIL to finish.
+struct PoolSlot {
+    explicit PoolSlot(int n) : pool(static_cast<size_t>(n <= 1 ? 1 : n)) {}
+    ncolor_cpp::ForkJoinPool pool;
+    std::mutex mu;
+};
+
+// Engines that resolve to the same thread count share one pool by
+// default. The package keeps a Solver and an ExpandEngine alive for the
+// life of the process; with a pool each that was 2 x (threads - 1)
+// parked workers. The registry holds weak references, so a pool dies
+// with the last engine using it (the SMT calibration builds and discards
+// engines with two different counts back to back).
+static std::shared_ptr<PoolSlot> acquire_shared_pool(int n_threads) {
     static std::mutex registry_mutex;
-    static std::map<int, std::weak_ptr<ncolor_cpp::ForkJoinPool>> registry;
+    static std::map<int, std::weak_ptr<PoolSlot>> registry;
     std::lock_guard<std::mutex> lk(registry_mutex);
     auto& slot = registry[n_threads];
     if (auto live = slot.lock()) return live;
-    auto fresh = std::make_shared<ncolor_cpp::ForkJoinPool>(
-        static_cast<size_t>(n_threads));
+    auto fresh = std::make_shared<PoolSlot>(n_threads);
     slot = fresh;
     return fresh;
 }
 
-// Serializes engine calls. Taken inside the GIL-released region of every
-// engine method (never while holding the GIL, so a thread waiting here
-// cannot deadlock a thread that needs the GIL to finish). Two threads
-// entering one engine, or two engines on a shared pool, at the same time
-// used to corrupt the pool and crash the process.
-static std::mutex& engine_mutex() {
-    static std::mutex m;
-    return m;
+// A pool of its own, shared with nobody, so this engine's calls never
+// wait behind another engine's. Costs its own worker threads.
+static std::shared_ptr<PoolSlot> resolve_pool(int n_threads, bool private_pool) {
+    const int n = n_threads <= 1 ? 1 : n_threads;
+    return private_pool ? std::make_shared<PoolSlot>(n) : acquire_shared_pool(n);
 }
 
 // Persistent-pool wrapper for expand_labels + parallel LUT apply.
@@ -207,16 +211,16 @@ static std::mutex& engine_mutex() {
 // across calls so the only per-call cost is task enqueue.
 class ExpandEngine {
 public:
-    explicit ExpandEngine(double n_threads)
+    explicit ExpandEngine(double n_threads, bool private_pool = false)
         : n_threads_(resolve_threads(n_threads)),
-          pool_(acquire_shared_pool(n_threads_ <= 1 ? 1 : n_threads_)) {}
+          pool_(resolve_pool(n_threads_, private_pool)) {}
 
     int n_threads() const { return n_threads_; }
 
     // Free the persistent scratch buffers (see ExpandBuffers::release).
     void release() {
         py::gil_scoped_release gil;
-        std::lock_guard<std::mutex> engine_lock(engine_mutex());
+        std::lock_guard<std::mutex> engine_lock(pool_->mu);
         bufs_.release();
     }
 
@@ -251,12 +255,12 @@ public:
 
         {
             py::gil_scoped_release release;
-            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            std::lock_guard<std::mutex> engine_lock(pool_->mu);
             cast_into_(buf, src_ptr, out_ptr, total, "ExpandEngine.expand_labels");
             if (p == 2) {
-                ncolor_cpp::expand_labels_lp<2>(out_ptr, out_ptr, bufs_, shape, *pool_, n_threads_, wrap);
+                ncolor_cpp::expand_labels_lp<2>(out_ptr, out_ptr, bufs_, shape, pool_->pool, n_threads_, wrap);
             } else {
-                ncolor_cpp::expand_labels_lp<1>(out_ptr, out_ptr, bufs_, shape, *pool_, n_threads_, wrap);
+                ncolor_cpp::expand_labels_lp<1>(out_ptr, out_ptr, bufs_, shape, pool_->pool, n_threads_, wrap);
             }
         }
         return out;
@@ -289,10 +293,10 @@ public:
 
         {
             py::gil_scoped_release release;
-            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            std::lock_guard<std::mutex> engine_lock(pool_->mu);
             cast_into_(buf, src_ptr, out_ptr, total, "ExpandEngine.expand_labels_clean");
             ncolor_cpp::expand_labels_clean_inplace(
-                out_ptr, bufs_, shape, *pool_, n_threads_, p);
+                out_ptr, bufs_, shape, pool_->pool, n_threads_, p);
             std::memcpy(out_ptr, bufs_.lbl(),
                         bufs_.size() * sizeof(int32_t));
         }
@@ -323,15 +327,15 @@ public:
 
         {
             py::gil_scoped_release release;
-            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            std::lock_guard<std::mutex> engine_lock(pool_->mu);
             if (p == 2) {
-                ncolor_cpp::expand_labels_lp<2>(input, out_lbl_ptr, bufs_, shape, *pool_, n_threads_, wrap);
+                ncolor_cpp::expand_labels_lp<2>(input, out_lbl_ptr, bufs_, shape, pool_->pool, n_threads_, wrap);
                 const int32_t* d = bufs_.dist();
                 for (int64_t i = 0; i < total; ++i) {
                     out_dist_ptr[i] = std::sqrt(static_cast<double>(d[i]));
                 }
             } else if (p == 1) {
-                ncolor_cpp::expand_labels_lp<1>(input, out_lbl_ptr, bufs_, shape, *pool_, n_threads_, wrap);
+                ncolor_cpp::expand_labels_lp<1>(input, out_lbl_ptr, bufs_, shape, pool_->pool, n_threads_, wrap);
                 const int32_t* d = bufs_.dist();
                 for (int64_t i = 0; i < total; ++i) {
                     out_dist_ptr[i] = static_cast<double>(d[i]);
@@ -387,7 +391,7 @@ public:
 
         {
             py::gil_scoped_release release;
-            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            std::lock_guard<std::mutex> engine_lock(pool_->mu);
             // Initialise output to +infinity. If a class has no seeds the
             // expansion writes labels=0 and dist=INT_MAX/4; we replace
             // those with +inf for safe min-aggregation downstream.
@@ -411,7 +415,7 @@ public:
 
                 if (p == 2) {
                     ncolor_cpp::expand_labels_lp<2>(masked.data(),
-                        labels_out_scratch.data(), bufs_, shape, *pool_, n_threads_, wrap);
+                        labels_out_scratch.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
                     const int32_t* d = bufs_.dist();
                     double* out_c = out_ptr + static_cast<int64_t>(c - 1) * total;
                     for (int64_t i = 0; i < total; ++i) {
@@ -419,7 +423,7 @@ public:
                     }
                 } else if (p == 1) {
                     ncolor_cpp::expand_labels_lp<1>(masked.data(),
-                        labels_out_scratch.data(), bufs_, shape, *pool_, n_threads_, wrap);
+                        labels_out_scratch.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
                     const int32_t* d = bufs_.dist();
                     double* out_c = out_ptr + static_cast<int64_t>(c - 1) * total;
                     for (int64_t i = 0; i < total; ++i) {
@@ -462,7 +466,7 @@ public:
 
         {
             py::gil_scoped_release release;
-            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            std::lock_guard<std::mutex> engine_lock(pool_->mu);
             const double INF = std::numeric_limits<double>::infinity();
             for (int64_t i = 0; i < static_cast<int64_t>(n_labels) * n_labels; ++i)
                 D[i] = INF;
@@ -479,10 +483,10 @@ public:
 
                 if (p == 2) {
                     ncolor_cpp::expand_labels_lp<2>(masked.data(),
-                        labels_out_scratch.data(), bufs_, shape, *pool_, n_threads_, wrap);
+                        labels_out_scratch.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
                 } else if (p == 1) {
                     ncolor_cpp::expand_labels_lp<1>(masked.data(),
-                        labels_out_scratch.data(), bufs_, shape, *pool_, n_threads_, wrap);
+                        labels_out_scratch.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
                 } else {
                     throw std::invalid_argument("pairwise_nearest_distance: p must be 1 or 2");
                 }
@@ -554,7 +558,7 @@ public:
         int n_labels;
         {
             py::gil_scoped_release release;
-            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            std::lock_guard<std::mutex> engine_lock(pool_->mu);
             // Cast to int32 in parallel inside the released-GIL block.
             bool fits = true;
             dispatch_cast_dtype(buf.format, buf.itemsize,
@@ -562,14 +566,14 @@ public:
                     using T = std::remove_pointer_t<decltype(tag)>;
                     fits = ncolor_cpp::cast_to_int32<T>(
                         static_cast<const T*>(src_ptr), out_ptr, total,
-                        *pool_, n_threads_);
+                        pool_->pool, n_threads_);
                 });
             if (!fits) throw_label_overflow("ExpandEngine.format_labels");
             n_labels = first_seen
                 ? ncolor_cpp::format_labels_inplace_first_seen(
-                    out_ptr, total, *pool_, n_threads_)
+                    out_ptr, total, pool_->pool, n_threads_)
                 : ncolor_cpp::format_labels_inplace(
-                    out_ptr, total, *pool_, n_threads_);
+                    out_ptr, total, pool_->pool, n_threads_);
         }
         return {std::move(out), n_labels};
     }
@@ -585,13 +589,13 @@ private:
                 using T = std::remove_pointer_t<decltype(tag)>;
                 fits = ncolor_cpp::cast_to_int32<T>(
                     static_cast<const T*>(src_ptr), dst, total,
-                    *pool_, n_threads_);
+                    pool_->pool, n_threads_);
             });
         if (!fits) throw_label_overflow(api_name);
     }
 
     int n_threads_;
-    std::shared_ptr<ncolor_cpp::ForkJoinPool> pool_;
+    std::shared_ptr<PoolSlot> pool_;
     ncolor_cpp::ExpandBuffers bufs_;
 };
 
@@ -614,9 +618,9 @@ static constexpr int64_t MIN_HT_SIZE = 16;
 // build / coloring / apply_lut.
 class Solver {
 public:
-    explicit Solver(double n_threads)
+    explicit Solver(double n_threads, bool private_pool = false)
         : n_threads_(resolve_threads(n_threads)),
-          pool_(acquire_shared_pool(n_threads_ <= 1 ? 1 : n_threads_)) {}
+          pool_(resolve_pool(n_threads_, private_pool)) {}
 
     int n_threads() const { return n_threads_; }
 
@@ -628,7 +632,7 @@ public:
     // timings, conflict count) is reset too.
     void release() {
         py::gil_scoped_release gil;
-        std::lock_guard<std::mutex> engine_lock(engine_mutex());
+        std::lock_guard<std::mutex> engine_lock(pool_->mu);
         expand_bufs_.release();
         drop_(bg_mask_); drop_(partials_);
         drop_(src_idx_); drop_(dst_idx_);
@@ -677,7 +681,7 @@ public:
         std::vector<std::pair<int32_t, int32_t>> pairs;
         {
             py::gil_scoped_release release;
-            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            std::lock_guard<std::mutex> engine_lock(pool_->mu);
             // Cast to int32 in expand_bufs_.lbl(); the bg mask is unused
             // here (Solver.connect never applies a LUT) but cast_with_bg
             // is the parallel cast we already use elsewhere — bg writes
@@ -692,7 +696,7 @@ public:
                     using T = std::remove_pointer_t<decltype(tag)>;
                     fits = ncolor_cpp::cast_with_bg<T>(
                         static_cast<const T*>(src_ptr), labels, bg, total,
-                        *pool_, n_threads_);
+                        pool_->pool, n_threads_);
                 });
             if (!fits) throw_label_overflow("Solver.connect");
 
@@ -836,7 +840,7 @@ public:
         bool early_exit_empty = false;
         {
             py::gil_scoped_release release;
-            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            std::lock_guard<std::mutex> engine_lock(pool_->mu);
 
             // 0a. Cast input dtype → int32 (in expand_bufs_.lbl()) AND
             // capture the bg pattern (input == 0) into bg_mask_, all in
@@ -859,7 +863,7 @@ public:
                     using T = std::remove_pointer_t<decltype(tag)>;
                     fits = ncolor_cpp::cast_with_bg<T>(
                         static_cast<const T*>(src_ptr), expanded, bg, total,
-                        *pool_, n_threads_);
+                        pool_->pool, n_threads_);
                 });
             if (!fits) throw_label_overflow("Solver.label");
             stage("cast");
@@ -871,9 +875,9 @@ public:
             if (format_input) {
                 const int n_labels = first_seen
                     ? ncolor_cpp::format_labels_inplace_first_seen(
-                        expanded, total, *pool_, n_threads_)
+                        expanded, total, pool_->pool, n_threads_)
                     : ncolor_cpp::format_labels_inplace(
-                        expanded, total, *pool_, n_threads_);
+                        expanded, total, pool_->pool, n_threads_);
                 stage("format");
                 // Empty / all-bg input: output is all zeros, no
                 // expansion / coloring needed.
@@ -926,12 +930,12 @@ public:
                     // already points to.
                     ncolor_cpp::expand_labels_clean_inplace(
                         expand_input, expand_bufs_, shape,
-                        *pool_, n_threads_, p);
+                        pool_->pool, n_threads_, p);
                 } else if (em == "standard") {
                     if (p == 2) {
-                        ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
+                        ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, pool_->pool, n_threads_, wrap);
                     } else {
-                        ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, *pool_, n_threads_, wrap);
+                        ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, pool_->pool, n_threads_, wrap);
                     }
                 } else {
                     throw std::invalid_argument(
@@ -999,16 +1003,16 @@ public:
                 if (despur_remove_thin) {
                     ncolor_cpp::delete_spurs_labels_nd_inplace<int32_t>(
                         expanded, shape, /*threshold=*/1,
-                        despur_iters, pool_.get(), n_threads_,
+                        despur_iters, &pool_->pool, n_threads_,
                         despur_remove_thin);
                 } else {
                     despur_face_count_.assign((size_t)total, 0);
                     ncolor_cpp::compute_face_count_nd<int32_t>(
                         expanded, despur_face_count_.data(), shape,
-                        pool_.get(), n_threads_);
+                        &pool_->pool, n_threads_);
                     ncolor_cpp::despur_via_face_count_nd<int32_t>(
                         expanded, despur_face_count_.data(), shape,
-                        /*threshold=*/1, pool_.get(), n_threads_);
+                        /*threshold=*/1, &pool_->pool, n_threads_);
                 }
                 stage("despur");
             }
@@ -1123,7 +1127,7 @@ public:
                             expanded, shape, conn, connect_radius,
                             soft_conn, soft_radius,
                             base_ht_size, soft_ht_size,
-                            n_threads_, *pool_, wrap,
+                            n_threads_, pool_->pool, wrap,
                             pairs, fused_soft_pairs_,
                             /*base_ht_scratch=*/&fp_ht_buf_,
                             /*soft_ht_scratch=*/&fp_soft_ht_buf_);
@@ -1469,7 +1473,7 @@ public:
 
         {
             py::gil_scoped_release release;
-            std::lock_guard<std::mutex> engine_lock(engine_mutex());
+            std::lock_guard<std::mutex> engine_lock(pool_->mu);
             if (N > 0) {
                 std::vector<std::pair<int32_t, int32_t>> uniq;
                 clean_pairs(edge_ptr, n_edges_in, uniq);
@@ -1607,7 +1611,7 @@ private:
         partials_.assign(actual_chunks, 0);
         std::atomic<size_t> next{0};
         int32_t* partials_ptr = partials_.data();
-        pool_->parallel([&, partials_ptr]() {
+        pool_->pool.parallel([&, partials_ptr]() {
             size_t idx;
             while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < actual_chunks) {
                 const size_t i0 = idx * chunk_sz;
@@ -1647,7 +1651,7 @@ private:
         for (;;) {
             auto out = ncolor_cpp::find_pairs_nd_unpadded<int32_t>(
                 labels, shape, conn,
-                ht_size, n_threads_, *pool_, wrap, radius,
+                ht_size, n_threads_, pool_->pool, wrap, radius,
                 &fp_ht_buf_);
             if (out.size() < ht_size || ht_size >= HT_SIZE_CAP) return out;
             ht_size <<= 1;
@@ -1696,7 +1700,7 @@ private:
         for (;;) {
             auto out = ncolor_cpp::find_pairs_weighted_nd_unpadded<int32_t, Mode>(
                 labels, dist, shape, conn,
-                ht_size, n_threads_, *pool_, wrap,
+                ht_size, n_threads_, pool_->pool, wrap,
                 primary, counts, radius,
                 &fp_ht_buf_, &fp_primary_buf_, &fp_counts_buf_);
             if (out.size() < ht_size || ht_size >= HT_SIZE_CAP) return out;
@@ -1717,7 +1721,7 @@ private:
             edge_weights, de_table, weight_obj,
             indptr_, indices_, src_idx_, dst_idx_,
             colors_, last_n_conflicts_, picker_scratch_,
-            pool_.get(), n_threads_);
+            &pool_->pool, n_threads_);
     }
 
     // Apply the color LUT to ``expanded[i]``: bg pixels (bg_mask_[i]==1)
@@ -1745,7 +1749,7 @@ private:
             }
             return;
         }
-        ncolor_cpp::dispatch_parallel(*pool_, static_cast<size_t>(total),
+        ncolor_cpp::dispatch_parallel(pool_->pool, static_cast<size_t>(total),
             static_cast<size_t>(nt) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
             [bg_p, src, lp, out_ptr](size_t begin, size_t end) {
                 for (size_t i = begin; i < end; ++i) {
@@ -1758,7 +1762,7 @@ private:
     static void drop_(V& v) { V().swap(v); }
 
     int n_threads_;
-    std::shared_ptr<ncolor_cpp::ForkJoinPool> pool_;
+    std::shared_ptr<PoolSlot> pool_;
     ncolor_cpp::ExpandBuffers expand_bufs_;
     std::vector<uint8_t> bg_mask_;     // captured from cast, used by apply_lut
     std::vector<int32_t> partials_;     // max-reduce partials, reused across calls
@@ -1823,7 +1827,8 @@ PYBIND11_MODULE(_impl, m) {
         "Persistent threadpool wrapper for expand_labels + format_labels.\n"
         "One engine per pipeline; the pool and intermediate buffers are\n"
         "reused across calls.")
-        .def(py::init<double>(), py::arg("n_threads") = -1.0)
+        .def(py::init<double, bool>(), py::arg("n_threads") = -1.0,
+             py::arg("private_pool") = false)
         .def_property_readonly("n_threads", &ExpandEngine::n_threads)
         .def("expand_labels", &ExpandEngine::expand_labels,
              py::arg("labels"), py::arg("p") = 2, py::arg("wrap") = false,
@@ -1902,7 +1907,8 @@ PYBIND11_MODULE(_impl, m) {
         "  0 < x < 1                  → fraction × os.cpu_count() (e.g. 0.5)\n"
         "  1                          → serial\n"
         "  N >= 1                     → exact thread count")
-        .def(py::init<double>(), py::arg("n_threads") = -1.0)
+        .def(py::init<double, bool>(), py::arg("n_threads") = -1.0,
+             py::arg("private_pool") = false)
         .def_property_readonly("n_threads", &Solver::n_threads)
         .def("label", &Solver::label,
              py::arg("mask"), py::arg("n_colors") = 4,

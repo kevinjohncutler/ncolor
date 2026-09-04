@@ -6,11 +6,11 @@ from __future__ import annotations
 
 import numpy as np
 
-from ._engines import LOCK as _LOCK, expand_engine as _get_engine
+from ._engines import _expand_for
 
 
 def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
-                  wrap: bool = False, mode: str = "standard"):
+                  wrap: bool = False, mode: str = "standard", _engine=None):
     """Label expansion across background pixels.
 
     Two expansion algorithms are available, selected by ``mode``:
@@ -64,8 +64,7 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
 
     # The engine casts to int32 itself (checked, in parallel), so no
     # numpy astype pass here.
-    with _LOCK:                        # engine calls must not overlap
-        engine = _get_engine()
-        if mode == "standard":
-            return engine.expand_labels(arr, p=p, wrap=bool(wrap))
-        return engine.expand_labels_clean(arr, p=int(p))
+    engine = _expand_for(_engine)
+    if mode == "standard":
+        return engine.expand_labels(arr, p=p, wrap=bool(wrap))
+    return engine.expand_labels_clean(arr, p=int(p))

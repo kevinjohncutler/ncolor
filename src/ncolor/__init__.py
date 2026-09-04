@@ -17,6 +17,8 @@ Public names:
 * ``geo``                  — vector front end: ``geo.label`` / ``geo.connect``
                              for GeoDataFrames, GeoJSON and Shapely geometries
 * ``release_buffers``      — free the scratch memory kept between calls
+* ``Engine``               — an independent engine, for coloring several
+                             images at once from different threads
 """
 from ._version import __version__
 
@@ -31,6 +33,7 @@ __all__ = [
     "color_graph",
     "geo",
     "release_buffers",
+    "Engine",
 ]
 
 _LAZY_ATTRS = {
@@ -43,6 +46,7 @@ _LAZY_ATTRS = {
     "delete_spurs": ".format",
     "color_graph": ".color",
     "release_buffers": "._engines",
+    "Engine": "._engines",
 }
 
 # Submodules reachable as a plain attribute (``ncolor.geo.label``) after

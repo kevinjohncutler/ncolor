@@ -44,6 +44,17 @@ and versions follow [semantic versioning](https://semver.org/).
   integer dtypes already supported. The cast to the engine's int32 runs
   in parallel inside the call; `expand_labels` no longer pays a
   single-threaded `numpy.astype` pass first.
+- **`ncolor.Engine`, for coloring several images at once.** Every call
+  shares one thread pool, and only one call may be in flight per pool,
+  so calls from several threads took turns: threading four images
+  through the module-level functions ran no faster than doing them one
+  after another (measured 1.03x). An `Engine` holds its own pool and its
+  own scratch buffers, so several of them work at the same time; four
+  engines of four threads each colored 16 images in half the time of the
+  shared engine on an 18-core machine. Callers doing one image at a time
+  need nothing new, since a single call already uses every core. Size
+  `n_engines * n_threads` to about the core count, and budget roughly 20
+  bytes per pixel of the largest image each engine sees.
 - **`ncolor.release_buffers()`.** The engines keep the working set of the
   largest image processed so far (about 22 bytes per pixel for `label`)
   allocated between calls. After one whole-slide image that is

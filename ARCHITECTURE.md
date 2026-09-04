@@ -33,12 +33,14 @@ The package holds two engine objects for the life of the process, a
 `Solver` (label / connect / color_graph) and an `ExpandEngine`
 (expand_labels / format_labels), created on first use in
 `ncolor._engines`. Engines that resolve to the same thread count share
-one `ForkJoinPool`. Engine calls must not overlap: the Python wrappers
-take one process-wide lock, and each engine method also takes a C++
-mutex inside its GIL-released region as a backstop for direct
-`ncolor._backend` callers (the lock is taken only after the GIL is
-dropped, so a waiter can never deadlock a thread that needs the GIL to
-finish). Both engines keep the working set of the largest image they
+one `ForkJoinPool`. Only one `parallel()` may be in flight per thread
+pool, so a pool and the mutex serializing calls on it are one object
+(`PoolSlot`): every engine method takes its pool's mutex for the
+duration of the call. Engines sharing a pool therefore take turns, and
+engines built with `private_pool=True` run at the same time, which is
+what `ncolor.Engine` hands out. The mutex is taken only after the GIL is
+released, so a thread waiting on it can never block one that needs the
+GIL to finish. Both engines keep the working set of the largest image they
 have seen; `ncolor.release_buffers()` frees it.
 
 The headers under `cpp/` have no Python dependency; only `binding.cpp`
