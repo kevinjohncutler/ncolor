@@ -1350,6 +1350,9 @@ public:
                     soft_weights_.data(),
                     n_used);
                 stage("soft_search");
+                // The soft search may have vacated a color; keep the
+                // reported count and the pixel values in step.
+                n_used = ncolor_cpp::densify_colors(colors_, N);
             }
 
             // 5. Build LUT (expanded[i] is in 1..N, so lut size = N+1) and
@@ -1515,6 +1518,7 @@ public:
                             soft_indptr_.data(), soft_indices_.data(),
                             soft_weights_.data(),
                             n_used);
+                        n_used = ncolor_cpp::densify_colors(colors_, N);
                     }
                     stage("soft_search");
                 }

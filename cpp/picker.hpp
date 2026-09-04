@@ -40,6 +40,38 @@
 
 namespace ncolor_cpp {
 
+// Renumber the colors actually present to a dense 1..k, preserving their
+// relative order, and return k.
+//
+// The picker's working palette can end up with holes: it searches with a
+// fixed number of colors and a coloring may simply not need one of them
+// (the weighted objective picks widely separated palette entries and
+// leaves the rest unused), and the soft post-pass can vacate a color
+// too. Reporting the largest index as the color count would then
+// overstate it, and callers that normalize an image by the count would
+// be wrong about it as well, so the two are kept in step: the values are
+// made dense and the count is the number of them.
+inline int densify_colors(std::vector<uint8_t>& colors, int32_t N) {
+    if (N <= 0 || colors.empty()) return 0;
+    const int32_t n = std::min<int32_t>(N, (int32_t)colors.size());
+    uint8_t remap[256] = {0};
+    for (int32_t i = 0; i < n; ++i) remap[colors[i]] = 1;
+    int k = 0;
+    // Index 0 is background and stays 0; 1..255 are colors.
+    for (int c = 1; c < 256; ++c) {
+        if (remap[c]) remap[c] = (uint8_t)(++k);
+    }
+    if (k == 0) return 0;
+    bool already_dense = true;
+    for (int c = 1; c <= k; ++c) {
+        if (remap[c] != c) { already_dense = false; break; }
+    }
+    if (!already_dense) {
+        for (int32_t i = 0; i < n; ++i) colors[i] = remap[colors[i]];
+    }
+    return k;
+}
+
 // Per-attempt scratch for the parallel race (one colors vector per
 // racing attempt). Keep one per engine and reuse it across calls.
 struct PickerScratch {
@@ -673,8 +705,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
         }
     }
 
-    int n_used = 0;
-    for (uint8_t c : colors_) if (c > n_used) n_used = c;
+    const int n_used = densify_colors(colors_, N);
     // O(M) tally of adjacent same-color pairs so callers that
     // request return_conflicts don't pay another scan over labels.
     last_n_conflicts_ = 0;
