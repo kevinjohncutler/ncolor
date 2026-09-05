@@ -93,6 +93,13 @@ def rand_graph(n, deg, seed):
 
 def time_graphs(mod):
     out = {}
+    # color_graph is newer than some of the builds this is pointed at
+    # (it does not exist in 2.0.2), and a missing entry is simply not
+    # compared, so say so and carry on rather than losing the run.
+    if not hasattr(mod, "color_graph"):
+        print("  (this build has no color_graph; skipping the hard graphs)",
+              flush=True)
+        return out
     for n, deg, seed in HARD_GRAPHS:
         edges = rand_graph(n, deg, seed)
         fn = lambda e=edges, k=n: mod.color_graph(e, k)

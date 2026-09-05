@@ -97,6 +97,16 @@ def summarize(all_rows):
         print(f"| {pair} | {len(rows)} | {np.exp(np.mean(np.log(r))):.3f}x | "
               f"{sum(1 for x in rows if verdict(x[7], x[8]) == 'faster')} | "
               f"{sum(1 for x in rows if verdict(x[7], x[8]) == 'SLOWER')} |")
+        # Every measurement gets its own 95% interval, so a run this wide
+        # turns up "significant" results by chance alone. Counting them
+        # against that floor is the difference between a regression and
+        # a coincidence: a handful of slower results among hundreds of
+        # measurements is what noise looks like, and only a result that
+        # repeats in an independent run is worth chasing.
+        print(f"\nAt 95% confidence over {len(rows)} measurements, about "
+              f"{len(rows) * 0.025:.0f} results in each direction are expected "
+              f"to clear the bar by chance. Treat a count near that as noise, "
+              f"and confirm anything real by repeating the run.")
 
 
 def report_pair(h, data, a_name, b_name, rng, detail, all_rows, multi):
