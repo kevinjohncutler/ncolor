@@ -82,7 +82,7 @@ does. `cpp/ncolor.hpp` includes all of them and
 |---|---|
 | `expand.hpp`, `expand_lp.hpp`, `chamfer.hpp` | ND Lp Voronoi expand (Saito-Toriwaki L1 + Felzenszwalb L2) |
 | `expand_clean.hpp` | Antipodal-bridge test + despur cascade fused with expand (the default `"clean"` mode) |
-| `connect.hpp`, `connect_with_face_count.hpp` | `find_pairs` adjacency scan (dual-emit hard + soft) |
+| `connect.hpp` | `find_pairs` adjacency scan (dual-emit hard + soft) |
 | `cc_label.hpp` | Connected-components labeling (drop-in for `skimage.measure.label`) |
 | `format_labels.hpp` | Compact non-sequential labels to `1..N`; range-checked parallel casts from bool, any integer width and float |
 | `color.hpp` | BFS coloring + Welsh-Powell + repair |

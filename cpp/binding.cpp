@@ -33,7 +33,6 @@
 #include "delete_spurs.hpp"
 #include "delete_spurs_labels.hpp"
 #include "fast_despur.hpp"
-#include "connect_with_face_count.hpp"
 #include "expand_lp.hpp"
 #include "expand_clean.hpp"
 #include "soft_color.hpp"
@@ -982,20 +981,6 @@ public:
             // modifies ``expanded`` in place so find_pairs / coloring
             // operate on the despurred graph.
             const int32_t* lut_lbl_ptr = expanded;
-            // Note on fusion: ``find_pairs_with_face_count_2d_v2`` +
-            // ``despur_via_face_count_with_pair_decrement_2d`` (see
-            // ``connect_with_face_count.hpp``) provide a correct fused
-            // path that emits pairs + face_count in one scan and
-            // prunes ghost edges via per-pair contact counts. Verified
-            // to produce a bit-identical pair list to the safe
-            // separate-pass path on MM (14769 pairs both ways).
-            //
-            // BUT: the HT_lookup-driven decrements during the despur
-            // peel-back (~56 k lookups on MM with random access in a
-            // 512 KB hashtable) cost ~5 ms — more than the ~1.5 ms
-            // saved by skipping a standalone find_pairs pass. Net
-            // regression. Keeping the algorithm in-tree but not wired
-            // here; can be turned on by callers that want it.
             if (despur_iters > 0 && expand) {
                 lut_lbl_.assign(expanded, expanded + total);
                 lut_lbl_ptr = lut_lbl_.data();
@@ -2297,93 +2282,6 @@ PYBIND11_MODULE(_impl, m) {
 
     // Fast despur built on a pre-computed face-count array. Avoids the
     // iter-0 full-image scan that dominates ``delete_spurs_labels``.
-    m.def("fast_despur",
-          [](py::array labels_in, int threshold, int n_threads) {
-              if (!(labels_in.flags() & py::array::c_style)) {
-                  labels_in = py::array::ensure(labels_in, py::array::c_style);
-              }
-              const auto buf = labels_in.request();
-              const int ndim = static_cast<int>(buf.ndim);
-              std::vector<int64_t> shape(ndim);
-              std::vector<py::ssize_t> out_shape(ndim);
-              for (int d = 0; d < ndim; ++d) {
-                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
-                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
-              }
-              py::array out(labels_in.dtype(), out_shape);
-              std::memcpy(out.request().ptr, buf.ptr,
-                          (size_t)buf.size * (size_t)buf.itemsize);
-              int64_t n_removed = 0;
-              const int nt = n_threads > 0 ? n_threads :
-                  (int)std::thread::hardware_concurrency();
-              const int64_t total = (int64_t)buf.size;
-              std::vector<uint8_t> face_count((size_t)total);
-              {
-                  py::gil_scoped_release release;
-                  std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
-                  if (nt > 1) pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
-                  dispatch_int_dtype(buf.format, buf.itemsize, "fast_despur",
-                      [&](auto* tag) {
-                          using T = std::remove_pointer_t<decltype(tag)>;
-                          T* lbl = static_cast<T*>(out.mutable_data());
-                          ncolor_cpp::compute_face_count_nd<T>(
-                              lbl, face_count.data(), shape, pool.get(), nt);
-                          n_removed = ncolor_cpp::despur_via_face_count_nd<T>(
-                              lbl, face_count.data(), shape,
-                              threshold, pool.get(), nt);
-                      });
-              }
-              return std::make_pair(std::move(out), n_removed);
-          },
-          py::arg("labels"), py::arg("threshold") = 1, py::arg("n_threads") = 0,
-          "Fast despur: precompute per-pixel same-label face-neighbour\n"
-          "count once (parallel branchless scan), then peel back spurs\n"
-          "via a queue that decrements neighbours' counts on revert.\n"
-          "No full-image rescans after iter 0.");
-
-    // Fused connect+face_count scan: returns (pairs, face_count) from
-    // one cache-warm pass. 2D only for now.
-    m.def("find_pairs_with_face_count_2d",
-          [](py::array labels_in, int conn, int n_threads, uint64_t ht_size) {
-              if (!(labels_in.flags() & py::array::c_style)) {
-                  labels_in = py::array::ensure(labels_in, py::array::c_style);
-              }
-              const auto buf = labels_in.request();
-              if (buf.ndim != 2) throw std::invalid_argument("2D only");
-              const int64_t H = buf.shape[0];
-              const int64_t W = buf.shape[1];
-              const int nt = n_threads > 0 ? n_threads :
-                  (int)std::thread::hardware_concurrency();
-              std::vector<py::ssize_t> fc_shape = {(py::ssize_t)H, (py::ssize_t)W};
-              py::array_t<uint8_t> face_count(fc_shape);
-              std::memset(face_count.mutable_data(), 0, (size_t)(H * W));
-              std::vector<std::pair<int32_t, int32_t>> pairs;
-              {
-                  py::gil_scoped_release release;
-                  ncolor_cpp::ForkJoinPool pool(nt);
-                  dispatch_int_dtype(buf.format, buf.itemsize, "find_pairs_with_face_count_2d",
-                      [&](auto* tag) {
-                          using T = std::remove_pointer_t<decltype(tag)>;
-                          pairs = ncolor_cpp::find_pairs_with_face_count_2d<T>(
-                              static_cast<const T*>(buf.ptr), H, W, conn,
-                              face_count.mutable_data(), ht_size, nt, pool);
-                      });
-              }
-              py::array_t<int32_t> pair_arr(
-                  {(py::ssize_t)pairs.size(), (py::ssize_t)2});
-              auto pa = pair_arr.mutable_unchecked<2>();
-              for (size_t k = 0; k < pairs.size(); ++k) {
-                  pa(k, 0) = pairs[k].first;
-                  pa(k, 1) = pairs[k].second;
-              }
-              return std::make_tuple(std::move(pair_arr), std::move(face_count));
-          },
-          py::arg("labels"), py::arg("conn") = 2, py::arg("n_threads") = 0,
-          py::arg("ht_size") = (uint64_t)65536,
-          "Fused 2D connect+face_count scan. Returns (pairs[K,2],\n"
-          "face_count[H,W]) in a single cache-warm pass — used to\n"
-          "replace separate find_pairs + compute_face_count calls.");
-
     m.def("two_hop_csr",
           [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indptr,
              py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indices)

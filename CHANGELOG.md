@@ -169,6 +169,23 @@ and versions follow [semantic versioning](https://semver.org/).
   test that assumed Python's half-to-even rounding was wrong on hosts
   where the product lands on .5.
 
+### Removed
+
+- **The last dimension-specific code paths.** The package's rule is one
+  ND implementation per kernel, and four things broke it. Two were dead:
+  the `_backend.fast_despur` and `_backend.find_pairs_with_face_count_2d`
+  exports were never called from Python or the tests, and the header
+  behind the second (`connect_with_face_count.hpp`) had no other user;
+  both exports and that header are gone. Two were live 2D
+  specializations sitting beside an ND kernel that was kept as their
+  parity reference, in `delete_spurs_labels.hpp` and `fast_despur.hpp`;
+  the 2D branches are gone and every dimension runs the ND kernel.
+  Verified against the previous binary: the despur paths give identical
+  output on 24 (image, iterations, remove_thin) combinations across 2D
+  and 3D, and the 2D/3D/4D reference tests pass. Cost on the one
+  opt-in path this touches: 0.93 to 1.25 ms on a 1024x1024 image,
+  unchanged at 4096x4096.
+
 ### Fixed
 
 - **An engine whose threads cannot be created raises instead of taking

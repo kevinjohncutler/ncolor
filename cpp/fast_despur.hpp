@@ -50,43 +50,6 @@ inline void compute_face_count_nd(
 
     const int nt = (pool && n_threads > 1) ? n_threads : 1;
 
-    if (ndim == 2) {
-        const int64_t H = shape[0], W = shape[1];
-        auto kernel = [&](int64_t y_lo, int64_t y_hi) {
-            for (int64_t y = y_lo; y < y_hi; ++y) {
-                const bool yL = (y > 0);
-                const bool yH = (y + 1 < H);
-                for (int64_t x = 0; x < W; ++x) {
-                    const int64_t i = y * W + x;
-                    const T lab = labels[i];
-                    // Branchless: the bg check (lab != 0) and edge
-                    // checks (yL/yH/xL/xH) are AND'd so an OOB or bg
-                    // pixel always contributes 0.
-                    const int hN = yL          && labels[i - W] == lab;
-                    const int hS = yH          && labels[i + W] == lab;
-                    const int hW = (x > 0)     && labels[i - 1] == lab;
-                    const int hE = (x + 1 < W) && labels[i + 1] == lab;
-                    const int c  = (lab != 0) ? (hN + hS + hW + hE) : 0;
-                    count[i] = (uint8_t)c;
-                }
-            }
-        };
-        if (nt > 1 && H >= (int64_t)(nt * 4)) {
-            std::atomic<int64_t> next_row{0};
-            const int64_t chunk = std::max<int64_t>(1, H / (nt * 4));
-            pool->parallel([&]() {
-                while (true) {
-                    int64_t y_lo = next_row.fetch_add(chunk);
-                    if (y_lo >= H) break;
-                    int64_t y_hi = std::min(H, y_lo + chunk);
-                    kernel(y_lo, y_hi);
-                }
-            });
-        } else {
-            kernel(0, H);
-        }
-        return;
-    }
 
     // ND fallback (any ndim ≥ 1). Strides for the 2*ndim face offsets.
     std::vector<int64_t> strides(ndim);
@@ -234,32 +197,7 @@ inline int64_t despur_via_face_count_nd(
     // actually had a same-label contribution from us. This is what
     // keeps the decrements correct.
     size_t head = 0;
-    if (ndim == 2) {
-        while (head < queue.size()) {
-            const int64_t i = queue[head].first;
-            const T old_lab  = queue[head].second;
-            ++head;
-            const int64_t y = i / W;
-            const int64_t x = i - y * W;
-            auto poke = [&](int64_t j) {
-                if (labels[j] != old_lab) return;  // not same-label contribution
-                uint8_t fc = face_count[j];
-                if (fc > 0) {
-                    fc = (uint8_t)(fc - 1);
-                    face_count[j] = fc;
-                }
-                if ((int8_t)fc <= th) {
-                    labels[j] = 0;
-                    ++removed;
-                    queue.emplace_back(j, old_lab);
-                }
-            };
-            if (y > 0)     poke(i - W);
-            if (y + 1 < H) poke(i + W);
-            if (x > 0)     poke(i - 1);
-            if (x + 1 < W) poke(i + 1);
-        }
-    } else {
+    {
         std::vector<int64_t> c(ndim, 0);
         while (head < queue.size()) {
             const int64_t i = queue[head].first;

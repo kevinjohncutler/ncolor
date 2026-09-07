@@ -28,7 +28,7 @@ The pieces, in pipeline order:
 | `format_labels.hpp` | compact labels to `1..N`; range-checked casts from any integer or float type |
 | `expand.hpp`, `expand_lp.hpp`, `chamfer.hpp` | N-D L1 / L2 Voronoi expansion (Saito-Toriwaki and Felzenszwalb sweeps) with NEON / SSE / AVX2 inner loops |
 | `expand_clean.hpp` | the same expansion fused with bridge and stub removal (the `"clean"` mode) |
-| `connect.hpp`, `connect_with_face_count.hpp` | the `find_pairs` adjacency scan, hard and soft kernels in one pass |
+| `connect.hpp` | the `find_pairs` adjacency scan, hard and soft kernels in one pass |
 | `color.hpp` | CSR construction, BFS / greedy coloring, repair, conflict check |
 | `picker.hpp` | the coloring picker: the race of strategies (`tabucol.hpp`, `bb_dsatur.hpp`, `hea.hpp`, `clique_lb.hpp`) that `label` and `color_graph` run |
 | `soft_color.hpp` | soft-constraint local search after the hard coloring |

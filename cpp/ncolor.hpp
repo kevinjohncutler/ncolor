@@ -30,7 +30,6 @@
 #include "chamfer.hpp"
 #include "expand_clean.hpp"
 #include "connect.hpp"
-#include "connect_with_face_count.hpp"
 #include "color.hpp"
 #include "picker.hpp"
 #include "soft_color.hpp"
