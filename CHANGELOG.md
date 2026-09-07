@@ -171,6 +171,21 @@ and versions follow [semantic versioning](https://semver.org/).
 
 ### Fixed
 
+- **An engine whose threads cannot be created raises instead of taking
+  the interpreter down.** Under a memory cap, or with more threads
+  requested than the system allows, the pool's constructor threw partway
+  through starting its workers and the ones already running were
+  destroyed joinable, which is `std::terminate`. That was a core dump
+  from Python. Workers now wait at a start gate until every one exists;
+  a failure releases and joins them and surfaces as `RuntimeError`. The
+  module-level pool also falls back to taking turns on the full-width
+  engine when a narrow one cannot be built.
+- **`connect()` on sparse label ids no longer sizes its hashtables from
+  the largest label.** An image whose 500 cells were numbered up to a
+  million got a table for a million: 9.4 ms against 0.7 ms now. Tables
+  are sized from the number of distinct labels; the pairs still carry
+  the original ids, and compacted inputs are unchanged.
+
 - **A cheap coloring now outranks an expensive one in the picker's
   race.** Deciding the winner by lowest-numbered success meant the race
   waited for every search below the winner, and a search decided the
