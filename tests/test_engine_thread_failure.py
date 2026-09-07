@@ -14,11 +14,19 @@ rather than after the hundred thousand the kernel would otherwise allow
 process already holds when it is applied: a fixed cap that fit an
 8-thread machine left a 32-thread one, whose wide engine alone reserves
 256 MB of stacks, unable to start the test's own threads. macOS refuses
-early on its own and does not enforce the cap; nor does Windows.
+early on its own and does not enforce the cap.
+
+Windows enforces no such cap and refuses only after exhausting kernel
+resources, which takes about 80 s of thread creation. So the crash test
+runs there with a budget to match, and the fallback test, whose subject
+is the Python-side pool logic and is the same on every platform, runs
+on Linux and macOS only.
 """
 import subprocess
 import sys
 import textwrap
+
+import pytest
 
 # Defines cap_here(): on Linux, limit the address space to what this
 # process holds right now plus headroom for a few more threads and small
@@ -56,10 +64,13 @@ _ASK_FOR_TOO_MANY = _CAP + textwrap.dedent(
     """
 )
 
+# Windows reaches the failure only by exhaustion: measured 81 s.
+_TIMEOUT = 400 if sys.platform == "win32" else 120
+
 
 def test_impossible_thread_count_raises_instead_of_aborting():
     proc = subprocess.run([sys.executable, "-c", _ASK_FOR_TOO_MANY],
-                          capture_output=True, timeout=120)
+                          capture_output=True, timeout=_TIMEOUT)
     assert proc.returncode == 0, (
         f"returncode={proc.returncode} (negative or 134 => the process died)\n"
         f"stdout: {proc.stdout.decode(errors='replace')[-800:]}\n"
@@ -67,6 +78,10 @@ def test_impossible_thread_count_raises_instead_of_aborting():
     assert b"raised" in proc.stdout
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="no cheap way to make thread creation fail on "
+                           "Windows; the pool logic under test is "
+                           "platform-independent and covered elsewhere")
 def test_module_functions_keep_working_after_a_failed_engine():
     """The pool falls back to taking turns rather than failing calls."""
     code = _CAP + textwrap.dedent(
