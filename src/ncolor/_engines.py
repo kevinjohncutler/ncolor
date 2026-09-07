@@ -61,6 +61,7 @@ _LOCK = threading.Lock()
 _all = []            # every engine created, in creation order
 _narrow = []         # the engines overlapping calls share
 _bound = 0           # engines handed to threads so far
+_cannot_grow = False # a narrow engine could not be built; stop trying
 _in_flight = 0       # calls running right now
 _concurrent = False  # has more than one thread ever called?
 _next_group = 1      # pool group 0 is the process-wide default
@@ -129,7 +130,7 @@ def _bind():
     than the call: four threads handing one lock back and forth measured
     2.3 ms of overhead per call, several times the work itself.
     """
-    global _concurrent, _bound
+    global _concurrent, _bound, _cannot_grow
     primary = _primary()
     with _LOCK:
         _bound += 1
@@ -143,17 +144,28 @@ def _bind():
     with _LOCK:
         # Overlapping callers share the narrow engines: one machine's
         # worth of threads between them, however many threads call.
-        if len(_narrow) < _max_engines():
-            eng = Engine(n_threads=_narrow_threads())
-            _narrow.append(eng)
-            _all.append(eng)
+        if len(_narrow) < _max_engines() and not _cannot_grow:
+            try:
+                eng = Engine(n_threads=_narrow_threads())
+            except (MemoryError, RuntimeError):
+                # The machine would not give us another engine (out of
+                # address space, or out of threads). Stop asking, and
+                # let this caller take turns on whatever exists: the
+                # full-width engine if nothing narrow was built yet.
+                # Slower, not broken.
+                _cannot_grow = True
+                eng = _narrow[(_bound - 1) % len(_narrow)] if _narrow else primary
+            else:
+                _narrow.append(eng)
+                _all.append(eng)
         else:
             # More callers than engines: they share, and take turns.
             # Round-robin on the number handed out, so threads that
             # arrive later spread over the engines instead of piling
             # onto one (thread ids get recycled, so they cannot be the
-            # thing that distributes them).
-            eng = _narrow[(_bound - 1) % len(_narrow)]
+            # thing that distributes them). If no narrow engine could
+            # ever be built, everyone takes turns on the wide one.
+            eng = _narrow[(_bound - 1) % len(_narrow)] if _narrow else primary
         _tls.engine = eng
         return eng
 

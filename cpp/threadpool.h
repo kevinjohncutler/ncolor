@@ -139,10 +139,31 @@ public:
           bar_count_(0),
           bar_sense_(0)
     {
+        // Workers wait at a start gate before they touch the barrier.
+        // If creating a thread fails partway (address space, thread
+        // limits), the ones already running would otherwise be parked
+        // at a barrier that can never fill, and destroying them
+        // joinable during unwinding would call std::terminate: measured
+        // as a core dump from a Python process that asked for a fifth
+        // engine under a memory cap. With the gate, a failure tells
+        // the started workers to leave, joins them, and rethrows, and
+        // the caller gets an exception it can catch.
         workers_.reserve(num_workers_);
-        for (size_t i = 0; i < num_workers_; ++i) {
-            workers_.emplace_back(&ForkJoinPool::worker_main_, this, i);
+        try {
+            for (size_t i = 0; i < num_workers_; ++i) {
+                workers_.emplace_back(&ForkJoinPool::worker_main_, this, i);
+            }
+        } catch (...) {
+            start_.store(-1, std::memory_order_release);
+            ncolor_threadpool_detail::wake_all(
+                reinterpret_cast<int*>(&start_));
+            for (auto& w : workers_) {
+                if (w.joinable()) w.join();
+            }
+            throw;
         }
+        start_.store(1, std::memory_order_release);
+        ncolor_threadpool_detail::wake_all(reinterpret_cast<int*>(&start_));
     }
 
     // Execute fn on all workers + calling thread, block until all complete.
@@ -174,6 +195,14 @@ public:
 
 private:
     void worker_main_(size_t worker_index) {
+        // Hold at the gate until the constructor has either created
+        // every worker (1) or given up (-1). Nothing here has touched
+        // the barrier yet, so a worker told to leave can simply return.
+        while (start_.load(std::memory_order_acquire) == 0) {
+            ncolor_threadpool_detail::wait_on_value(
+                reinterpret_cast<int*>(&start_), 0);
+        }
+        if (start_.load(std::memory_order_acquire) < 0) return;
         // Opt-in (NCOLOR_PIN_THREADS), Linux-only; a no-op otherwise.
         ncolor::affinity::pin_worker(static_cast<unsigned>(worker_index),
                                      static_cast<unsigned>(num_workers_));
@@ -236,6 +265,7 @@ private:
     // Barrier state
     std::atomic<size_t> bar_count_;
     std::atomic<int> bar_sense_;
+    std::atomic<int> start_{0};      // 0 hold, 1 go, -1 leave
 
     // Current work function (set by parallel(), read by workers)
     std::function<void()> work_fn_;
