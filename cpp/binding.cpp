@@ -1609,6 +1609,17 @@ private:
     int32_t distinct_labels_(const int32_t* lbl, int64_t total,
                              int32_t max_label) {
         if (max_label <= 0) return 0;
+        // Only when the table it can shrink is big. Below this the
+        // table sized from max_label is small enough that allocating
+        // and probing it costs less than counting, and the count is
+        // not free: every thread scatters byte stores into one array
+        // that, for compacted labels, is a few hundred bytes, so the
+        // threads fight over the same cache lines. Measured with the
+        // pass unconditional: connect() 0.74x across the corpus and
+        // 0.10x on a 64-core machine, for inputs the pass could not
+        // have helped. Above the threshold the array is large, the
+        // stores spread out, and the pass pays for itself many times.
+        if (max_label <= DISTINCT_PASS_MIN_MAX_LABEL) return max_label;
         seen_.assign(static_cast<size_t>(max_label) + 1, 0);
         uint8_t* seen = seen_.data();
         const size_t total_sz = static_cast<size_t>(total);
@@ -1799,6 +1810,12 @@ private:
 
     template <typename V>
     static void drop_(V& v) { V().swap(v); }
+
+    // Largest label value for which the adjacency tables are simply
+    // sized from it; see distinct_labels_. 65536 labels at the widest
+    // 3D degree is a 2M-slot table, 16 MB, which is where oversizing
+    // starts to cost more than a pass over the image.
+    static constexpr int32_t DISTINCT_PASS_MIN_MAX_LABEL = 65536;
 
     int n_threads_;
     std::shared_ptr<PoolSlot> pool_;
