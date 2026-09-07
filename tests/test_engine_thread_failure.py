@@ -7,15 +7,32 @@ and a core dump. The pool's constructor threw partway through creating
 its workers, and the workers already running were destroyed joinable.
 
 The subprocess is the assertion: a crash is a signal, not an exception,
-so it has to be observed from outside.
+so it has to be observed from outside. On Linux the subprocess caps its
+own address space first, so thread creation fails after a few threads
+rather than after the hundred thousand the kernel would otherwise allow
+(that took 95 s on an 8-core box); macOS refuses early on its own, and
+neither it nor Windows enforces the cap, so there the count does the
+work by itself.
 """
 import subprocess
 import sys
 import textwrap
 
-_ASK_FOR_TOO_MANY = textwrap.dedent(
+# Runs first in every subprocess: a cap that Linux enforces, with
+# OpenBLAS pinned so numpy still imports under it.
+_CAP = textwrap.dedent(
     """
-    import sys
+    import os, sys
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    if sys.platform == "linux":
+        import resource
+        cap = 1_200_000_000
+        resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
+    """
+)
+
+_ASK_FOR_TOO_MANY = _CAP + textwrap.dedent(
+    """
     import ncolor
     try:
         ncolor.Engine(n_threads=10_000_000)
@@ -40,7 +57,7 @@ def test_impossible_thread_count_raises_instead_of_aborting():
 
 def test_module_functions_keep_working_after_a_failed_engine():
     """The pool falls back to taking turns rather than failing calls."""
-    code = textwrap.dedent(
+    code = _CAP + textwrap.dedent(
         """
         import threading
         import numpy as np
@@ -50,7 +67,6 @@ def test_module_functions_keep_working_after_a_failed_engine():
         ncolor.label(a)
         # Make the narrow engines impossible to build, then ask for them.
         _engines._max_engines_cached = 4
-        _engines._smt_narrow = _engines._narrow_threads
         _engines._narrow_threads = lambda: 10_000_000
         errs = []
         def work():
