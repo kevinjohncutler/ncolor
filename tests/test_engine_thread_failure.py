@@ -8,25 +8,36 @@ its workers, and the workers already running were destroyed joinable.
 
 The subprocess is the assertion: a crash is a signal, not an exception,
 so it has to be observed from outside. On Linux the subprocess caps its
-own address space first, so thread creation fails after a few threads
+own address space so thread creation fails after a handful of threads
 rather than after the hundred thousand the kernel would otherwise allow
-(that took 95 s on an 8-core box); macOS refuses early on its own, and
-neither it nor Windows enforces the cap, so there the count does the
-work by itself.
+(that took 95 s on an 8-core box). The cap is relative to what the
+process already holds when it is applied: a fixed cap that fit an
+8-thread machine left a 32-thread one, whose wide engine alone reserves
+256 MB of stacks, unable to start the test's own threads. macOS refuses
+early on its own and does not enforce the cap; nor does Windows.
 """
 import subprocess
 import sys
 import textwrap
 
-# Runs first in every subprocess: a cap that Linux enforces, with
-# OpenBLAS pinned so numpy still imports under it.
+# Defines cap_here(): on Linux, limit the address space to what this
+# process holds right now plus headroom for a few more threads and small
+# allocations. Called at the point in each script where everything the
+# test needs already exists, so only the engine under test runs out.
 _CAP = textwrap.dedent(
     """
     import os, sys
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    if sys.platform == "linux":
+    def cap_here(headroom_mb=160):
+        if sys.platform != "linux":
+            return
         import resource
-        cap = 1_200_000_000
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmSize:"):
+                    vm_kb = int(line.split()[1])
+                    break
+        cap = vm_kb * 1024 + headroom_mb * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (cap, cap))
     """
 )
@@ -34,6 +45,7 @@ _CAP = textwrap.dedent(
 _ASK_FOR_TOO_MANY = _CAP + textwrap.dedent(
     """
     import ncolor
+    cap_here()
     try:
         ncolor.Engine(n_threads=10_000_000)
     except (MemoryError, RuntimeError) as e:
@@ -64,12 +76,14 @@ def test_module_functions_keep_working_after_a_failed_engine():
         import ncolor
         from ncolor import _engines
         a = np.zeros((96, 96), np.int32); a[4:40, 4:40] = 1; a[50:90, 50:90] = 2
-        ncolor.label(a)
-        # Make the narrow engines impossible to build, then ask for them.
-        _engines._max_engines_cached = 4
-        _engines._narrow_threads = lambda: 10_000_000
+        ncolor.label(a)                 # the full-width engine now exists
+        # Start the test's own threads before the cap, parked on a gate,
+        # so their stacks are already counted; then make the narrow
+        # engines impossible to build and let the threads go.
+        go = threading.Event()
         errs = []
         def work():
+            go.wait()
             try:
                 for _ in range(3):
                     out, conflicts = ncolor.label(a, return_conflicts=True)
@@ -79,6 +93,10 @@ def test_module_functions_keep_working_after_a_failed_engine():
                 errs.append(repr(e))
         ts = [threading.Thread(target=work) for _ in range(4)]
         for t in ts: t.start()
+        cap_here()
+        _engines._max_engines_cached = 4
+        _engines._narrow_threads = lambda: 10_000_000
+        go.set()
         for t in ts: t.join()
         print("errors:", errs, "cannot_grow:", _engines._cannot_grow)
         raise SystemExit(1 if errs or not _engines._cannot_grow else 0)
