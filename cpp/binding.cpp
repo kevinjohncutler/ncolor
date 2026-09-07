@@ -699,7 +699,8 @@ public:
             if (!fits) throw_label_overflow("Solver.connect");
 
             const int32_t max_label = parallel_max_label_(labels, total);
-            pairs = find_pairs_(labels, shape, conn, wrap, max_label);
+            const int32_t n_labels = distinct_labels_(labels, total, max_label);
+            pairs = find_pairs_(labels, shape, conn, wrap, n_labels);
         }
 
         return pairs_to_array(pairs);
@@ -1018,6 +1019,7 @@ public:
             // 2. Find adjacency pairs. Parallel max-reduce first
             // (was a single-threaded 1.2 ms loop at 2048²).
             const int32_t max_label = parallel_max_label_(expanded, total);
+            const int32_t n_labels = distinct_labels_(expanded, total, max_label);
             stage("max_scan");
             const int wobj = weight_objective;
             const int wmode = weight_mode;  // 0=Min (default), see binding kwargs
@@ -1042,28 +1044,28 @@ public:
                     case ReduceMode::Max:
                         pairs = find_pairs_weighted_<ReduceMode::Max>(
                             expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            max_label, pair_primary, pair_counts); break;
+                            n_labels, pair_primary, pair_counts); break;
                     case ReduceMode::Mean:
                         pairs = find_pairs_weighted_<ReduceMode::Mean>(
                             expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            max_label, pair_primary, pair_counts); break;
+                            n_labels, pair_primary, pair_counts); break;
                     case ReduceMode::Count:
                         pairs = find_pairs_weighted_<ReduceMode::Count>(
                             expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            max_label, pair_primary, pair_counts); break;
+                            n_labels, pair_primary, pair_counts); break;
                     case ReduceMode::Harmonic:
                         pairs = find_pairs_weighted_<ReduceMode::Harmonic>(
                             expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            max_label, pair_primary, pair_counts); break;
+                            n_labels, pair_primary, pair_counts); break;
                     case ReduceMode::MeanInv:
                         pairs = find_pairs_weighted_<ReduceMode::MeanInv>(
                             expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            max_label, pair_primary, pair_counts); break;
+                            n_labels, pair_primary, pair_counts); break;
                     case ReduceMode::Min:
                     default:
                         pairs = find_pairs_weighted_<ReduceMode::Min>(
                             expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            max_label, pair_primary, pair_counts); break;
+                            n_labels, pair_primary, pair_counts); break;
                 }
             } else if (min_contact > 1 && connect_radius > 1) {
                 // Contact-filtered pair-find: tracks per-pair pixel-
@@ -1081,7 +1083,7 @@ public:
                 pair_counts.clear();
                 pairs = find_pairs_weighted_<ReduceMode::Count>(
                     expanded, /*dist=*/nullptr, shape, conn, wrap,
-                    max_label, primary_unused, pair_counts,
+                    n_labels, primary_unused, pair_counts,
                     connect_radius);
                 // Filter pairs by count.
                 int kept = 0;
@@ -1112,9 +1114,9 @@ public:
                     count_forward_neighbors(ndim_local, soft_conn, soft_radius);
                 const int64_t n_fwd_delta = std::max<int64_t>(1, n_fwd_soft - n_fwd_base);
                 const int64_t base_ht_raw =
-                    2 * n_fwd_base * (int64_t)max_label;
+                    2 * n_fwd_base * (int64_t)n_labels;
                 const int64_t soft_ht_raw =
-                    2 * n_fwd_delta * (int64_t)max_label;
+                    2 * n_fwd_delta * (int64_t)n_labels;
                 uint64_t base_ht_size = (uint64_t)ipow2_ge(
                     std::max<int64_t>(base_ht_raw, MIN_HT_SIZE));
                 uint64_t soft_ht_size = (uint64_t)ipow2_ge(
@@ -1593,6 +1595,45 @@ private:
 
     // Parallel max-reduce over the (already-expanded) int32 label buffer.
     // Below the threshold runs serially (dispatch overhead exceeds work).
+    // How many distinct nonzero labels an image holds, for sizing the
+    // adjacency hashtables. They were sized from the largest label
+    // value, which is the same thing for compacted labels and wildly
+    // different for sparse ids: an image whose 500 cells were numbered
+    // up to a million got a table for a million, 9.4 ms of connect()
+    // against 0.6 ms for the same cells numbered 1..500. Distinct count
+    // is what the table actually has to hold. The pass is a byte per
+    // label value, set in parallel (every writer stores 1, so the race
+    // is benign) and counted once; the array is kept between calls
+    // like the other scratch. Pairs are still emitted with the labels
+    // as given; nothing is renumbered.
+    int32_t distinct_labels_(const int32_t* lbl, int64_t total,
+                             int32_t max_label) {
+        if (max_label <= 0) return 0;
+        seen_.assign(static_cast<size_t>(max_label) + 1, 0);
+        uint8_t* seen = seen_.data();
+        const size_t total_sz = static_cast<size_t>(total);
+        if (n_threads_ <= 1 || total < 8192) {
+            for (size_t i = 0; i < total_sz; ++i) seen[lbl[i]] = 1;
+        } else {
+            const size_t n_chunks = static_cast<size_t>(n_threads_) *
+                                    ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD;
+            const size_t actual_chunks = std::min(n_chunks, total_sz);
+            const size_t chunk_sz = (total_sz + actual_chunks - 1) / actual_chunks;
+            std::atomic<size_t> next{0};
+            pool_->pool.parallel([&]() {
+                size_t idx;
+                while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < actual_chunks) {
+                    const size_t i0 = idx * chunk_sz;
+                    const size_t i1 = std::min(i0 + chunk_sz, total_sz);
+                    for (size_t i = i0; i < i1; ++i) seen[lbl[i]] = 1;
+                }
+            });
+        }
+        int64_t n = 0;
+        for (size_t v = 1; v <= static_cast<size_t>(max_label); ++v) n += seen[v];
+        return static_cast<int32_t>(n);
+    }
+
     int32_t parallel_max_label_(const int32_t* lbl, int64_t total) {
         int32_t max_label = 0;
         if (n_threads_ <= 1 || total < 8192) {
@@ -1662,10 +1703,10 @@ private:
     // headroom (degree ~32) to size correctly on the first try; the
     // retry-on-full loop guarantees correctness if even this is low.
     static uint64_t initial_ht_size_(int ndim, int64_t n_fwd,
-                                     int32_t max_label) {
+                                     int32_t n_labels) {
         int64_t deg = 2 * n_fwd;
         if (ndim >= 3) deg = std::max<int64_t>(deg, 32);
-        const int64_t ht_raw = deg * static_cast<int64_t>(max_label);
+        const int64_t ht_raw = deg * static_cast<int64_t>(n_labels);
         return static_cast<uint64_t>(
             ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE)));
     }
@@ -1764,6 +1805,7 @@ private:
     ncolor_cpp::ExpandBuffers expand_bufs_;
     std::vector<uint8_t> bg_mask_;     // captured from cast, used by apply_lut
     std::vector<int32_t> partials_;     // max-reduce partials, reused across calls
+    std::vector<uint8_t> seen_;         // distinct-label scratch, reused across calls
     std::vector<int32_t> src_idx_, dst_idx_;
     std::vector<int32_t> indptr_, indices_;
     // Optional parallel-to-indices_ edge weights used by the boundary-
