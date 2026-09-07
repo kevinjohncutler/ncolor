@@ -35,6 +35,13 @@ namespace ncolor_cpp {
 
 namespace despur_detail {
 
+struct NDOffset {
+    std::vector<int8_t> dc;   // length ndim, values in {-1, 0, +1}
+    int64_t flat_offset;      // sum dc[d] * strides[d]
+    bool is_face;             // exactly one nonzero coord
+    int opposite_idx;         // index of -dc in the same table
+};
+
 // A pixel is marked for removal when it's a "spur" (≤ threshold
 // same-label face-neighbors) OR optionally a "thin-line interior":
 // exactly 2 same-label 8-connectivity neighbors AND those two are
@@ -43,56 +50,6 @@ namespace despur_detail {
 // in a single pass instead of needing N/2 iterations to peel from
 // both ends. The thin check is 2D-only here; the ND helper below
 // supports the axis-aligned subset (no diagonals) for 3D+.
-template <typename T>
-inline void count_and_mark_2d(
-    const T* labels, uint8_t* mark, int64_t H, int64_t W,
-    int threshold, int64_t y_lo, int64_t y_hi,
-    bool remove_thin = false)
-{
-    for (int64_t y = y_lo; y < y_hi; ++y) {
-        for (int64_t x = 0; x < W; ++x) {
-            const int64_t i = y * W + x;
-            const T lab = labels[i];
-            if (lab == 0) continue;
-            const bool hN = (y > 0)         && labels[i - W]     == lab;
-            const bool hS = (y + 1 < H)     && labels[i + W]     == lab;
-            const bool hW = (x > 0)         && labels[i - 1]     == lab;
-            const bool hE = (x + 1 < W)     && labels[i + 1]     == lab;
-            const int face = (int)hN + (int)hS + (int)hW + (int)hE;
-            if (face <= threshold) { mark[i] = 1; continue; }
-            if (!remove_thin) continue;
-            // Need EXACTLY two same-label 8-connectivity neighbours and
-            // they must form an opposite pair. Check faces first; only
-            // peek at diagonals when face count is 0 or 2 (any other
-            // face count rules out a 2-opposite total).
-            const bool hNW = (y > 0     && x > 0)     && labels[i - W - 1] == lab;
-            const bool hNE = (y > 0     && x + 1 < W) && labels[i - W + 1] == lab;
-            const bool hSW = (y + 1 < H && x > 0)     && labels[i + W - 1] == lab;
-            const bool hSE = (y + 1 < H && x + 1 < W) && labels[i + W + 1] == lab;
-            const int total = face + (int)hNW + (int)hNE + (int)hSW + (int)hSE;
-            if (total != 2) continue;
-            // Match exactly one of the four opposite-pair patterns.
-            const bool ns   = hN  && hS  && !hW && !hE && !hNW && !hNE && !hSW && !hSE;
-            const bool we   = hW  && hE  && !hN && !hS && !hNW && !hNE && !hSW && !hSE;
-            const bool nwse = hNW && hSE && !hN && !hS && !hW  && !hE  && !hNE && !hSW;
-            const bool nesw = hNE && hSW && !hN && !hS && !hW  && !hE  && !hNW && !hSE;
-            if (ns || we || nwse || nesw) mark[i] = 1;
-        }
-    }
-}
-
-// ND offset table for the thin-line detector. Enumerates all
-// 3^ndim − 1 unit-displacement neighbours (skip the all-zero offset),
-// records which are face neighbours (exactly one nonzero coord), and
-// the index of each offset's opposite (negated) partner. Built once
-// per delete_spurs_labels_nd_inplace call.
-struct NDOffset {
-    std::vector<int8_t> dc;   // length ndim, values in {-1, 0, +1}
-    int64_t flat_offset;      // sum dc[d] * strides[d]
-    bool is_face;             // exactly one nonzero coord
-    int opposite_idx;         // index of -dc in the same table
-};
-
 inline std::vector<NDOffset> build_nd_offsets(
     int ndim, const std::vector<int64_t>& strides)
 {
@@ -137,12 +94,13 @@ inline std::vector<NDOffset> build_nd_offsets(
     return out;
 }
 
-// ND fallback: per-pixel coord recomputation. With remove_thin = true
+// The one marking kernel, for every dimension. With remove_thin = true
 // this catches any 1-voxel-wide straight segment, whether axis-aligned
 // or diagonal: a pixel is marked iff its same-label 8-connectivity
 // neighbours count exactly two AND they sit at opposite offsets
-// (their displacement vectors negate). Slower than 2D fast path; used
-// for ndim != 2 and as the parity reference for the 2D specialisation.
+// (their displacement vectors negate). A 2D specialization used to sit
+// beside it with this as its parity reference; it was the only
+// dimension-specific path in the package and is gone.
 template <typename T>
 inline void count_and_mark_nd(
     const T* labels, uint8_t* mark,
@@ -245,38 +203,17 @@ inline int64_t delete_spurs_labels_nd_inplace(
         }
     };
 
-    const bool fast_2d = (ndim == 2);
-    const int64_t H = (ndim >= 1 ? shape[0] : 1);
-    const int64_t W = (ndim >= 2 ? shape[1] : 1);
     const int nt = (pool && n_threads > 1) ? n_threads : 1;
 
     // ND offsets table (used by count_and_mark_nd). Built once per call.
-    std::vector<despur_detail::NDOffset> nd_offsets;
-    if (!fast_2d) nd_offsets = despur_detail::build_nd_offsets(ndim, strides);
+    std::vector<despur_detail::NDOffset> nd_offsets =
+        despur_detail::build_nd_offsets(ndim, strides);
 
     // -- Iter 0: mark spurs in a shared bitmap via parallel slab
     // dispatch, then zero them out. ``remove_thin`` also kills
     // 1-voxel-wide straight interior pixels in the same pass.
     std::vector<uint8_t> mark(total, 0);
-    if (fast_2d) {
-        if (nt > 1) {
-            std::atomic<int64_t> next_row{0};
-            const int64_t chunk = std::max<int64_t>(1, H / (nt * 4));
-            pool->parallel([&]() {
-                while (true) {
-                    int64_t y_lo = next_row.fetch_add(chunk);
-                    if (y_lo >= H) break;
-                    int64_t y_hi = std::min(H, y_lo + chunk);
-                    despur_detail::count_and_mark_2d<T>(
-                        labels, mark.data(), H, W, threshold, y_lo, y_hi,
-                        remove_thin);
-                }
-            });
-        } else {
-            despur_detail::count_and_mark_2d<T>(
-                labels, mark.data(), H, W, threshold, 0, H, remove_thin);
-        }
-    } else {
+    {
         const int64_t outer = shape[0];
         const int64_t slab_size = strides[0];
         if (nt > 1) {
