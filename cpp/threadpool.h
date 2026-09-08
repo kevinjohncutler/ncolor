@@ -31,6 +31,8 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <system_error>
 #include <functional>
 #include <thread>
 #include <vector>
@@ -151,6 +153,18 @@ public:
         workers_.reserve(num_workers_);
         try {
             for (size_t i = 0; i < num_workers_; ++i) {
+                // Test hook: make worker N fail to start, as the OS would
+                // when out of threads. Reaching this path for real means
+                // exhausting the system, which Linux can be made to do
+                // in milliseconds under an address-space cap and Windows
+                // cannot within a test's budget (97 s on a VM, over
+                // 400 s on a CI runner).
+                if (i == fail_thread_at_()) {
+                    throw std::system_error(
+                        std::make_error_code(std::errc::resource_unavailable_try_again),
+                        "ncolor: thread creation failure injected by "
+                        "NCOLOR_TEST_FAIL_THREAD_AT");
+                }
                 workers_.emplace_back(&ForkJoinPool::worker_main_, this, i);
             }
         } catch (...) {
@@ -194,6 +208,18 @@ public:
     ForkJoinPool& operator=(const ForkJoinPool&) = delete;
 
 private:
+    // Read at every pool construction, not once per process: a test
+    // builds one pool that must succeed and then asks for pools that
+    // must fail. Pools are constructed a handful of times per process,
+    // so the lookup costs nothing.
+    static size_t fail_thread_at_() {
+        const char* e = std::getenv("NCOLOR_TEST_FAIL_THREAD_AT");
+        if (!e || !*e) return static_cast<size_t>(-1);
+        char* end = nullptr;
+        const unsigned long long n = std::strtoull(e, &end, 10);
+        return end != e ? static_cast<size_t>(n) : static_cast<size_t>(-1);
+    }
+
     void worker_main_(size_t worker_index) {
         // Hold at the gate until the constructor has either created
         // every worker (1) or given up (-1). Nothing here has touched

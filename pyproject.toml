@@ -57,6 +57,13 @@ environment = { NCOLOR_NO_CALIBRATE = "1", NCOLOR_MARCH_NATIVE = "0", NCOLOR_MAR
 select = "cp315-*"
 test-requires = ["pytest"]
 
+# Windows ARM64 has no shapely wheel either: pip tries to compile it and
+# fails in the cibuildwheel test venv, which failed every win_arm64 job
+# before a single ncolor test ran. Same remedy: test the core alone.
+[[tool.cibuildwheel.overrides]]
+select = "*-win_arm64"
+test-requires = ["pytest"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests", "test_files"]
 
