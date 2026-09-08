@@ -5,7 +5,7 @@ All notable changes to ncolor are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [semantic versioning](https://semver.org/).
 
-## [2.1.0] — unreleased
+## [2.1.0] — 2026-09-07
 
 ### Added
 
