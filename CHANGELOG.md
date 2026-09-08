@@ -5,7 +5,7 @@ All notable changes to ncolor are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [semantic versioning](https://semver.org/).
 
-## [2.1.1] — unreleased
+## [2.1.1] — 2026-09-07
 
 Follow-ups on the 2.1.0 geometry front end, found while checking it against
 the request in [#2](https://github.com/kevinjohncutler/ncolor/issues/2).
