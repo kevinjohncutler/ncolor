@@ -125,6 +125,17 @@ def _as_geometries(geoms):
     if isinstance(geoms, BaseGeometry):
         return np.asarray([geoms], dtype=object), None
 
+    # A DataFrame-shaped object reaching this point has no geometry we
+    # can use: either a plain pandas DataFrame, or a GeoDataFrame whose
+    # active geometry column was never set (``.geometry`` raises there, so
+    # the duck-typed check above declined it). Iterating one yields column
+    # *names*, so without this the failure is "cannot interpret str as a
+    # geometry", which points nowhere near the cause.
+    if hasattr(geoms, "columns") and hasattr(geoms, "index"):
+        raise TypeError(
+            "no active geometry column on this DataFrame; set one with "
+            "gdf.set_geometry('<column>'), or pass the geometries directly")
+
     # Any iterable of geometries / GeoJSON mappings / __geo_interface__.
     from shapely.geometry import shape
     out = []
@@ -176,7 +187,7 @@ def _contact_lengths(shapely, geoms, pairs, tolerance):
 
 
 def connect(geoms, tolerance=0.0, min_shared_length=0.0,
-                return_rejected=False):
+            return_rejected=False):
     """Adjacency pairs for a set of vector features.
 
     The vector counterpart of :func:`ncolor.connect`: instead of walking
@@ -292,7 +303,9 @@ def label(geoms, n=4, tolerance=0.0, min_shared_length=0.0, soft=True,
         ``column`` instead of a bare array. When the input was already a
         GeoDataFrame its other columns are carried over.
     column : str
-        Column name used by ``return_frame``.
+        Column name used by ``return_frame``. A column of this name
+        already on the input frame is replaced in the returned copy; the
+        input itself is never modified.
 
     Returns
     -------
@@ -332,10 +345,15 @@ def label(geoms, n=4, tolerance=0.0, min_shared_length=0.0, soft=True,
                 "return_frame=True requires GeoPandas: pip install geopandas"
             ) from exc
         if frame is not None and hasattr(frame, "assign"):
-            out = frame.copy()
+            out = frame.copy()                       # a GeoDataFrame
             out[column] = colors
         else:
-            out = gpd.GeoDataFrame({column: colors}, geometry=list(geoms))
+            # A GeoSeries (which has no .assign) or a non-GeoPandas input.
+            # Carry the CRS and the index across when there was a frame to
+            # take them from; a bare geometry list has neither.
+            out = gpd.GeoDataFrame({column: colors}, geometry=list(geoms),
+                                   crs=getattr(frame, "crs", None),
+                                   index=getattr(frame, "index", None))
 
     if return_n and return_conflicts:
         return out, int(n_used), conflicts

@@ -342,6 +342,31 @@ def regionprops(labels, n_labels=0):
 
 
 
+def _as_edge_array(edges, name):
+    """Cast an edge list to contiguous int32, refusing a silent wrap.
+
+    A vertex id at or above 2**31 would wrap on the cast and either turn
+    negative (dropped as invalid) or land on a different, in-range
+    vertex, which silently changes the graph that gets colored. Same
+    class of bug as the int32 label-image casts, and easy to hit by
+    passing 1-indexed label IDs from a large segmentation instead of
+    0-indexed vertices.
+    """
+    if edges is None:
+        return np.zeros((0, 2), dtype=np.int32)
+    arr = np.asarray(edges)
+    if arr.size and arr.dtype.kind in "iu":
+        info = np.iinfo(np.int32)
+        hi = int(arr.max())
+        lo = int(arr.min()) if arr.dtype.kind == "i" else 0
+        if hi > info.max or lo < info.min:
+            raise OverflowError(
+                f"{name} contains vertex ids outside int32 "
+                f"([{lo}, {hi}]); ncolor.color_graph indexes vertices as "
+                f"int32, so pass 0-indexed ids below {info.max}")
+    return np.ascontiguousarray(arr, dtype=np.int32)
+
+
 def color_graph(edges, n_vertices=None, n=4, soft_edges=None, max_depth=30,
                 return_n=False, check_conflicts=False, return_conflicts=False,
                 _engine=None):
@@ -390,8 +415,7 @@ def color_graph(edges, n_vertices=None, n=4, soft_edges=None, max_depth=30,
     >>> len(set(colors.tolist()))          # a triangle needs three
     3
     """
-    edges_arr = np.ascontiguousarray(edges, dtype=np.int32) \
-        if edges is not None else np.zeros((0, 2), dtype=np.int32)
+    edges_arr = _as_edge_array(edges, "edges")
     if edges_arr.ndim != 2 or edges_arr.shape[1] != 2:
         raise ValueError(
             f"edges must be an (M, 2) int array of 0-indexed vertex pairs; "
@@ -403,7 +427,7 @@ def color_graph(edges, n_vertices=None, n=4, soft_edges=None, max_depth=30,
 
     soft_arr = None
     if soft_edges is not None:
-        soft_arr = np.ascontiguousarray(soft_edges, dtype=np.int32)
+        soft_arr = _as_edge_array(soft_edges, "soft_edges")
         if soft_arr.ndim != 2 or soft_arr.shape[1] != 2:
             raise ValueError(
                 f"soft_edges must be an (E, 2) int array of 0-indexed "

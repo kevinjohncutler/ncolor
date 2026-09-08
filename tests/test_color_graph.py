@@ -135,3 +135,25 @@ def test_grid_graph_matches_raster_label():
     colors, n = ncolor.color_graph(pairs - 1, side * side, return_n=True)
     assert n <= 4
     assert _is_proper(colors, pairs - 1)
+
+
+@pytest.mark.parametrize("bad", [
+    np.array([[0, 1], [1, 2 ** 31 + 5]], dtype=np.int64),
+    np.array([[0, 2 ** 32 + 1]], dtype=np.uint64),
+    np.array([[0, -(2 ** 31) - 5]], dtype=np.int64),
+])
+def test_vertex_ids_outside_int32_raise_instead_of_wrapping(bad):
+    """A wrapped id would silently land on a different, valid vertex."""
+    with pytest.raises(OverflowError, match="int32"):
+        ncolor.color_graph(bad, n_vertices=3)
+
+
+def test_soft_edges_outside_int32_raise_too():
+    with pytest.raises(OverflowError, match="soft_edges"):
+        ncolor.color_graph([[0, 1]], 2,
+                           soft_edges=np.array([[0, 2 ** 31]], dtype=np.int64))
+
+
+def test_int64_edges_within_int32_are_accepted():
+    colors = ncolor.color_graph(np.array([[0, 1], [1, 2]], dtype=np.int64), 3)
+    assert colors[0] != colors[1] and colors[1] != colors[2]

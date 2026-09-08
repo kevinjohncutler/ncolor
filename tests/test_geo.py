@@ -268,3 +268,67 @@ def test_raster_label_points_at_geo_label_for_a_geodataframe():
     gdf = gpd.GeoDataFrame(geometry=grid_boxes(2))
     with pytest.raises(TypeError, match=r"geo\.label"):
         ncolor.label(gdf)
+
+
+@needs_geopandas
+def test_return_frame_from_a_geoseries_keeps_the_crs_and_index():
+    """A GeoSeries has no .assign, so the frame is rebuilt; carry both over."""
+    gs = gpd.GeoSeries(grid_boxes(3), crs="EPSG:3857",
+                       index=list(range(100, 109)))
+    out = geo.label(gs, return_frame=True)
+    assert isinstance(out, gpd.GeoDataFrame)
+    assert out.crs == gs.crs
+    assert out.index.tolist() == gs.index.tolist()
+    assert "color" in out.columns
+
+
+@needs_geopandas
+def test_return_frame_from_a_bare_geometry_list_has_no_crs():
+    out = geo.label(grid_boxes(3), return_frame=True)
+    assert isinstance(out, gpd.GeoDataFrame) and out.crs is None
+
+
+@needs_geopandas
+def test_dataframe_without_an_active_geometry_column_says_so():
+    bare = gpd.GeoDataFrame({"v": range(4), "shape": grid_boxes(2)})
+    with pytest.raises(TypeError, match="geometry column"):
+        geo.label(bare)
+    import pandas as pd
+    with pytest.raises(TypeError, match="geometry column"):
+        geo.label(pd.DataFrame({"a": [1, 2]}))
+
+
+@needs_geopandas
+def test_return_frame_replaces_an_existing_column_without_touching_the_input():
+    gdf = gpd.GeoDataFrame({"color": ["red"] * 9}, geometry=grid_boxes(3),
+                           crs="EPSG:3857")
+    out = geo.label(gdf, return_frame=True)
+    assert out["color"].tolist() != ["red"] * 9      # replaced in the copy
+    assert gdf["color"].tolist() == ["red"] * 9      # input untouched
+
+
+@needs_geopandas
+def test_geodataframe_with_a_renamed_geometry_column_and_odd_index():
+    gdf = gpd.GeoDataFrame({"v": [10, 20, 30]},
+                           geometry=[box(0, 0, 1, 1), box(1, 0, 2, 1),
+                                     box(2, 0, 3, 1)],
+                           index=[7, 3, 99], crs="EPSG:4326")
+    gdf = gdf.rename_geometry("shape")
+    out = geo.label(gdf, return_frame=True)
+    assert out.index.tolist() == [7, 3, 99]          # positional, not by label
+    assert out["color"].iloc[0] != out["color"].iloc[1]
+
+
+def test_geojson_file_without_geopandas(tmp_path, monkeypatch):
+    """The reader falls back to plain json when GeoPandas is absent."""
+    import sys
+    polys = grid_boxes(3)
+    fc = {"type": "FeatureCollection",
+          "features": [{"type": "Feature", "properties": {},
+                        "geometry": g.__geo_interface__} for g in polys]}
+    path = tmp_path / "plain.geojson"
+    path.write_text(json.dumps(fc))
+    monkeypatch.setitem(sys.modules, "geopandas", None)   # import -> ImportError
+    colors = geo.label(str(path))
+    assert colors.shape == (9,)
+    assert_proper(colors, geo.connect(str(path)))

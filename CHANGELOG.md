@@ -5,6 +5,40 @@ All notable changes to ncolor are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [semantic versioning](https://semver.org/).
 
+## [2.1.1] — unreleased
+
+Follow-ups on the 2.1.0 geometry front end, found while checking it against
+the request in [#2](https://github.com/kevinjohncutler/ncolor/issues/2).
+
+### Fixed
+
+- **`geo.label(geoseries, return_frame=True)` dropped the CRS and the
+  index.** A `GeoSeries` has no `.assign`, so that path rebuilds the frame
+  from the geometry list rather than copying the input, and it was
+  rebuilding it bare: the result came back with `crs=None` and a fresh
+  `RangeIndex`, which then writes an unprojected file and breaks any
+  later join on the original index. Both are carried across now. A
+  `GeoDataFrame` input was never affected (it is copied), and a bare
+  geometry list has neither to carry.
+- **A DataFrame with no active geometry column failed with a misleading
+  error.** `.geometry` raises on such a frame, so the GeoPandas
+  duck-typing declined it and the input fell through to the generic
+  iterable path, which iterates a DataFrame's *column names* and reported
+  "cannot interpret str as a geometry". It now says the geometry column
+  is not set and how to set it. Same for a plain pandas DataFrame.
+- **`color_graph` silently wrapped vertex ids at or above 2^31.** The
+  cast to int32 turned them negative (dropped as out of range) or landed
+  them on a different, valid vertex, quietly coloring a different graph
+  than the one passed in. Easy to hit by handing it 1-indexed label IDs
+  from a large segmentation instead of 0-indexed vertices. Both `edges`
+  and `soft_edges` are now range-checked and raise `OverflowError`,
+  matching the label-image casts.
+
+### Documentation
+
+- `geo.label`'s `column` kwarg documents that it replaces a column of the
+  same name in the returned copy; the input frame is never modified.
+
 ## [2.1.0] — 2026-09-07
 
 ### Added
