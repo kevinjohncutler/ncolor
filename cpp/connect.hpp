@@ -22,23 +22,15 @@
 #  include <intrin.h>
 #endif
 
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+#include <tuple>
+#include "intrinsics.hpp"
 #include "dispatch.hpp"
 #include "threadpool.h"
 
 namespace ncolor_cpp {
-
-// Portable count-trailing-zeros for non-zero uint32_t. clang/gcc use the
-// builtin; MSVC has _BitScanForward (since VS2005). Caller must ensure
-// ``m != 0`` — the result for 0 is undefined.
-static inline int ctz32(uint32_t m) {
-#if defined(_MSC_VER) && !defined(__clang__)
-    unsigned long idx;
-    _BitScanForward(&idx, m);
-    return static_cast<int>(idx);
-#else
-    return __builtin_ctz(m);
-#endif
-}
 
 // ``ForkJoinPool`` is declared at file scope in threadpool.h (vendored from
 // edt). Bring it into our namespace so callers don't have to mix qualifiers.
@@ -70,10 +62,16 @@ constexpr bool mode_uses_count(ReduceMode m) {
            m == ReduceMode::MeanInv;
 }
 
-// Realistic upper bound for ndim. Used to size stack-allocated coord
-// arrays in the scan kernels. Limits exotic >16D inputs; the public
-// dispatcher rejects ndim above this.
-constexpr int FIND_PAIRS_MAX_NDIM = 16;
+// Boundary masks use one bit per axis, covering NumPy's maximum rank.
+constexpr int FIND_PAIRS_MAX_NDIM = 64;
+inline void validate_neighborhood_ndim(int ndim) {
+    if (ndim < 1 || ndim > FIND_PAIRS_MAX_NDIM)
+        throw std::invalid_argument("neighborhood kernels require 1..64 dimensions");
+}
+inline void validate_neighbor_radius(int radius) {
+    if (radius > 127)
+        throw std::invalid_argument("neighbor radius must be <= 127");
+}
 
 // Bounded linear probe. Returns the slot index holding ``key`` (an
 // existing match or the first EMPTY slot to claim), or ``ht_mask + 1``
@@ -220,35 +218,69 @@ inline void ht_insert_min(uint64_t* ht, int32_t* mins, uint64_t ht_mask,
 
 namespace detail {
 
-// Count the forward neighbors produced by the (ndim, conn) connectivity.
-// Caller uses this to size the per-thread hashtables in Solver. The full
-// (dc, flat_offset) tuples come from build_forward_neighbors below; this
-// is a cheap wrapper that just iterates the same odometer.
+// Sum C(ndim,k) * (2*radius)^k / 2, k=1..conn. Build the
+// weighted binomial terms with Pascal's recurrence to avoid intermediate
+// overflow. Saturation is sufficient for hash-table sizing heuristics.
 inline int64_t count_forward_neighbors(int ndim, int conn, int radius = 1) {
-    if (ndim < 1 || radius < 1) return 0;
-    int64_t n_fwd = 0;
-    std::vector<int8_t> dc(ndim, (int8_t)-radius);
-    while (true) {
-        int n_nz = 0, first_nz = -1;
-        for (int d = 0; d < ndim; ++d) if (dc[d] != 0) {
-            if (first_nz < 0) first_nz = d;
-            ++n_nz;
+    if (ndim < 1 || radius < 1 || conn < 1) return 0;
+    validate_neighborhood_ndim(ndim);
+    validate_neighbor_radius(radius);
+    conn = std::min(conn, ndim);
+    // static: a constexpr local read inside a capture-less lambda is not
+    // an odr-use, and clang and gcc accept it, but MSVC refuses to
+    // compile it (C3493) and then cannot call the lambdas at all. A
+    // static local needs no capture anywhere.
+    static constexpr int64_t cap = std::numeric_limits<int64_t>::max() / 4;
+    auto add = [](int64_t a, int64_t b) { return a > cap - b ? cap : a + b; };
+    auto mul = [](int64_t a, int64_t b) { return a > cap / b ? cap : a * b; };
+    std::vector<int64_t> terms(conn + 1, 0);
+    terms[0] = 1;
+    for (int d = 0; d < ndim; ++d)
+        for (int k = std::min(conn, d + 1); k >= 1; --k)
+            terms[k] = add(terms[k], mul(terms[k - 1], 2 * radius));
+    int64_t count = 0;
+    for (int k = 1; k <= conn; ++k) count = add(count, terms[k] / 2);
+    return count;
+}
+
+inline int64_t count_forward_neighbors(const std::vector<int64_t>& shape,
+                                      int conn, int radius = 1) {
+    validate_neighborhood_ndim(static_cast<int>(shape.size()));
+    const int active = static_cast<int>(std::count_if(shape.begin(), shape.end(),
+        [](int64_t n) { return n > 1; }));
+    return count_forward_neighbors(active, conn, radius);
+}
+
+// Visit only qualifying forward offsets, in the original odometer order.
+// Zero-length/singleton axes cannot have a distinct neighbor. Pruning
+// once conn nonzero coordinates are chosen makes face-only enumeration
+// polynomial in rank rather than walking the entire (2r+1)^ndim cube.
+template <typename Emit>
+inline void for_each_forward_neighbor(const std::vector<int64_t>& shape,
+                                     int conn, int radius, Emit emit) {
+    const int ndim = static_cast<int>(shape.size());
+    validate_neighborhood_ndim(ndim);
+    validate_neighbor_radius(radius);
+    if (radius < 1 || conn < 1) return;
+    std::vector<int8_t> dc(ndim, 0);
+    auto visit = [&](auto&& self, int d, int used, int cheb) -> void {
+        if (d == ndim) {
+            if (used) emit(dc, used, cheb);
+            return;
         }
-        // Forward-only: first nonzero coord is positive. Generalizes the
-        // radius=1 condition `dc[first_nz] == 1` so the predicate works
-        // for any radius (positive offset in row-major order ⇒ greater
-        // flat index ⇒ each undirected pair emitted at most once).
-        if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] > 0) ++n_fwd;
-        int d = ndim - 1;
-        while (d >= 0) {
-            ++dc[d];
-            if (dc[d] <= radius) break;
-            dc[d] = (int8_t)-radius;
-            --d;
+        if (shape[d] <= 1 || used == conn) {
+            dc[d] = 0;
+            self(self, d + 1, used, cheb);
+            return;
         }
-        if (d < 0) break;
-    }
-    return n_fwd;
+        // Before the first nonzero axis, only zero or positive offsets
+        // can belong to the forward half of the neighborhood.
+        for (int v = used ? -radius : 0; v <= radius; ++v) {
+            dc[d] = static_cast<int8_t>(v);
+            self(self, d + 1, used + (v != 0), std::max(cheb, std::abs(v)));
+        }
+    };
+    visit(visit, 0, 0, 0);
 }
 
 // Generate the forward-neighbor set's (dc[0..ndim-1], flat_offset) tuples.
@@ -271,32 +303,12 @@ inline void build_forward_neighbors(
     // firmly; we want physically-adjacent edges driving those, with the
     // wider-radius edges filling in afterwards.
     std::vector<std::tuple<int, int64_t, std::vector<int8_t>>> cands;
-    std::vector<int8_t> dc(ndim, (int8_t)-radius);
-    while (true) {
-        int n_nz = 0, first_nz = -1, cheb = 0;
-        for (int d = 0; d < ndim; ++d) {
-            const int a = dc[d] < 0 ? -dc[d] : dc[d];
-            if (a > cheb) cheb = a;
-            if (dc[d] != 0) {
-                if (first_nz < 0) first_nz = d;
-                ++n_nz;
-            }
-        }
-        // Forward-only: first nonzero coord positive. See count_forward_neighbors.
-        if (n_nz > 0 && n_nz <= conn && first_nz >= 0 && dc[first_nz] > 0) {
+    for_each_forward_neighbor(shape, conn, radius,
+        [&](const std::vector<int8_t>& dc, int, int cheb) {
             int64_t off = 0;
             for (int d = 0; d < ndim; ++d) off += static_cast<int64_t>(dc[d]) * strides_out[d];
             cands.emplace_back(cheb, off, dc);
-        }
-        int d = ndim - 1;
-        while (d >= 0) {
-            ++dc[d];
-            if (dc[d] <= radius) break;
-            dc[d] = (int8_t)-radius;
-            --d;
-        }
-        if (d < 0) break;
-    }
+        });
     // Stable sort by Chebyshev distance ascending (ties keep odometer order).
     std::stable_sort(cands.begin(), cands.end(),
         [](const auto& a, const auto& b) {
@@ -588,7 +600,7 @@ inline void scan_band_unpadded(
     //     same axis (toroidal topology). For each OOB axis we recompute the
     //     wrapped coord and rebuild the flat offset directly, since the
     //     pre-computed nb_flat[k] assumed no wrap.
-    auto scan_pixel_checked = [&](const int64_t* coords, uint32_t bnd_mask, int64_t flat) {
+    auto scan_pixel_checked = [&](const int64_t* coords, uint64_t bnd_mask, int64_t flat) {
         const T vi = lbl[flat];
         if (vi == 0) return;
         int32_t di = 0;
@@ -610,9 +622,9 @@ inline void scan_band_unpadded(
                 emit_pair(ht, vi, lbl[neigh_flat], di, dj);
             } else {
                 bool valid = true;
-                uint32_t m = bnd_mask;
+                uint64_t m = bnd_mask;
                 while (m) {
-                    const int d = ctz32(m);
+                    const int d = ctz_u64(m);
                     m &= m - 1;
                     const int64_t nc = coords[d] + dc[d];
                     if (nc < 0 || nc >= shape[d]) { valid = false; break; }
@@ -636,18 +648,20 @@ inline void scan_band_unpadded(
     // coord arithmetic, no boundary mask updates.
     const int inner = ndim - 1;
     const int64_t W = shape[inner];           // inner-axis length
-    const uint32_t inner_bit = 1u << inner;
-    int64_t coords[FIND_PAIRS_MAX_NDIM] = {0};
+    const uint64_t inner_bit = uint64_t{1} << inner;
+    // Every active outer coordinate is decoded below; the inner one
+    // is assigned by the pixel loop. Do not clear unused rank capacity.
+    int64_t coords[FIND_PAIRS_MAX_NDIM];
     int64_t q = line_start;
     for (int d = inner - 1; d >= 0; --d) {
         coords[d] = q % shape[d];
         q /= shape[d];
     }
     for (int64_t line = line_start; line < line_end; ++line) {
-        uint32_t outer_bnd = 0;               // bnd mask for coords[0..ndim-2]
+        uint64_t outer_bnd = 0;               // bnd mask for coords[0..ndim-2]
         for (int d = 0; d < inner; ++d) {
             if (coords[d] < radius || coords[d] >= shape[d] - radius)
-                outer_bnd |= (1u << d);
+                outer_bnd |= (uint64_t{1} << d);
         }
         // C-contiguous layout: each flattened outer coordinate owns one
         // complete W-element row.
@@ -655,7 +669,7 @@ inline void scan_band_unpadded(
         if (outer_bnd != 0 || W < 2 * radius + 1) {
             // Full per-pixel boundary checks across the entire inner axis.
             for (int64_t x = 0; x < W; ++x) {
-                const uint32_t bnd = outer_bnd |
+                const uint64_t bnd = outer_bnd |
                     ((x < radius || x >= W - radius) ? inner_bit : 0u);
                 coords[inner] = x;
                 scan_pixel_checked(coords, bnd, row_base + x);
@@ -845,7 +859,7 @@ find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
 }
 
 // Public entry point — dispatches on ``wrap`` only (the kernel itself is
-// fully ND). Returns ``{}`` for ndim ∉ [2, 16] or invalid conn.
+// fully ND). Unsupported ranks raise instead of silently losing edges.
 template <typename T>
 std::vector<std::pair<int32_t, int32_t>>
 find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
@@ -854,7 +868,8 @@ find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
                        int radius = 1,
                        std::vector<uint64_t>* ht_scratch = nullptr) {
     const int ndim = static_cast<int>(shape.size());
-    if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM || conn < 1 || conn > ndim) return {};
+    validate_neighborhood_ndim(ndim);
+    if (conn < 1 || conn > ndim) return {};
     if (radius < 1) radius = 1;
     return wrap
         ? find_pairs_unpadded_impl<T, true >(lbl, shape, conn, ht_size, n_threads, pool,
@@ -910,33 +925,14 @@ inline void build_forward_neighbors_dual(
     // Sort by (group, cheb) so all base offsets precede all delta offsets,
     // and within each group, lower Chebyshev distance comes first.
     std::vector<std::tuple<int, int, int64_t, std::vector<int8_t>>> cands;
-    std::vector<int8_t> dc(ndim, (int8_t)-soft_radius);
-    while (true) {
-        int n_nz = 0, first_nz = -1, cheb = 0;
-        for (int d = 0; d < ndim; ++d) {
-            const int a = dc[d] < 0 ? -dc[d] : dc[d];
-            if (a > cheb) cheb = a;
-            if (dc[d] != 0) {
-                if (first_nz < 0) first_nz = d;
-                ++n_nz;
-            }
-        }
-        if (n_nz > 0 && n_nz <= soft_conn && first_nz >= 0 && dc[first_nz] > 0) {
+    for_each_forward_neighbor(shape, soft_conn, soft_radius,
+        [&](const std::vector<int8_t>& dc, int n_nz, int cheb) {
             const bool in_base = (base_conn > 0 && base_radius >= 1 &&
                                    n_nz <= base_conn && cheb <= base_radius);
             int64_t off = 0;
             for (int d = 0; d < ndim; ++d) off += static_cast<int64_t>(dc[d]) * strides_out[d];
             cands.emplace_back(in_base ? 0 : 1, cheb, off, dc);
-        }
-        int d = ndim - 1;
-        while (d >= 0) {
-            ++dc[d];
-            if (dc[d] <= soft_radius) break;
-            dc[d] = (int8_t)-soft_radius;
-            --d;
-        }
-        if (d < 0) break;
-    }
+        });
     std::stable_sort(cands.begin(), cands.end(),
         [](const auto& a, const auto& b) {
             if (std::get<0>(a) != std::get<0>(b)) return std::get<0>(a) < std::get<0>(b);
@@ -976,7 +972,7 @@ inline void scan_band_unpadded_dual(
     // scan_inner_axis_dual_fast); an out-of-bounds near neighbor counts
     // as "different" so the far offsets are still checked.
     const int n_near = n_base + n_delta_near;
-    auto scan_pixel_checked = [&](const int64_t* coords, uint32_t bnd_mask, int64_t flat) {
+    auto scan_pixel_checked = [&](const int64_t* coords, uint64_t bnd_mask, int64_t flat) {
         const T vi = lbl[flat];
         if (vi == 0) return;
         bool all_same = true;
@@ -1001,9 +997,9 @@ inline void scan_band_unpadded_dual(
                 emit(h, mask, vi, vj);
             } else {
                 bool valid = true;
-                uint32_t m = bnd_mask;
+                uint64_t m = bnd_mask;
                 while (m) {
-                    const int d = ctz32(m);
+                    const int d = ctz_u64(m);
                     m &= m - 1;
                     const int64_t nc = coords[d] + dc[d];
                     if (nc < 0 || nc >= shape[d]) { valid = false; break; }
@@ -1020,23 +1016,25 @@ inline void scan_band_unpadded_dual(
     };
     const int inner = ndim - 1;
     const int64_t W = shape[inner];
-    const uint32_t inner_bit = 1u << inner;
-    int64_t coords[FIND_PAIRS_MAX_NDIM] = {0};
+    const uint64_t inner_bit = uint64_t{1} << inner;
+    // Every active outer coordinate is decoded below; the inner one
+    // is assigned by the pixel loop. Do not clear unused rank capacity.
+    int64_t coords[FIND_PAIRS_MAX_NDIM];
     int64_t q = line_start;
     for (int d = inner - 1; d >= 0; --d) {
         coords[d] = q % shape[d];
         q /= shape[d];
     }
     for (int64_t line = line_start; line < line_end; ++line) {
-        uint32_t outer_bnd = 0;
+        uint64_t outer_bnd = 0;
         for (int d = 0; d < inner; ++d) {
             if (coords[d] < radius || coords[d] >= shape[d] - radius)
-                outer_bnd |= (1u << d);
+                outer_bnd |= (uint64_t{1} << d);
         }
         const int64_t row_base = line * W;
         if (outer_bnd != 0 || W < 2 * radius + 1) {
             for (int64_t x = 0; x < W; ++x) {
-                const uint32_t bnd = outer_bnd |
+                const uint64_t bnd = outer_bnd |
                     ((x < radius || x >= W - radius) ? inner_bit : 0u);
                 coords[inner] = x;
                 scan_pixel_checked(coords, bnd, row_base + x);
@@ -1221,7 +1219,7 @@ inline int find_pairs_dual_nd_unpadded(
     out_base.clear();
     out_soft.clear();
     const int ndim = static_cast<int>(shape.size());
-    if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM) return 0;
+    validate_neighborhood_ndim(ndim);
     if (base_conn < 1 || base_conn > ndim) return 0;
     if (soft_conn < 1 || soft_conn > ndim) return 0;
     if (wrap) {
@@ -1258,7 +1256,8 @@ find_pairs_weighted_nd_unpadded(const T* lbl, const int32_t* dist,
                                 std::vector<double>*  primary_scratch = nullptr,
                                 std::vector<int32_t>* counts_scratch = nullptr) {
     const int ndim = static_cast<int>(shape.size());
-    if (ndim < 2 || ndim > FIND_PAIRS_MAX_NDIM || conn < 1 || conn > ndim) {
+    validate_neighborhood_ndim(ndim);
+    if (conn < 1 || conn > ndim) {
         out_primary.clear();
         out_counts.clear();
         return {};

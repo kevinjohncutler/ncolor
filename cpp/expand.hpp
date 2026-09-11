@@ -225,7 +225,7 @@ static inline void envelope_fill_barrier_simd(
 //   - Contig=true  : direct lbl[i] / dist[i] access; Phase 2 uses the
 //                    SIMD fill helper.
 //   - Contig=false : strided lbl[i*stride] / dist[i*stride]; scalar fill.
-template <bool Wrap, bool Contig>
+template <bool Wrap, bool Contig, bool Barrier = false>
 inline void envelope_pass_row_impl(
         int32_t* __restrict lbl, int32_t* __restrict dist,
         int64_t N, int64_t stride,
@@ -317,9 +317,17 @@ inline void envelope_pass_row_impl(
         const int32_t g_j = g[j];
         const int32_t v_j = v[j];
         if constexpr (Contig) {
-            envelope_fill_simd(lbl, dist, i_start, i_end, lbl_j, g_j, v_j);
+            if constexpr (Barrier) {
+                envelope_fill_barrier_simd(lbl, dist, i_start, i_end,
+                    lbl_j, g_j, v_j, INT32_MIN);
+            } else {
+                envelope_fill_simd(lbl, dist, i_start, i_end, lbl_j, g_j, v_j);
+            }
         } else {
             for (int64_t i = i_start; i < i_end; ++i) {
+                if constexpr (Barrier) {
+                    if (dist[i * stride] == INT32_MIN) continue;
+                }
                 const int32_t di = static_cast<int32_t>(i) - v_j;
                 lbl[i * stride] = lbl_j;
                 dist[i * stride] = g_j + di * di;

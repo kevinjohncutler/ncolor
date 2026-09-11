@@ -42,55 +42,45 @@ struct NDOffset {
     int opposite_idx;         // index of -dc in the same table
 };
 
-// A pixel is marked for removal when it's a "spur" (≤ threshold
-// same-label face-neighbors) OR optionally a "thin-line interior":
-// exactly 2 same-label 8-connectivity neighbors AND those two are
-// on opposite sides of the pixel (N-S, W-E, NW-SE, or NE-SW). With
-// remove_thin = true a 1-px-wide straight line gets wiped wholesale
-// in a single pass instead of needing N/2 iterations to peel from
-// both ends. The thin check is 2D-only here; the ND helper below
-// supports the axis-aligned subset (no diagonals) for 3D+.
+// Face-only pruning needs just 2*ndim offsets. The optional thin-line
+// test uses the full neighborhood, excluding singleton axes. Face
+// antipodes are adjacent entries; full-neighborhood antipodes are mirror
+// indices. Neither needs a pairwise search.
 inline std::vector<NDOffset> build_nd_offsets(
-    int ndim, const std::vector<int64_t>& strides)
+    const std::vector<int64_t>& shape, const std::vector<int64_t>& strides,
+    bool remove_thin)
 {
+    const int ndim = static_cast<int>(shape.size());
     std::vector<NDOffset> out;
-    std::vector<int8_t> dc(ndim, -1);
-    while (true) {
-        int n_nz = 0;
-        bool any_nz = false;
-        int64_t flat = 0;
+    std::vector<int8_t> dc(ndim, 0);
+    if (!remove_thin) {
         for (int d = 0; d < ndim; ++d) {
-            if (dc[d] != 0) { ++n_nz; any_nz = true; }
-            flat += (int64_t)dc[d] * strides[d];
-        }
-        if (any_nz) {
-            NDOffset o;
-            o.dc.assign(dc.begin(), dc.end());
-            o.flat_offset = flat;
-            o.is_face = (n_nz == 1);
-            o.opposite_idx = -1;
-            out.push_back(std::move(o));
-        }
-        // increment dc as a base-3 odometer over {-1,0,+1}
-        int d = ndim - 1;
-        while (d >= 0) {
-            ++dc[d];
-            if (dc[d] <= 1) break;
+            if (shape[d] <= 1) continue;
             dc[d] = -1;
-            --d;
+            out.push_back({dc, -strides[d], true, -1});
+            dc[d] = 1;
+            out.push_back({dc, strides[d], true, -1});
+            dc[d] = 0;
+            const int n = static_cast<int>(out.size());
+            out[n - 2].opposite_idx = n - 1;
+            out[n - 1].opposite_idx = n - 2;
         }
-        if (d < 0) break;
+        return out;
     }
-    // Fill opposite_idx by linear scan.
-    for (size_t k = 0; k < out.size(); ++k) {
-        for (size_t j = 0; j < out.size(); ++j) {
-            bool opp = true;
-            for (int d = 0; d < ndim; ++d) {
-                if (out[k].dc[d] != -out[j].dc[d]) { opp = false; break; }
-            }
-            if (opp) { out[k].opposite_idx = (int)j; break; }
+    auto visit = [&](auto&& self, int d, int nonzero, int64_t flat) -> void {
+        if (d == ndim) {
+            if (nonzero) out.push_back({dc, flat, nonzero == 1, -1});
+            return;
         }
-    }
+        const int r = shape[d] > 1 ? 1 : 0;
+        for (int v = -r; v <= r; ++v) {
+            dc[d] = static_cast<int8_t>(v);
+            self(self, d + 1, nonzero + (v != 0), flat + v * strides[d]);
+        }
+    };
+    visit(visit, 0, 0, 0);
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i].opposite_idx = static_cast<int>(out.size() - 1 - i);
     return out;
 }
 
@@ -143,6 +133,16 @@ inline void count_and_mark_nd(
                 if (first_idx < 0) first_idx = (int)k;
                 else if (second_idx < 0) second_idx = (int)k;
                 else { over_two = true; }
+                // Both ways of being marked only get harder as the
+                // counts grow: the stub rule needs face_count to stay
+                // at or below the threshold, the thin rule needs exactly
+                // two same-label neighbors. Once neither can hold, the
+                // remaining offsets cannot change the answer. Without
+                // this the thin mode walked all 3^n-1 offsets for every
+                // interior voxel and ran 2.5x slower than the face-only
+                // mode on a 3D image, where an interior voxel settles
+                // after its third neighbor.
+                if (face_count > threshold && (!remove_thin || over_two)) break;
             }
             if (face_count <= threshold) {
                 mark[i] = 1;
@@ -207,7 +207,7 @@ inline int64_t delete_spurs_labels_nd_inplace(
 
     // ND offsets table (used by count_and_mark_nd). Built once per call.
     std::vector<despur_detail::NDOffset> nd_offsets =
-        despur_detail::build_nd_offsets(ndim, strides);
+        despur_detail::build_nd_offsets(shape, strides, remove_thin);
 
     // -- Iter 0: mark spurs in a shared bitmap via parallel slab
     // dispatch, then zero them out. ``remove_thin`` also kills

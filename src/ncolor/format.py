@@ -130,7 +130,7 @@ def format_labels(labels, clean=False, min_area=9, despur=False,
         if despur and nmax > 0:
             # Label-aware despur pre-pass in C++ (delete_spurs_labels).
             # Wipes spurs AND 1-voxel-thick straight interior pixels
-            # (axis-aligned + 2D diagonals) in a single mark-and-apply
+            # (including N-D diagonals) in a single mark-and-apply
             # over the whole image, catching 1-px inter-cell bridges.
             # Falls through to the cc_label_per_label branch below,
             # which handles disjoint-component splitting and area
@@ -245,10 +245,10 @@ def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
       omnipose external-spur rule. Aggressive; fewer iterations to
       converge.
     * ``"total"`` — full-diagonal (3^ndim − 1 neighbors). Preserves
-      1-voxel-wide skeletons in 3D (their interiors have face=2 but
-      total=2, both equal to ndim=3 minus 1 — under ``threshold=ndim``
-      they survive cardinal but fall below total). Use this when the
-      input may contain genuine thin features you want to keep.
+      diagonally connected features better than face-only connectivity.
+      At the default threshold, a straight 1-voxel-wide line in 3D
+      still has only two neighbors and is pruned. Lower ``threshold``
+      to retain such thin features.
 
     ``threshold`` — binary mode default is ``None`` → ``ndim`` (pixel
     is a spur if fg-neighbor count is in ``[1, threshold)``); label
@@ -260,10 +260,9 @@ def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
 
     ``remove_thin`` (label mode only, default ``False``) — also zero
     1-voxel-thick straight interior pixels in the same pass. A pixel
-    qualifies iff it has exactly two same-label 8-connectivity
-    neighbors that sit at opposite offsets (axis-aligned in any ndim,
-    plus 2D diagonals NW-SE / NE-SW). Useful when expand_labels
-    leaves 1-px bridges between cells that would otherwise need many
+    qualifies iff it has exactly two same-label full-connectivity
+    neighbors that sit at opposite offsets, including N-D diagonals.
+    Useful when expand_labels leaves 1-px bridges between cells that would otherwise need many
     iterations of end-peeling to clear.
     """
     if kind not in ("auto", "binary", "labels"):

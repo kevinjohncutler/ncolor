@@ -1,27 +1,7 @@
-// Voronoi expansion + bridge cleanup ("clean" expand mode).
-//
-// Adds an antipodal-bridge test to the L2 separable expand_labels: after
-// each EDT axis sweep, pixels that pass the local antipodal-only test are
-// marked as "barriers" (lbl=0, dist=BRIDGE_BARRIER_DIST) and the next
-// axis sweep refuses to refill them. A 1-pixel-wide string of pixels
-// connected by opposite faces or corners (the bridge topology) is what
-// the test catches: exactly 2 same-label neighbors in one of the four
-// antipodal pairings {N,S}, {E,W}, {NE,SW}, {NW,SE} in 2D.
-//
-// Why not just despur after expand_labels:
-//   The standard despur uses face_count <= threshold, which misses
-//   2-wide bridges (face_count = 2-3 per pixel). The antipodal test
-//   specifically identifies the bridge topology — pixels in a thin
-//   string between two regions. AND by marking them as sticky barriers
-//   between axes, the next axis can't refill them.
-//
-// Why "after each axis" rather than "during":
-//   The bridge test needs an 8-neighborhood (2D) — most of those reads
-//   are cross-scanline. Doing the test concurrently with the EDT sweep
-//   requires either double-buffering or careful read/write ordering of
-//   the in-place labels array. The "after each axis" version does one
-//   extra parallel scan per axis with all reads happening after the axis
-//   has fully committed. The cost is small relative to EDT itself.
+// N-D Lp Voronoi expansion with sticky bridge barriers. After each
+// swept subspace of at least two active axes, classify thin bridges and
+// stubs, then peel back their face-neighbor tails. Later sweeps preserve
+// removed pixels as background. Both sweeps and cleanup can be periodic.
 
 #ifndef NCOLOR_EXPAND_CLEAN_HPP
 #define NCOLOR_EXPAND_CLEAN_HPP
@@ -35,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #include "chamfer.hpp"
@@ -48,92 +29,6 @@ namespace ncolor_cpp {
 // Sentinel value in dist[] indicating a barrier pixel (refused bridge).
 // INT32_MIN is impossible for a normal squared L2 distance (always >= 0).
 constexpr int32_t BRIDGE_BARRIER_DIST = INT32_MIN;
-
-namespace expand_clean_detail {
-
-// Antipodal-only same-label test for 2D 8-neighborhood. Returns true iff
-// labels[y*W + x] is non-zero AND has EXACTLY 2 same-label neighbors
-// forming one of the antipodal pairs {N,S}, {E,W}, {NE,SW}, {NW,SE}.
-//
-// Image-boundary neighbors count as "not same label" — a 1-wide strip
-// along the image edge is still considered a bridge (the missing side
-// is treated as different territory).
-template <typename T>
-inline bool is_antipodal_bridge_2d(
-    const T* __restrict labels,
-    int64_t y, int64_t x,
-    int64_t H, int64_t W)
-{
-    const T A = labels[y * W + x];
-    if (A == 0) return false;
-
-    auto same = [&](int64_t dy, int64_t dx) -> int {
-        const int64_t ny = y + dy;
-        const int64_t nx = x + dx;
-        if (ny < 0 || ny >= H || nx < 0 || nx >= W) return 0;
-        return labels[ny * W + nx] == A ? 1 : 0;
-    };
-
-    const int N  = same(-1,  0), S  = same( 1,  0);
-    const int E  = same( 0,  1), Ww = same( 0, -1);
-    const int NE = same(-1,  1), SW = same( 1, -1);
-    const int NW = same(-1, -1), SE = same( 1,  1);
-
-    const int total = N + S + E + Ww + NE + SW + NW + SE;
-    if (total != 2) return false;
-
-    // Antipodal pair patterns. With total==2 we just check that one of
-    // the pairs is on and all other six neighbors are off.
-    if (N  && S  && !(E || Ww || NE || SW || NW || SE)) return true;
-    if (E  && Ww && !(N || S  || NE || SW || NW || SE)) return true;
-    if (NE && SW && !(N || S  || E  || Ww || NW || SE)) return true;
-    if (NW && SE && !(N || S  || E  || Ww || NE || SW)) return true;
-    return false;
-}
-
-// Subspace antipodal test. Given an ND label image and an ordered list
-// of `k = subset_axes.size()` axes (the swept subspace), check whether
-// the pixel at flat index `i` is a bridge in this subspace: exactly 2
-// same-label neighbors, both in one of the (3^k - 1)/2 antipodal pairs.
-//
-// `flat_disps` lists the 3^k - 1 flat-index displacements (in stride
-// space) into the subspace; `pair_a_pair_b` gives the (a, b) indices
-// (into flat_disps) of each antipodal pair, so pair (a, b) means
-// flat_disps[a] and flat_disps[b] are antipodes. `oob_mask[d]` is true
-// iff the dth displacement would land out of bounds at this pixel
-// (caller pre-checks).
-//
-// Returns true iff antipodal-only same-label condition holds.
-template <typename T>
-inline bool is_antipodal_bridge_subspace(
-    const T* __restrict labels,
-    int64_t i,
-    const int64_t* flat_disps,
-    int n_disps,
-    const int* pair_idx,    // length n_disps; pair_idx[a] = b for partner; -1 if no partner (impossible for full subspace)
-    const uint8_t* in_bounds)  // length n_disps; nonzero iff displacement d is valid for pixel i
-{
-    const T A = labels[i];
-    if (A == 0) return false;
-    // Count same-label and find which two displacements (if exactly 2) match.
-    int match_a = -1, match_b = -1;
-    int count = 0;
-    for (int d = 0; d < n_disps; ++d) {
-        if (!in_bounds[d]) continue;
-        if (labels[i + flat_disps[d]] == A) {
-            if (count == 0) match_a = d;
-            else if (count == 1) match_b = d;
-            else { return false; }   // > 2 same-label
-            ++count;
-        }
-    }
-    if (count != 2) return false;
-    // Are match_a and match_b antipodal? i.e. pair_idx[match_a] == match_b.
-    return pair_idx[match_a] == match_b;
-}
-
-}  // namespace expand_clean_detail
-
 
 // ND helper: compute the 3^k - 1 displacement offsets in the subspace
 // defined by `subset_axes` (size k), and the antipodal-partner index
@@ -152,8 +47,14 @@ inline SubspaceAntipodalTable build_subspace_antipodal_table(
     const int k = (int)subset_axes.size();
     // Total number of base-3 vectors of length k, excluding the all-zero one.
     int n_disps_total = 1;
-    for (int i = 0; i < k; ++i) n_disps_total *= 3;
+    for (int i = 0; i < k; ++i) {
+        if (n_disps_total > INT_MAX / 3)
+            throw std::overflow_error("clean neighborhood exceeds int32 offset capacity");
+        n_disps_total *= 3;
+    }
     n_disps_total -= 1;
+    if (k > 0 && n_disps_total > INT_MAX / k)
+        throw std::overflow_error("clean neighborhood exceeds int32 offset capacity");
 
     SubspaceAntipodalTable t;
     t.coord_offsets.reserve(n_disps_total);
@@ -182,26 +83,11 @@ inline SubspaceAntipodalTable build_subspace_antipodal_table(
         }
     }
 
-    // Build pair_idx: pair_idx[a] = b such that coord_offsets[b] == -coord_offsets[a].
+    // Negating a base-3 vector reverses its enumeration index, also
+    // after removing the central zero vector.
     const int n = (int)t.flat_disps.size();
-    t.pair_idx.assign(n, -1);
-    for (int a = 0; a < n; ++a) {
-        if (t.pair_idx[a] != -1) continue;
-        for (int b = a + 1; b < n; ++b) {
-            if (t.pair_idx[b] != -1) continue;
-            bool is_antipode = true;
-            for (int d = 0; d < k; ++d) {
-                if (t.coord_offsets[a][d] != -t.coord_offsets[b][d]) {
-                    is_antipode = false; break;
-                }
-            }
-            if (is_antipode) {
-                t.pair_idx[a] = b;
-                t.pair_idx[b] = a;
-                break;
-            }
-        }
-    }
+    t.pair_idx.resize(n);
+    for (int a = 0; a < n; ++a) t.pair_idx[a] = n - 1 - a;
 
     // is_face[d] = 1 iff displacement d has exactly one nonzero coord
     // (a cardinal-direction face neighbor within the subspace).
@@ -248,7 +134,7 @@ inline int64_t bridge_check_subspace_nd(
     const std::vector<int64_t>& shape,
     const std::vector<int>& subset_axes,
     ForkJoinPool* pool = nullptr, int n_threads = 1,
-    std::vector<uint8_t>* nbr_scratch = nullptr)
+    std::vector<uint8_t>* nbr_scratch = nullptr, bool wrap = false)
 {
     const int N = (int)shape.size();
     const int k = (int)subset_axes.size();
@@ -323,6 +209,7 @@ inline int64_t bridge_check_subspace_nd(
     //                    else queued iff the two face matches are
     //                    antipodal
     constexpr uint8_t SATURATED = 255;
+    constexpr uint8_t QUEUED = 254;
     // One byte per pixel. Every labeled pixel is written by the scan
     // before the peel-back reads it, and background pixels are never
     // read, so the buffer needs no zeroing and can persist across calls
@@ -344,11 +231,11 @@ inline int64_t bridge_check_subspace_nd(
     // decision as the interior path, with the original early exits.
     auto classify = [&](int64_t i, int32_t A,
                         const int* fd, int nf, const int* cd, int nc,
-                        std::vector<QEnt>& out) {
+                        const int64_t* disps, std::vector<QEnt>& out) {
         int face = 0, match_a = -1, match_b = -1;
         for (int ff = 0; ff < nf; ++ff) {
             const int d = fd[ff];
-            if (labels[i + flat_disps[d]] == A) {
+            if (labels[i + disps[d]] == A) {
                 if (face == 0) match_a = d;
                 else if (face == 1) match_b = d;
                 if (++face > 2) { nbr_count[(size_t)i] = SATURATED; return; }
@@ -356,7 +243,7 @@ inline int64_t bridge_check_subspace_nd(
         }
         if (face == 2) {
             for (int cc = 0; cc < nc; ++cc) {
-                if (labels[i + flat_disps[cd[cc]]] == A) {
+                if (labels[i + disps[cd[cc]]] == A) {
                     nbr_count[(size_t)i] = SATURATED;
                     return;
                 }
@@ -379,15 +266,32 @@ inline int64_t bridge_check_subspace_nd(
             for (int d = N - 2; d >= 0; --d) { lc[d] = r % shape[d]; r /= shape[d]; }
         }
         std::vector<int> fd_line, cd_line, fd_end, cd_end;
+        std::vector<int64_t> periodic_disps(wrap ? n_disps : 0);
+        std::vector<int64_t> end_disps(wrap ? n_disps : 0);
         fd_line.reserve(n_face_disps); fd_end.reserve(n_face_disps);
         cd_line.reserve(n_corner_disps); cd_end.reserve(n_corner_disps);
 
         for (int64_t line = line_lo; line < line_hi; ++line) {
             const int64_t base = line * W;
+            const int64_t* line_disps = flat_disps;
+            if (wrap) {
+                for (int d = 0; d < n_disps; ++d) {
+                    int64_t off = flat_disps[d];
+                    for (int j = 0; j < k - 1; ++j) {
+                        const int ax = subset_axes[j];
+                        const int64_t c = lc[ax] + co_flat[d * k + j];
+                        if (c < 0) off += shape[ax] * strides[ax];
+                        else if (c >= shape[ax]) off -= shape[ax] * strides[ax];
+                    }
+                    periodic_disps[d] = off;
+                }
+                line_disps = periodic_disps.data();
+            }
 
             // Displacements whose non-innermost offsets stay inside the
             // subspace on this line.
             auto line_valid = [&](int d) {
+                if (wrap) return true;
                 const int* co = co_flat.data() + d * k;
                 for (int j = 0; j < k - 1; ++j) {
                     const int64_t c = lc[subset_axes[j]];
@@ -410,14 +314,24 @@ inline int64_t bridge_check_subspace_nd(
                 const int32_t A = labels[i];
                 if (A == 0) return;
                 auto in_range = [&](int d) {
+                    if (wrap) return true;
                     const int o = co_flat[d * k + (k - 1)];
                     return !((o < 0 && x == 0) || (o > 0 && x == W - 1));
                 };
                 fd_end.clear(); cd_end.clear();
                 for (int d : fd_line) if (in_range(d)) fd_end.push_back(d);
                 for (int d : cd_line) if (in_range(d)) cd_end.push_back(d);
+                const int64_t* disps = line_disps;
+                if (wrap) {
+                    for (int d = 0; d < n_disps; ++d) {
+                        const int64_t nx = x + co_flat[d * k + k - 1];
+                        end_disps[d] = line_disps[d] +
+                            (nx < 0 ? W : (nx >= W ? -W : 0));
+                    }
+                    disps = end_disps.data();
+                }
                 classify(i, A, fd_end.data(), (int)fd_end.size(),
-                         cd_end.data(), (int)cd_end.size(), out);
+                         cd_end.data(), (int)cd_end.size(), disps, out);
             };
 
             if (W <= 2) {
@@ -432,7 +346,7 @@ inline int64_t bridge_check_subspace_nd(
                     // Face count, one displacement per pass: a compare
                     // and a byte add per pixel, no branches.
                     for (int d : fd_line) {
-                        const int32_t* nb = cur + flat_disps[d];
+                        const int32_t* nb = cur + line_disps[d];
                         for (int64_t x = 0; x < n; ++x) {
                             cnt[x] += (uint8_t)(nb[x] == cur[x]);
                         }
@@ -452,13 +366,13 @@ inline int64_t bridge_check_subspace_nd(
                         // two face matches decide by antipodality.
                         bool sat = false;
                         for (int d : cd_line) {
-                            if (labels[i + flat_disps[d]] == A) { sat = true; break; }
+                            if (labels[i + line_disps[d]] == A) { sat = true; break; }
                         }
                         if (sat) { nbr_count[(size_t)i] = SATURATED; continue; }
                         nbr_count[(size_t)i] = 2;
                         int a = -1, b = -1;
                         for (int d : fd_line) {
-                            if (labels[i + flat_disps[d]] == A) {
+                            if (labels[i + line_disps[d]] == A) {
                                 if (a < 0) a = d; else { b = d; break; }
                             }
                         }
@@ -509,10 +423,8 @@ inline int64_t bridge_check_subspace_nd(
             queue.insert(queue.end(), v.begin(), v.end());
         }
         // Threads claim chunks in whatever order they wake, so the merged
-        // queue order varies run to run, and the peel-back cascade below
-        // is order-sensitive at the margin (a few pixels per image).
-        // Sorting by pixel index makes the result identical to the serial
-        // scan's, whatever the thread count. The queue is tiny.
+        // queue order varies run to run. Keep its traversal deterministic
+        // across thread counts; the queue is small.
         std::sort(queue.begin(), queue.end());
     } else {
         std::vector<uint8_t> cnt((size_t)cnt_len);
@@ -529,15 +441,12 @@ inline int64_t bridge_check_subspace_nd(
 
     if (queue.empty()) return 0;
 
-    // Apply initial removals.
+    // Mark the queue, but remove each pixel only when it is popped.
+    // A lazy recount then includes every not-yet-processed neighbor.
+    // Clearing the whole queue up front would make recounts subtract
+    // future removals twice (once here, again when their queue entry pops).
     int64_t removed = 0;
-    for (auto& [i, _lab] : queue) {
-        if (labels[i] != 0) {
-            labels[i] = 0;
-            dist[i] = BRIDGE_BARRIER_DIST;
-            ++removed;
-        }
-    }
+    for (auto& [i, _lab] : queue) nbr_count[(size_t)i] = QUEUED;
 
     // Phase 2: queue-based peel-back. Decrement face_count of each
     // same-label subspace FACE neighbor of a removed pixel (2*k face
@@ -549,6 +458,18 @@ inline int64_t bridge_check_subspace_nd(
     std::vector<int64_t> jcoords_all(N);
     std::vector<int> jcoords_sub(k);
 
+    auto face_neighbor = [&](int64_t i, const std::vector<int>& c, int f) {
+        int64_t off = face_flat_disps[f];
+        for (int j = 0; j < k; ++j) {
+            const int64_t nc = static_cast<int64_t>(c[j]) + face_coord_offsets[f][j];
+            if (nc < 0 || nc >= shape_sub[j]) {
+                if (!wrap) return int64_t{-1};
+                off += (nc < 0 ? shape_sub[j] : -shape_sub[j]) * strides[subset_axes[j]];
+            }
+        }
+        return i + off;
+    };
+
     auto recount_face_exact = [&](int64_t j_idx, int32_t lab) -> int {
         int64_t r = j_idx;
         for (int d = 0; d < N; ++d) {
@@ -558,12 +479,8 @@ inline int64_t bridge_check_subspace_nd(
         for (int d = 0; d < k; ++d) jcoords_sub[d] = (int)jcoords_all[subset_axes[d]];
         int cnt = 0;
         for (int f = 0; f < n_face_disps; ++f) {
-            bool ok = true;
-            for (int jx = 0; jx < k; ++jx) {
-                const int c = jcoords_sub[jx] + face_coord_offsets[f][jx];
-                if (c < 0 || c >= (int)shape_sub[jx]) { ok = false; break; }
-            }
-            if (ok && labels[j_idx + face_flat_disps[f]] == lab) ++cnt;
+            const int64_t nb = face_neighbor(j_idx, jcoords_sub, f);
+            if (nb >= 0 && labels[nb] == lab) ++cnt;
         }
         return cnt;
     };
@@ -573,6 +490,9 @@ inline int64_t bridge_check_subspace_nd(
         const int64_t i = queue[head].first;
         const int32_t old_lab = queue[head].second;
         ++head;
+        labels[i] = 0;
+        dist[i] = BRIDGE_BARRIER_DIST;
+        ++removed;
 
         int64_t rem = i;
         for (int d = 0; d < N; ++d) {
@@ -582,15 +502,11 @@ inline int64_t bridge_check_subspace_nd(
         for (int d = 0; d < k; ++d) coords_sub[d] = (int)coords_all[subset_axes[d]];
 
         for (int f = 0; f < n_face_disps; ++f) {
-            bool ok = true;
-            for (int j = 0; j < k; ++j) {
-                const int c = coords_sub[j] + face_coord_offsets[f][j];
-                if (c < 0 || c >= (int)shape_sub[j]) { ok = false; break; }
-            }
-            if (!ok) continue;
-            const int64_t j_idx = i + face_flat_disps[f];
+            const int64_t j_idx = face_neighbor(i, coords_sub, f);
+            if (j_idx < 0) continue;
             if (labels[j_idx] != old_lab) continue;
             uint8_t fc = nbr_count[(size_t)j_idx];
+            if (fc == QUEUED) continue;
             if (fc == SATURATED) {
                 // First touch of a saturated entry: recount gives the
                 // current face_count (already reflects i's removal,
@@ -604,10 +520,8 @@ inline int64_t bridge_check_subspace_nd(
             }
             nbr_count[(size_t)j_idx] = fc;
             if (fc <= 1) {
-                labels[j_idx] = 0;
-                dist[j_idx] = BRIDGE_BARRIER_DIST;
+                nbr_count[(size_t)j_idx] = QUEUED;
                 queue.emplace_back(j_idx, old_lab);
-                ++removed;
             }
         }
     }
@@ -625,169 +539,22 @@ inline int64_t bridge_check_subspace_nd(
 }
 
 
-// Bridge detection scan on a 2D label image. Two-phase: read-only scan
-// collects bridge indices, then a commit phase writes barrier sentinels.
-// The two-phase split prevents a bridge-detection race where an early
-// pixel's barrier write would suppress a later pixel's detection.
-//
-// Returns the number of pixels marked as barriers.
-template <typename T>
-inline int64_t bridge_check_2d(
-    T* labels, int32_t* dist,
-    int64_t H, int64_t W,
-    ForkJoinPool* pool = nullptr, int n_threads = 1)
-{
-    const int64_t total = H * W;
-    if (total == 0) return 0;
-
-    const int nt = (pool && n_threads > 1) ? n_threads : 1;
-
-    std::vector<int64_t> bridges;
-
-    auto scan_chunk = [&](int64_t y_lo, int64_t y_hi,
-                           std::vector<int64_t>& out) {
-        for (int64_t y = y_lo; y < y_hi; ++y) {
-            for (int64_t x = 0; x < W; ++x) {
-                if (expand_clean_detail::is_antipodal_bridge_2d(
-                        labels, y, x, H, W)) {
-                    out.push_back(y * W + x);
-                }
-            }
-        }
-    };
-
-    if (nt > 1 && H >= (int64_t)(nt * 4)) {
-        std::vector<std::vector<int64_t>> per_thread(nt);
-        std::atomic<int> tid_counter{0};
-        std::atomic<int64_t> next_row{0};
-        const int64_t chunk = std::max<int64_t>(1, H / (nt * 4));
-        pool->parallel([&]() {
-            int my_tid = tid_counter.fetch_add(1);
-            if (my_tid >= nt) return;
-            auto& local = per_thread[my_tid];
-            while (true) {
-                int64_t y_lo = next_row.fetch_add(chunk);
-                if (y_lo >= H) break;
-                int64_t y_hi = std::min(H, y_lo + chunk);
-                scan_chunk(y_lo, y_hi, local);
-            }
-        });
-        size_t sz = 0;
-        for (auto& v : per_thread) sz += v.size();
-        bridges.reserve(sz);
-        for (auto& v : per_thread) {
-            bridges.insert(bridges.end(), v.begin(), v.end());
-        }
-    } else {
-        scan_chunk(0, H, bridges);
-    }
-
-    for (int64_t i : bridges) {
-        labels[i] = 0;
-        dist[i] = BRIDGE_BARRIER_DIST;
-    }
-    return (int64_t)bridges.size();
-}
-
-
-// Barrier-respecting envelope_pass_row. Identical to envelope_pass_row_impl
-// (in expand.hpp), but the Phase 2 segment fill reads dist[i] before
-// writing and skips pixels where dist[i] == BRIDGE_BARRIER_DIST. The
-// contiguous case uses the masked SIMD fill (envelope_fill_barrier_simd);
-// the strided case stays scalar.
-//
-// Phase 1 already handles barriers implicitly: a barrier pixel has
-// lbl=0 so it doesn't get pushed as a seed.
-template <bool Contig>
-inline void envelope_pass_row_barrier_impl(
-        int32_t* __restrict lbl, int32_t* __restrict dist,
-        int64_t N, int64_t stride,
-        int32_t* __restrict v, int32_t* __restrict lblstk,
-        int32_t* __restrict g, double* __restrict z,
-        double* __restrict vd, double* __restrict vd_sq) {
-    int32_t k = 0;
-    auto push_seed = [&](int64_t i, int32_t lbl_val, int32_t gi) {
-        const double fi = static_cast<double>(i);
-        const double gf = static_cast<double>(gi);
-        const double fi_sq_plus_gf = fi * fi + gf;
-        double new_z = -1e18;
-        while (k > 0) {
-            const int32_t top = k - 1;
-            const double ft = vd[top];
-            const double ft_sq = vd_sq[top];
-            const double g_top = static_cast<double>(g[top]);
-            const double numer = fi_sq_plus_gf - g_top - ft_sq;
-            const double denom = 2.0 * (fi - ft);
-            if (numer > z[top] * denom) {
-                new_z = numer / denom;
-                break;
-            }
-            k -= 1;
-        }
-        z[k] = new_z;
-        v[k] = static_cast<int32_t>(i);
-        vd[k] = fi;
-        vd_sq[k] = fi * fi;
-        lblstk[k] = lbl_val;
-        g[k] = gi;
-        k += 1;
-    };
-
-    auto load_lbl = [&](int64_t idx) -> int32_t {
-        if constexpr (Contig) return lbl[idx]; else return lbl[idx * stride];
-    };
-    auto load_dist = [&](int64_t idx) -> int32_t {
-        if constexpr (Contig) return dist[idx]; else return dist[idx * stride];
-    };
-
-    for (int64_t i = 0; i < N; ++i) {
-        const int32_t lv = load_lbl(i);
-        if (lv == 0) continue;
-        push_seed(i, lv, load_dist(i));
-    }
-    if (k == 0) return;
-
-    int64_t i_start = 0;
-    for (int32_t j = 0; j < k; ++j) {
-        int64_t i_end;
-        if (j + 1 == k) {
-            i_end = N;
-        } else {
-            const double zj1 = z[j + 1];
-            if (zj1 <= static_cast<double>(i_start)) continue;
-            i_end = (zj1 >= static_cast<double>(N))
-                ? N : static_cast<int64_t>(std::ceil(zj1));
-            if (i_end > N) i_end = N;
-        }
-        if (i_end <= i_start) continue;
-        const int32_t lbl_j = lblstk[j];
-        const int32_t g_j = g[j];
-        const int32_t v_j = v[j];
-        if constexpr (Contig) {
-            envelope_fill_barrier_simd(lbl, dist, i_start, i_end,
-                                       lbl_j, g_j, v_j, BRIDGE_BARRIER_DIST);
-        } else {
-            for (int64_t i = i_start; i < i_end; ++i) {
-                const int64_t idx = i * stride;
-                if (dist[idx] == BRIDGE_BARRIER_DIST) continue;
-                const int32_t di = static_cast<int32_t>(i) - v_j;
-                lbl[idx] = lbl_j;
-                dist[idx] = g_j + di * di;
-            }
-        }
-        i_start = i_end;
-    }
-}
-
+// Use the same parabolic envelope for periodic and bounded expansion;
+// only the fill skips sticky barriers. Ghost seeds never include barriers
+// because those pixels have label zero.
 inline void envelope_pass_row_barrier(
         int32_t* lbl, int32_t* dist, int64_t N, int64_t stride,
         int32_t* v, int32_t* lblstk, int32_t* g, double* z,
-        double* vd, double* vd_sq) {
-    if (stride == 1) {
-        envelope_pass_row_barrier_impl<true>(
-            lbl, dist, N, 1, v, lblstk, g, z, vd, vd_sq);
+        double* vd, double* vd_sq, bool wrap = false) {
+    if (wrap) {
+        if (stride == 1) envelope_pass_row_impl<true, true, true>(
+            lbl, dist, N, stride, v, lblstk, g, z, vd, vd_sq);
+        else envelope_pass_row_impl<true, false, true>(
+            lbl, dist, N, stride, v, lblstk, g, z, vd, vd_sq);
     } else {
-        envelope_pass_row_barrier_impl<false>(
+        if (stride == 1) envelope_pass_row_impl<false, true, true>(
+            lbl, dist, N, stride, v, lblstk, g, z, vd, vd_sq);
+        else envelope_pass_row_impl<false, false, true>(
             lbl, dist, N, stride, v, lblstk, g, z, vd, vd_sq);
     }
 }
@@ -798,7 +565,7 @@ inline void envelope_pass_barrier(
         int32_t* h_lbl, int32_t* h_dist,
         int64_t n_slices, int64_t N,
         ForkJoinPool& pool, int n_threads,
-        std::vector<EnvelopeScratch>& scratch) {
+        std::vector<EnvelopeScratch>& scratch, bool wrap = false) {
     if (n_threads < 1) n_threads = 1;
     const int eff_threads = static_cast<int>(compute_threads(
         static_cast<size_t>(n_threads),
@@ -807,7 +574,7 @@ inline void envelope_pass_barrier(
     if (static_cast<int>(scratch.size()) < eff_threads) {
         scratch.resize(eff_threads);
     }
-    const size_t cap = static_cast<size_t>(N) + 1;
+    const size_t cap = static_cast<size_t>(wrap ? 3 * N : N) + 1;
     for (int t = 0; t < eff_threads; ++t) scratch[t].resize(cap);
 
     dispatch_parallel_with_scratch(pool, eff_threads,
@@ -823,72 +590,9 @@ inline void envelope_pass_barrier(
                 int32_t* l = h_lbl + s * N;
                 int32_t* d = h_dist + s * N;
                 envelope_pass_row_barrier(
-                    l, d, N, /*stride=*/1, vp, lp, gp, zp, vdp, vdsqp);
+                    l, d, N, /*stride=*/1, vp, lp, gp, zp, vdp, vdsqp, wrap);
             }
         });
-}
-
-
-// Top-level 2D entry. Replicates expand_labels_inplace for 2D but
-// inserts a bridge_check after the final axis. Output written to
-// bufs.lbl().
-//
-// Sweep order (matches expand_labels_inplace): axis 1 (innermost) first
-// via pass0, then axis 0 (outermost) via transpose + envelope_pass_barrier
-// + transpose-back. After the final axis, bridge_check_2d marks barriers
-// and zeroes labels on bridge pixels.
-//
-// For 2D, there's only one meaningful bridge-check point: after the
-// final axis, when labels are full 2D-Voronoi. Applying the test after
-// axis 1 (1D-row-Voronoi state) would flag whole stripes spuriously,
-// because every interior pixel in a wide horizontal segment has
-// {E,W} same-label by construction. The barrier-aware envelope_pass is
-// still used for axis 0 — it's a no-op when no barriers exist, but
-// keeps the code path uniform with the ND case (where intermediate
-// barriers do exist).
-inline void expand_labels_clean_2d_inplace(
-    const int32_t* input, ExpandBuffers& bufs,
-    int64_t H, int64_t W,
-    ForkJoinPool& pool, int n_threads)
-{
-    const int64_t total = H * W;
-    bufs.resize(total);
-    int32_t* h_lbl  = bufs.lbl();
-    int32_t* h_dist = bufs.dist();
-    int32_t* t_lbl  = bufs.lbl_T();
-    int32_t* t_dist = bufs.dist_T();
-
-    if (input != h_lbl) {
-        std::memcpy(h_lbl, input, total * sizeof(int32_t));
-    }
-
-    // Axis 1 (innermost): standard pass0. No barriers exist yet so we
-    // can use the fast path; it writes dist for every pixel along the
-    // row, so no leftover BARRIER sentinels survive into axis 0.
-    {
-        const int64_t n_slices = H;
-        const int64_t Nlen = W;
-        envelope_pass0(h_lbl, h_dist, n_slices, Nlen,
-                       pool, n_threads, bufs.scratch());
-    }
-
-    // Axis 0 (outermost): transpose to make it contiguous, then
-    // barrier-aware envelope_pass, then transpose back. For 2D no
-    // barriers have been marked yet, so this behaves like the standard
-    // sweep; the path is kept barrier-aware so the same machinery
-    // generalizes to ND (where intermediate axes would have barriers).
-    const int64_t A = 1, B = H, C = W;
-    batch_transpose<int32_t>(h_lbl, h_dist, t_lbl, t_dist,
-                              A, B, C, pool, n_threads);
-    envelope_pass_barrier(t_lbl, t_dist, A * C, B,
-                          pool, n_threads, bufs.scratch());
-    batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist,
-                              A, C, B, pool, n_threads);
-
-    // Final bridge check: scan the 2D-Voronoi result and mark antipodal
-    // bridges as barriers. Caller reads result from bufs.lbl(); barrier
-    // pixels are labels[i] = 0 with dist[i] = BRIDGE_BARRIER_DIST.
-    bridge_check_2d(h_lbl, h_dist, H, W, &pool, n_threads);
 }
 
 
@@ -936,7 +640,7 @@ inline void chamfer_st_l1_axis(int32_t* lbl, int32_t* dist,
                                 const std::vector<int64_t>& shape,
                                 int ax,
                                 ForkJoinPool& pool, int n_threads,
-                                bool barriers_present)
+                                bool barriers_present, bool wrap = false)
 {
     const int ndim = (int)shape.size();
     constexpr int64_t MIN_BAND_W = 256;
@@ -958,7 +662,7 @@ inline void chamfer_st_l1_axis(int32_t* lbl, int32_t* dist,
                           [&](size_t a0, size_t a1) {
             for (size_t a = a0; a < a1; ++a) {
                 const int64_t off = (int64_t)a * B;
-                chamfer_l1_row_init(lbl + off, dist + off, B, /*wrap=*/false);
+                chamfer_l1_row_init(lbl + off, dist + off, B, wrap);
             }
         });
         return;
@@ -993,10 +697,10 @@ inline void chamfer_st_l1_axis(int32_t* lbl, int32_t* dist,
             const int64_t off = a * B * C;
             if (barriers_present) {
                 chamfer_l1_slab_pass_barrier(lbl + off, dist + off,
-                                              B, C, c0, c1, /*wrap=*/false);
+                                              B, C, c0, c1, wrap);
             } else {
                 chamfer_l1_slab_pass(lbl + off, dist + off,
-                                      B, C, c0, c1, /*wrap=*/false);
+                                      B, C, c0, c1, wrap);
             }
         }
     });
@@ -1011,7 +715,7 @@ inline void envelope_pass_strided_abc_barrier(
         int32_t* h_lbl, int32_t* h_dist,
         int64_t A, int64_t B, int64_t C,
         ForkJoinPool& pool, int n_threads,
-        std::vector<EnvelopeScratch>& scratch) {
+        std::vector<EnvelopeScratch>& scratch, bool wrap = false) {
     if (n_threads < 1) n_threads = 1;
     const int64_t n_lines = A * C;
     const int eff_threads = static_cast<int>(compute_threads(
@@ -1019,7 +723,7 @@ inline void envelope_pass_strided_abc_barrier(
         static_cast<size_t>(n_lines),
         static_cast<size_t>(B)));
     if (static_cast<int>(scratch.size()) < eff_threads) scratch.resize(eff_threads);
-    const size_t cap = static_cast<size_t>(B) + 1;
+    const size_t cap = static_cast<size_t>(wrap ? 3 * B : B) + 1;
     for (int t = 0; t < eff_threads; ++t) scratch[t].resize(cap);
 
     dispatch_parallel_with_scratch(pool, eff_threads,
@@ -1036,7 +740,7 @@ inline void envelope_pass_strided_abc_barrier(
                 const int64_t c = static_cast<int64_t>(k) % C;
                 const int64_t base = a * B * C + c;
                 envelope_pass_row_barrier(h_lbl + base, h_dist + base, B,
-                                          /*stride=*/C, vp, lp, gp, zp, vdp, vdsqp);
+                                          /*stride=*/C, vp, lp, gp, zp, vdp, vdsqp, wrap);
             }
         });
 }
@@ -1051,7 +755,7 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
                                    int ax,
                                    ForkJoinPool& pool, int n_threads,
                                    std::vector<EnvelopeScratch>& scratch,
-                                   bool barriers_present)
+                                   bool barriers_present, bool wrap = false)
 {
     const int ndim = (int)shape.size();
     const int64_t n = shape[ax];
@@ -1060,7 +764,13 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
         const int64_t total = [&](){ int64_t t = 1; for (auto s : shape) t *= s; return t; }();
         const int64_t n_slices = total / n;
         // No barriers possible yet (first axis); pass0 is safe.
-        envelope_pass0(h_lbl, h_dist, n_slices, n, pool, n_threads, scratch);
+        if (wrap) {
+            constexpr int32_t INF = std::numeric_limits<int32_t>::max() / 4;
+            for (int64_t i = 0; i < total; ++i) h_dist[i] = h_lbl[i] ? 0 : INF;
+            envelope_pass(h_lbl, h_dist, n_slices, n, pool, n_threads, scratch, true);
+        } else {
+            envelope_pass0(h_lbl, h_dist, n_slices, n, pool, n_threads, scratch);
+        }
         return;
     }
     int64_t A = 1;
@@ -1077,18 +787,18 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
     if (use_strided) {
         if (barriers_present) {
             envelope_pass_strided_abc_barrier(h_lbl, h_dist, A, B, C,
-                                              pool, n_threads, scratch);
+                                              pool, n_threads, scratch, wrap);
         } else {
             envelope_pass_strided_abc(h_lbl, h_dist, A, B, C,
-                                      pool, n_threads, scratch, /*wrap=*/false);
+                                      pool, n_threads, scratch, wrap);
         }
         return;
     }
     batch_transpose<int32_t>(h_lbl, h_dist, t_lbl, t_dist, A, B, C, pool, n_threads);
     if (barriers_present) {
-        envelope_pass_barrier(t_lbl, t_dist, A * C, B, pool, n_threads, scratch);
+        envelope_pass_barrier(t_lbl, t_dist, A * C, B, pool, n_threads, scratch, wrap);
     } else {
-        envelope_pass(t_lbl, t_dist, A * C, B, pool, n_threads, scratch, /*wrap=*/false);
+        envelope_pass(t_lbl, t_dist, A * C, B, pool, n_threads, scratch, wrap);
     }
     batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads);
 }
@@ -1104,13 +814,17 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
 // p: 1 = L1 (Saito-Toriwaki), 2 = L2 (Felzenszwalb). Default 2.
 inline void expand_labels_clean_nd_inplace(
     const int32_t* input, ExpandBuffers& bufs,
-    const std::vector<int64_t>& shape,
-    ForkJoinPool& pool, int n_threads, int p = 2)
+    const std::vector<int64_t>& input_shape,
+    ForkJoinPool& pool, int n_threads, int p = 2, bool wrap = false)
 {
+    std::vector<int64_t> shape;
+    for (int64_t n : input_shape) if (n != 1) shape.push_back(n);
+    if (shape.empty()) shape.push_back(1);
     const int ndim = (int)shape.size();
     int64_t total = 1;
     for (auto s : shape) total *= s;
     bufs.resize(total);
+    if (total == 0) return;
     int32_t* h_lbl  = bufs.lbl();
     int32_t* h_dist = bufs.dist();
     int32_t* t_lbl  = bufs.lbl_T();
@@ -1132,11 +846,11 @@ inline void expand_labels_clean_nd_inplace(
     for (int ax = ndim - 1; ax >= 0; --ax) {
         if (p == 1) {
             chamfer_st_l1_axis(h_lbl, h_dist, shape, ax,
-                                pool, n_threads, barriers_present);
+                                pool, n_threads, barriers_present, wrap);
         } else {
             l2_sweep_axis_barrier(h_lbl, h_dist, t_lbl, t_dist, shape, ax,
                                    pool, n_threads, bufs.scratch(),
-                                   barriers_present);
+                                   barriers_present, wrap);
         }
         // After this axis, the swept subspace is {ax, ax+1, ..., ndim-1}.
         // Skip the innermost (subspace size 1 false-positives); for any
@@ -1149,41 +863,10 @@ inline void expand_labels_clean_nd_inplace(
             for (int j = 0; j < subspace_size; ++j) subset_axes[j] = ax + j;
             int64_t n_new = bridge_check_subspace_nd(
                 h_lbl, h_dist, shape, subset_axes, &pool, n_threads,
-                &bufs.nbr_scratch());
+                &bufs.nbr_scratch(), wrap);
             if (n_new > 0) barriers_present = true;
         }
     }
-}
-
-
-// L1 (Manhattan) variant. Runs the standard Saito-Toriwaki sweep
-// (chamfer_st_l1_nd) to full expansion, then applies the antipodal
-// bridge check on the final 2D-Voronoi labels. For 2D no intermediate
-// per-axis check is meaningful (axis-1 produces 1D-row-Voronoi which
-// false-positives the antipodal test), so a post-pass is equivalent
-// to per-axis with sticky barriers.
-//
-// L1 produces materially more antipodal bridges than L2 (Manhattan
-// boundaries are axis-aligned and create 1-wide diagonal strings where
-// two cells meet at a corner). This is the metric where the bridge
-// test actually changes the output visibly.
-inline void expand_labels_clean_l1_2d_inplace(
-    const int32_t* input, ExpandBuffers& bufs,
-    int64_t H, int64_t W,
-    ForkJoinPool& pool, int n_threads)
-{
-    const int64_t total = H * W;
-    bufs.resize(total);
-    int32_t* h_lbl  = bufs.lbl();
-    int32_t* h_dist = bufs.dist();
-
-    if (input != h_lbl) {
-        std::memcpy(h_lbl, input, total * sizeof(int32_t));
-    }
-
-    std::vector<int64_t> shape = {H, W};
-    chamfer_st_l1_nd(h_lbl, h_dist, shape, pool, n_threads, /*wrap=*/false);
-    bridge_check_2d(h_lbl, h_dist, H, W, &pool, n_threads);
 }
 
 
@@ -1204,10 +887,10 @@ inline void expand_labels_clean_l1_2d_inplace(
 inline void expand_labels_clean_inplace(
     const int32_t* input, ExpandBuffers& bufs,
     const std::vector<int64_t>& shape,
-    ForkJoinPool& pool, int n_threads, int p)
+    ForkJoinPool& pool, int n_threads, int p, bool wrap = false)
 {
     expand_labels_clean_nd_inplace(
-        input, bufs, shape, pool, n_threads, p);
+        input, bufs, shape, pool, n_threads, p, wrap);
 }
 
 }  // namespace ncolor_cpp

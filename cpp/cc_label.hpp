@@ -129,7 +129,7 @@ inline int32_t cc_label_nd(const T* input, int32_t* output,
                            const std::vector<int64_t>& shape, int conn,
                            CCStageTimes* times = nullptr) {
     const int ndim = static_cast<int>(shape.size());
-    if (ndim < 1) return 0;
+    validate_neighborhood_ndim(ndim);
     if (conn < 1) conn = 1;
     if (conn > ndim) conn = ndim;
     int64_t total = 1;
@@ -189,11 +189,12 @@ inline int32_t cc_label_nd(const T* input, int32_t* output,
 
     // Outer odometer over coords[0..ndim-2]. Boundary mask says whether
     // any outer axis is at its first or last index.
-    constexpr int MAX_NDIM = 16;
-    int64_t coords[MAX_NDIM] = {0};
-    uint32_t outer_bnd = 0;
+    constexpr int MAX_NDIM = FIND_PAIRS_MAX_NDIM;
+    int64_t coords[MAX_NDIM];
+    std::fill_n(coords, ndim, int64_t{0});
+    uint64_t outer_bnd = 0;
     for (int d = 0; d < inner; ++d) {
-        if (coords[d] == 0 || coords[d] >= shape[d] - 1) outer_bnd |= (1u << d);
+        if (coords[d] == 0 || coords[d] >= shape[d] - 1) outer_bnd |= (uint64_t{1} << d);
     }
     int64_t row_base = 0;  // flat offset to (coords[0..ndim-2], inner=0)
     const int64_t outer_total = (inner == 0) ? 1 : (total / W);
@@ -252,15 +253,15 @@ inline int32_t cc_label_nd(const T* input, int32_t* output,
         while (coords[d] >= shape[d] && d > 0) {
             row_base -= coords[d] * strides[d];
             coords[d] = 0;
-            outer_bnd |= (1u << d);
+            outer_bnd |= (uint64_t{1} << d);
             --d;
             ++coords[d];
             row_base += strides[d];
         }
         if (coords[d] >= shape[d]) break;
         const bool is_bnd = (coords[d] == 0 || coords[d] >= shape[d] - 1);
-        if (is_bnd) outer_bnd |= (1u << d);
-        else outer_bnd &= ~(1u << d);
+        if (is_bnd) outer_bnd |= (uint64_t{1} << d);
+        else outer_bnd &= ~(uint64_t{1} << d);
     }
 
     auto t_after_pass1 = times ? clk::now() : clk::time_point{};
@@ -322,7 +323,7 @@ inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
                                       int conn,
                                       std::vector<T>& source_labels_out) {
     const int ndim = static_cast<int>(shape.size());
-    if (ndim < 1) { source_labels_out.clear(); return 0; }
+    validate_neighborhood_ndim(ndim);
     if (conn < 1) conn = 1;
     if (conn > ndim) conn = ndim;
     int64_t total = 1;
@@ -369,8 +370,9 @@ inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
         output[flat] = (best == 0) ? uf.make_set() : best;
     };
 
-    constexpr int MAX_NDIM = 16;
-    int64_t coords[MAX_NDIM] = {0};
+    constexpr int MAX_NDIM = FIND_PAIRS_MAX_NDIM;
+    int64_t coords[MAX_NDIM];
+    std::fill_n(coords, ndim, int64_t{0});
     int64_t row_base = 0;
     const int64_t outer_total = (inner == 0) ? 1 : (total / W);
 

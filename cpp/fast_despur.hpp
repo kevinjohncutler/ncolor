@@ -178,10 +178,6 @@ inline int64_t despur_via_face_count_nd(
     strides[ndim - 1] = 1;
     for (int d = ndim - 2; d >= 0; --d) strides[d] = strides[d + 1] * shape[d + 1];
 
-    // For 2D, hot path:
-    const int64_t H = (ndim >= 1 ? shape[0] : 1);
-    const int64_t W = (ndim >= 2 ? shape[1] : 1);
-
     // First revert all initially-marked spurs.
     int64_t removed = 0;
     for (auto& [i, _lab] : queue) {

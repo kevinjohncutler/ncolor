@@ -5,6 +5,38 @@ All notable changes to ncolor are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Clean expansion ignores singleton axes when deciding whether a swept
+  subspace can contain bridges, preserving results when singleton axes
+  are inserted anywhere in an array.
+- Adjacency and connected-components kernels support up to 64 axes.
+  Inputs above the supported rank raise instead of returning missing
+  edges or overflowing the fixed coordinate buffer.
+- `wrap=True` now reaches clean L1/L2 expansion, bridge classification,
+  and the peel-back cascade, including the default `label()` path.
+- Cleanup retains graph vertices for cells whose original pixels are
+  restored in the output, preventing out-of-range color LUT reads.
+- Lazy neighbor recounts no longer double-count queued removals during
+  cleanup. This can preserve pixels that were previously over-pruned.
+- Neighborhood radius values above 127 raise rather than overflowing
+  the offset representation; large neighborhood/padding sizes are
+  checked before overflowing their integer representation.
+
+### Performance
+
+- Face-only label cleanup builds only face offsets. Full-neighborhood
+  antipodal partners use direct indexing instead of quadratic searches.
+  Both cleanup modes stop scanning a voxel's neighborhood as soon as
+  neither removal rule can still apply: face-only cleanup on a 3D image
+  runs 3.1x faster than 2.1.1, full-neighborhood cleanup 1.45x.
+- Adjacency generation visits only offsets allowed by connectivity,
+  omits singleton-axis offsets, and counts neighbors combinatorially.
+- Removed unused 2D clean-expansion implementations and corrected the
+  public descriptions of N-D cleanup.
+
 ## [2.1.1] — 2026-09-07
 
 Follow-ups on the 2.1.0 geometry front end, found while checking it against

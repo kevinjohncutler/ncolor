@@ -263,13 +263,9 @@ public:
         return out;
     }
 
-    // Bridge-free Voronoi label expansion. After each EDT axis sweep,
-    // pixels that form an antipodal-only bridge (exactly two same-label
-    // neighbors arranged opposite each other: N-S, E-W, NE-SW, or NW-SE
-    // in 2D) are marked as barriers (lbl=0) so the next axis sweep
-    // can't refill them. Currently 2D L2 only — falls back to standard
-    // L2 expand for ND > 2 until 3D antipodal generalization lands.
-    py::array_t<int32_t> expand_labels_clean(py::array labels, int p = 2) {
+    // N-D Lp expansion with sticky bridge barriers and periodic cleanup.
+    py::array_t<int32_t> expand_labels_clean(py::array labels, int p = 2,
+                                            bool wrap = false) {
         if (p != 1 && p != 2) {
             throw std::invalid_argument(
                 "expand_labels_clean: p must be 1 or 2");
@@ -293,7 +289,7 @@ public:
             std::lock_guard<std::mutex> engine_lock(pool_->mu);
             cast_into_(buf, src_ptr, out_ptr, total, "ExpandEngine.expand_labels_clean");
             ncolor_cpp::expand_labels_clean_inplace(
-                out_ptr, bufs_, shape, pool_->pool, n_threads_, p);
+                out_ptr, bufs_, shape, pool_->pool, n_threads_, p, wrap);
             std::memcpy(out_ptr, bufs_.lbl(),
                         bufs_.size() * sizeof(int32_t));
         }
@@ -661,6 +657,7 @@ public:
         }
         const auto buf = mask.request();
         const int ndim = static_cast<int>(buf.ndim);
+        ncolor_cpp::validate_neighborhood_ndim(ndim);
         if (ndim < 2) throw std::invalid_argument(
             "Solver.connect expects a label image with ndim >= 2");
         if (conn < 1 || conn > ndim) throw std::invalid_argument(
@@ -745,6 +742,7 @@ public:
         }
         const auto buf = mask.request();
         const int ndim = static_cast<int>(buf.ndim);
+        ncolor_cpp::validate_neighborhood_ndim(ndim);
         if (ndim < 2) throw std::invalid_argument(
             "Solver.label expects a label image with ndim >= 2");
         if (conn < 1 || conn > ndim) throw std::invalid_argument(
@@ -870,12 +868,14 @@ public:
             // in place inside expand_bufs_.lbl(). When format_input=False
             // the caller is asserting labels are already 1..N.
             const int32_t* expand_input = expanded;
+            int32_t input_max_label = 0;
             if (format_input) {
                 const int n_labels = first_seen
                     ? ncolor_cpp::format_labels_inplace_first_seen(
                         expanded, total, pool_->pool, n_threads_)
                     : ncolor_cpp::format_labels_inplace(
                         expanded, total, pool_->pool, n_threads_);
+                input_max_label = n_labels;
                 stage("format");
                 // Empty / all-bg input: output is all zeros, no
                 // expansion / coloring needed.
@@ -916,6 +916,8 @@ public:
             // can use them.
             const bool need_orig_snapshot = !clean_mask
                 && expand && em == "clean";
+            if (!format_input && (need_orig_snapshot || (despur_iters > 0 && expand)))
+                input_max_label = parallel_max_label_(expand_input, total);
             if (need_orig_snapshot) {
                 orig_labels_.assign(expand_input, expand_input + total);
             }
@@ -928,7 +930,7 @@ public:
                     // already points to.
                     ncolor_cpp::expand_labels_clean_inplace(
                         expand_input, expand_bufs_, shape,
-                        pool_->pool, n_threads_, p);
+                        pool_->pool, n_threads_, p, wrap);
                 } else if (em == "standard") {
                     if (p == 2) {
                         ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, pool_->pool, n_threads_, wrap);
@@ -1092,20 +1094,13 @@ public:
                 // merge on the soft side. Falls through to the single-
                 // emit path when no soft kernel is requested or when it
                 // would be a subset of the base.
-                const int ndim_local = (int)shape.size();
                 const int64_t n_fwd_base = ncolor_cpp::detail::
-                    count_forward_neighbors(ndim_local, conn, connect_radius);
+                    count_forward_neighbors(shape, conn, connect_radius);
                 const int64_t n_fwd_soft = ncolor_cpp::detail::
-                    count_forward_neighbors(ndim_local, soft_conn, soft_radius);
+                    count_forward_neighbors(shape, soft_conn, soft_radius);
                 const int64_t n_fwd_delta = std::max<int64_t>(1, n_fwd_soft - n_fwd_base);
-                const int64_t base_ht_raw =
-                    2 * n_fwd_base * (int64_t)n_labels;
-                const int64_t soft_ht_raw =
-                    2 * n_fwd_delta * (int64_t)n_labels;
-                uint64_t base_ht_size = (uint64_t)ipow2_ge(
-                    std::max<int64_t>(base_ht_raw, MIN_HT_SIZE));
-                uint64_t soft_ht_size = (uint64_t)ipow2_ge(
-                    std::max<int64_t>(soft_ht_raw, MIN_HT_SIZE));
+                uint64_t base_ht_size = initial_ht_size_(0, n_fwd_base, n_labels);
+                uint64_t soft_ht_size = initial_ht_size_(0, n_fwd_delta, n_labels);
                 for (;;) {
                     const int full =
                         ncolor_cpp::find_pairs_dual_nd_unpadded<int32_t>(
@@ -1179,7 +1174,11 @@ public:
             }
 
             // 3. Build CSR (labels are 1..max_label after expand → node = label-1).
-            const int32_t N = max_label;
+            // A cleaned-away cell remains a graph vertex whenever its
+            // original pixels will be restored. Otherwise LUT lookup can
+            // read past the end and return stale colors from an earlier call.
+            const bool restore_cells = need_orig_snapshot || (despur_iters > 0 && expand);
+            const int32_t N = restore_cells ? std::max(max_label, input_max_label) : max_label;
             int32_t M = static_cast<int32_t>(pairs.size());
 
             // `extra_edges` parsed above (pre-GIL-release) into n_extra
@@ -1672,7 +1671,7 @@ private:
         if (max_label == 0) return {};
         const int ndim = static_cast<int>(shape.size());
         const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbors(
-            ndim, conn, radius);
+            shape, conn, radius);
         uint64_t ht_size = initial_ht_size_(ndim, n_fwd, max_label);
         // Retry-on-full: the number of DISTINCT adjacency edges is not
         // bounded by n_fwd*max_label — a dense ND Voronoi cell can be
@@ -1700,9 +1699,10 @@ private:
     // retry-on-full loop guarantees correctness if even this is low.
     static uint64_t initial_ht_size_(int ndim, int64_t n_fwd,
                                      int32_t n_labels) {
-        int64_t deg = 2 * n_fwd;
+        int64_t deg = 2 * std::min<int64_t>(n_fwd, HT_SIZE_CAP / 2);
         if (ndim >= 3) deg = std::max<int64_t>(deg, 32);
-        const int64_t ht_raw = deg * static_cast<int64_t>(n_labels);
+        const int64_t ht_raw = std::min<int64_t>(HT_SIZE_CAP,
+            deg * static_cast<int64_t>(n_labels));
         return static_cast<uint64_t>(
             ipow2_ge(std::max<int64_t>(ht_raw, MIN_HT_SIZE)));
     }
@@ -1728,7 +1728,7 @@ private:
         if (max_label == 0) return {};
         const int ndim = static_cast<int>(shape.size());
         const int64_t n_fwd = ncolor_cpp::detail::count_forward_neighbors(
-            ndim, conn, radius);
+            shape, conn, radius);
         uint64_t ht_size = initial_ht_size_(ndim, n_fwd, max_label);
         // Retry-on-full (see find_pairs_): the weighted reducer arrays are
         // re-cleared and refilled on each call, so a retry is self-consistent.
@@ -1885,18 +1885,10 @@ PYBIND11_MODULE(_impl, m) {
              "L2 ~1.4-1.6× std. Verified bit-equal to a np.pad reference\n"
              "on standard inputs.")
         .def("expand_labels_clean", &ExpandEngine::expand_labels_clean,
-             py::arg("labels"), py::arg("p") = 2,
-             "Bridge-free Voronoi label expansion (2D only for now).\n"
-             "Identical to expand_labels except an antipodal-only bridge\n"
-             "test runs on the final 2D-Voronoi labels: pixels with\n"
-             "exactly two same-label neighbors arranged antipodally\n"
-             "(N-S, E-W, NE-SW, or NW-SE) are marked bg. Prevents 1-\n"
-             "pixel-wide bridges (face or corner) from connecting cells.\n"
-             "p=1 (L1, Saito-Toriwaki) tends to produce many more such\n"
-             "bridges than p=2 (L2, Felzenszwalb) — L1 is the metric\n"
-             "where the test actually changes the output materially.\n"
-             "ND > 2 falls back to standard expand_labels (no bridge\n"
-             "prevention) until 3D antipodal generalization lands.")
+             py::arg("labels"), py::arg("p") = 2, py::arg("wrap") = false,
+             "N-D Lp Voronoi expansion with sticky bridge/stub barriers.\n"
+             "p=1 selects L1; p=2 selects L2. wrap=True makes expansion\n"
+             "and cleanup periodic. Singleton axes do not affect cleanup.")
         .def("expand_labels_with_dist", &ExpandEngine::expand_labels_with_dist,
              py::arg("labels"), py::arg("p") = 2, py::arg("wrap") = false,
              "Same as expand_labels but also returns the distance field.\n"
@@ -2183,6 +2175,7 @@ PYBIND11_MODULE(_impl, m) {
               }
               const auto buf = mask.request();
               const int ndim = static_cast<int>(buf.ndim);
+              ncolor_cpp::validate_neighborhood_ndim(ndim);
               if (ndim < 2) throw std::invalid_argument(
                   "delete_spurs requires an array of ndim >= 2");
 
@@ -2274,9 +2267,9 @@ PYBIND11_MODULE(_impl, m) {
           "Stops when no further removals or after max_iters.\n\n"
           "``remove_thin=True`` also zeros 1-voxel-thick straight\n"
           "interior pixels in the SAME pass (a pixel with exactly two\n"
-          "same-label 8-connectivity neighbors that sit at opposite\n"
-          "offsets — axis-aligned in 3D+, axis-aligned and diagonal\n"
-          "in 2D). Useful for cleaning up 1-px bridges left by L1\n"
+          "same-label full-connectivity neighbors at opposite offsets,\n"
+          "including diagonals in every dimension). Useful for cleaning\n"
+          "up 1-px bridges left by L1\n"
           "Voronoi expand without paying the iter-by-iter end-peeling\n"
           "cost.");
 

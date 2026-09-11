@@ -15,7 +15,7 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
 
     Two expansion algorithms are available, selected by ``mode``:
 
-    * ``"standard"`` (default) — Voronoi expansion under the L_p metric.
+    * ``"standard"`` (default): Voronoi expansion under the L_p metric.
       ``p=2`` uses the Felzenszwalb-Huttenlocher parabolic envelope
       (any ndim, default). ``p=1`` uses the Saito-Toriwaki separable
       sweep (Manhattan distance, ~5× faster on 2D, slightly different
@@ -24,17 +24,11 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
       toroidal: opposite image edges are treated as adjacent, so a
       seed near one edge competes for territory with seeds near the
       opposite edge. ~1.1× cost for L1, ~1.4-1.6× for L2.
-    * ``"clean"`` — Same separable Voronoi expansion as ``"standard"``
-      (selectable via ``p`` / ``metric``: ``p=1`` Saito-Toriwaki L1,
-      ``p=2`` Felzenszwalb L2), with an antipodal-only bridge test run
-      on the final 2D-Voronoi labels: pixels with exactly two
-      same-label neighbors arranged antipodally (N-S, E-W, NE-SW, or
-      NW-SE) are marked bg-barriers. Prevents 1-pixel-wide bridges
-      (face or corner) between Voronoi cells. L1 typically produces an
-      order of magnitude more antipodal bridges than L2 — this is the
-      metric where the test changes the output materially. 2D only for
-      now — ND > 2 falls back to standard expand (no bridge
-      prevention).
+    * ``"clean"``: N-D Lp expansion with a bridge/stub cleanup after
+      each swept subspace of at least two non-singleton axes. Removed
+      pixels remain background barriers through later sweeps. Both the
+      expansion and cleanup honor ``wrap=True``. Singleton axes do not
+      affect the result.
 
     Accepts any integer, bool or float label array; the cast to the
     engine's int32 runs in parallel inside the call. Labels are kept as
@@ -67,4 +61,4 @@ def expand_labels(label_image, p: int = 2, *, metric: str | None = None,
     with _use(_engine) as eng:
         if mode == "standard":
             return eng._expand.expand_labels(arr, p=p, wrap=bool(wrap))
-        return eng._expand.expand_labels_clean(arr, p=int(p))
+        return eng._expand.expand_labels_clean(arr, p=int(p), wrap=bool(wrap))
