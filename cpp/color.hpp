@@ -105,7 +105,8 @@ inline void build_csr_from_pairs_weighted(
 // `weight_obj`: 0 = balance (current default), +1 = maximize weighted ΔE
 //               (sharp contrast on heavy edges), -1 = minimize weighted ΔE
 //               (soft contrast). Ignored when weights or de_table is null.
-inline bool color_graph_csr_legacy(
+template <size_t PaletteSize>
+inline bool color_graph_csr_legacy_impl(
         const int32_t* indptr, const int32_t* indices, int32_t N,
         int32_t n_colors, int32_t rand_period, int32_t offset, int64_t max_iter,
         std::vector<uint8_t>& colors, bool welsh_powell = false,
@@ -226,7 +227,7 @@ inline bool color_graph_csr_legacy(
         }
     }
 
-    std::bitset<256> fullmask;
+    std::bitset<PaletteSize> fullmask;
     for (int c = 1; c <= n_colors; ++c) fullmask.set(c);
     int64_t count = 0;
     while (head < tail && count < max_iter) {
@@ -236,7 +237,7 @@ inline bool color_graph_csr_legacy(
 
         const int32_t row_beg = indptr[u];
         const int32_t row_end = indptr[u + 1];
-        std::bitset<256> mask;
+        std::bitset<PaletteSize> mask;
         bool all_present = false;
         for (int32_t k = row_beg; k < row_end; ++k) {
             const uint8_t cv = colors[indices[k]];
@@ -314,7 +315,7 @@ inline bool color_graph_csr_legacy(
             counter[u] = 0;
         } else {
             // Tally colors among neighbors, pick least-used (excluding u's current).
-            int32_t cnt[256] = {};  // One counter per representable color.
+            int32_t cnt[PaletteSize] = {};  // One counter per representable color.
             for (int32_t k = row_beg; k < row_end; ++k) {
                 const uint8_t cv = colors[indices[k]];
                 if (cv != 0) cnt[cv] += 1;
@@ -360,6 +361,20 @@ inline bool color_graph_csr_legacy(
     }
 
     return head >= tail;  // true = finished all in queue
+}
+
+// Keep ordinary palettes in one machine word while retaining all 255 colors.
+inline bool color_graph_csr_legacy(
+        const int32_t* indptr, const int32_t* indices, int32_t N,
+        int32_t n_colors, int32_t rand_period, int32_t offset, int64_t max_iter,
+        std::vector<uint8_t>& colors, bool welsh_powell = false,
+        const double* weights = nullptr, const double* de_table = nullptr,
+        int weight_obj = 0) {
+    if (n_colors < 64)
+        return color_graph_csr_legacy_impl<64>(indptr, indices, N, n_colors,
+            rand_period, offset, max_iter, colors, welsh_powell, weights, de_table, weight_obj);
+    return color_graph_csr_legacy_impl<256>(indptr, indices, N, n_colors,
+        rand_period, offset, max_iter, colors, welsh_powell, weights, de_table, weight_obj);
 }
 
 // Conflict check — true if any edge has same-colored endpoints.

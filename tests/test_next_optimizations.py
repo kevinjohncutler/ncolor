@@ -247,3 +247,14 @@ def test_unformatted_float_truncation_to_background():
     expected = ncolor.label(image.astype(np.int32), format_input=False)
     np.testing.assert_array_equal(ncolor.label(image, format_input=False), expected)
     np.testing.assert_array_equal(ncolor.prepare_labels(image, format_input=False).color(), expected)
+
+
+@pytest.mark.parametrize('conn', [1, 2, 3])
+@pytest.mark.parametrize('density', [0.01, 0.1, 0.7, 1.0])
+def test_thin_component_seams_match_independent_reference(conn, density):
+    from skimage.measure import label
+    image = np.random.default_rng(919).random((2, 513, 517)) < density
+    expected, count = label(image, connectivity=conn, return_num=True)
+    actual, actual_count = ncolor.Engine(n_threads=4).connected_components(image, conn=conn)
+    assert actual_count == count
+    np.testing.assert_array_equal(actual, expected)

@@ -31,6 +31,13 @@ void* operator new(size_t n) {
 }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete(void* p, size_t) noexcept { std::free(p); }
+// Standard-library temporary buffers can use nonthrowing allocation.
+// Route them through the same allocator so tracking and sanitizers agree.
+void* operator new(size_t n, const std::nothrow_t&) noexcept {
+    try { return ::operator new(n); }
+    catch (...) { return nullptr; }
+}
+void operator delete(void* p, const std::nothrow_t&) noexcept { ::operator delete(p); }
 
 using namespace ncolor_cpp;
 
@@ -244,8 +251,35 @@ static void check_clique_bounds() {
     assert(state.deadline_hit);
 }
 
+static void check_compact_palette_equivalence() {
+    std::mt19937 rng(419);
+    const int n = 79;
+    std::vector<int32_t> ip{0}, ix;
+    for (int u = 0; u < n; ++u) {
+        for (int v = 0; v < n; ++v)
+            if (u != v && ((u * 37 + v * 37) % 7 < 4)) ix.push_back(v);
+        ip.push_back(static_cast<int32_t>(ix.size()));
+    }
+    std::vector<double> weights(ix.size());
+    for (auto& w : weights) w = 1 + rng() % 11;
+    for (int k : {1, 4, 7, 31, 32, 63}) {
+        std::vector<double> palette((k + 1) * (k + 1));
+        for (auto& d : palette) d = rng() % 100;
+        for (int offset : {0, 3, 15}) for (bool wp : {false, true}) {
+            for (int objective : {-1, 0, 1}) {
+                std::vector<uint8_t> compact, wide;
+                const bool a = color_graph_csr_legacy_impl<64>(ip.data(), ix.data(), n,
+                    k, 10, offset, n * 6, compact, wp, weights.data(), palette.data(), objective);
+                const bool b = color_graph_csr_legacy_impl<256>(ip.data(), ix.data(), n,
+                    k, 10, offset, n * 6, wide, wp, weights.data(), palette.data(), objective);
+                assert(a == b && compact == wide);
+            }
+        }
+    }
+}
+
 static void check_large_palettes() {
-    for (int k : {31, 32, 64, 255}) {
+    for (int k : {31, 32, 63, 64, 255}) {
         // An impossible clique exercises the all-colors-present counter
         // path as well as initialization, unlike an easy large palette.
         const int n = k + 1;
@@ -445,6 +479,29 @@ static void check_parallel_components() {
     }
 }
 
+template <typename T>
+static void check_cast_sign_reduction() {
+    ForkJoinPool pool(4);
+    for (int64_t size : {0, 1, 499999, 500000, 500001}) {
+        std::vector<T> input(static_cast<size_t>(size), T{7});
+        std::vector<int32_t> output(static_cast<size_t>(size));
+        std::vector<uint8_t> background(static_cast<size_t>(size));
+        for (T value : {T{0}, T{-1}, static_cast<T>(INT32_MIN), T{2147483520}}) {
+            if (size) input.back() = value;
+            for (int threads : {1, 4}) {
+                bool negative = true;
+                assert((cast_with_bg<T, true>(input.data(), output.data(), background.data(),
+                    size, pool, threads, &negative)));
+                assert(negative == (size > 0 && value < 0));
+                for (int64_t j = 0; j < size; ++j) {
+                    assert(output[j] == static_cast<int32_t>(input[j]));
+                    assert(background[j] == (output[j] == 0));
+                }
+            }
+        }
+    }
+}
+
 static void check_byte_formatting() {
     ForkJoinPool pool(4);
     for (int64_t size : {0, 1, 499999, 500000, 500001}) {
@@ -521,6 +578,10 @@ static void check_pool_exception_recovery() {
 
 int main() {
     check_byte_formatting();
+    check_cast_sign_reduction<int32_t>();
+    check_cast_sign_reduction<int64_t>();
+    check_cast_sign_reduction<float>();
+    check_cast_sign_reduction<double>();
     check_feature_transfers();
     check_retained_feature_layout();
     check_parallel_components();
@@ -531,6 +592,7 @@ int main() {
     check_thin_spur_allocations();
     check_soft_endpoint_bounds();
     check_large_palettes();
+    check_compact_palette_equivalence();
     check_sparse_formatting();
     check_clique_bounds();
     check_buffers();

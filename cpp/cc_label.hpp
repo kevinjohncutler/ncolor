@@ -543,33 +543,56 @@ inline int32_t cc_label_parallel_nd(
         std::vector<int> crossing;
         for (size_t k = 0; k < flat.size(); ++k)
             if (offsets[k * ndim] == 1) crossing.push_back(static_cast<int>(k));
+        // Clip outer coordinates once per row. Only the two row endpoints
+        // need an inner-axis bounds check; interior pixels reuse this list.
         std::vector<int64_t> point(ndim, 0);
+        std::vector<int> row_crossing;
+        row_crossing.reserve(crossing.size());
+        const int64_t width = shape.back();
         for (int s = 1; s < slabs; ++s) {
             std::fill(point.begin(), point.end(), 0);
             const int64_t first = starts[s] - plane;
-            for (int64_t i = 0; i < plane; ++i) {
-                const int64_t at = first + i;
-                const int32_t a = output[at];
-                if (a) for (int k : crossing) {
+            int32_t previous_a = 0, previous_b = 0;
+            for (int64_t row = 0; row < plane; row += width) {
+                row_crossing.clear();
+                for (int k : crossing) {
                     bool valid = true;
-                    for (int d = 1; d < ndim; ++d) {
+                    for (int d = 1; d < ndim - 1; ++d) {
                         const int64_t q = point[d] + offsets[k * ndim + d];
                         if (q < 0 || q >= shape[d]) { valid = false; break; }
                     }
-                    if (!valid) continue;
-                    const int64_t neighbor = at + flat[k];
-                    const int32_t b = output[neighbor];
-                    if (!b) continue;
-                    if constexpr (PerLabel) if (input[at] != input[neighbor]) continue;
-                    if (uf.parent.empty()) {
-                        uf.parent.resize(static_cast<size_t>(provisional) + 1);
-                        uf.rank_.assign(uf.parent.size(), 0);
-                        for (size_t id = 0; id < uf.parent.size(); ++id)
-                            uf.parent[id] = static_cast<int32_t>(id);
-                    }
-                    uf.unite(bases[s - 1] + a, bases[s] + b);
+                    if (valid) row_crossing.push_back(k);
                 }
-                for (int d = ndim - 1; d > 0; --d) {
+                auto merge_pixel = [&](int64_t x, bool boundary) {
+                    const int64_t at = first + row + x;
+                    const int32_t a = output[at];
+                    if (!a) return;
+                    for (int k : row_crossing) {
+                        if (boundary) {
+                            const int64_t q = x + offsets[k * ndim + ndim - 1];
+                            if (q < 0 || q >= width) continue;
+                        }
+                        const int64_t neighbor = at + flat[k];
+                        const int32_t b = output[neighbor];
+                        if (!b) continue;
+                        if constexpr (PerLabel) if (input[at] != input[neighbor]) continue;
+                        // Repeated local component pairs need only one union.
+                        if (a == previous_a && b == previous_b) continue;
+                        previous_a = a;
+                        previous_b = b;
+                        if (uf.parent.empty()) {
+                            uf.parent.resize(static_cast<size_t>(provisional) + 1);
+                            uf.rank_.assign(uf.parent.size(), 0);
+                            for (size_t id = 0; id < uf.parent.size(); ++id)
+                                uf.parent[id] = static_cast<int32_t>(id);
+                        }
+                        uf.unite(bases[s - 1] + a, bases[s] + b);
+                    }
+                };
+                merge_pixel(0, true);
+                for (int64_t x = 1; x < width - 1; ++x) merge_pixel(x, false);
+                merge_pixel(width - 1, true);
+                for (int d = ndim - 2; d > 0; --d) {
                     if (++point[d] < shape[d]) break;
                     point[d] = 0;
                 }

@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import platform
 import statistics
@@ -101,7 +102,10 @@ def run(args):
     def record(name, fn, check):
         results[name] = timed(fn, check, args.repeats)
         print(name, round(results[name]['median_ms'], 3), flush=True)
-    for name in inputs.files:
+    selected = args.case or inputs.files
+    if any(name not in inputs.files for name in selected):
+        raise ValueError('--case must name an entry in the corpus')
+    for name in selected:
         image = inputs[name]
         original = fingerprint(image)
         if name.startswith('labels_'):
@@ -198,6 +202,7 @@ def run(args):
                     threads=args.threads, repeats=args.repeats, warmups=4,
                     python=platform.python_version(), platform=platform.system(), machine=platform.machine(),
                     cpu=cpu_model(),
+                    affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
                     dependencies={p:importlib.metadata.version(p) for p in ['numpy','scipy','scikit-image','numba','fastremap']},
                     corpus={k:fingerprint(inputs[k]) for k in inputs.files})
     args.output.parent.mkdir(parents=True,exist_ok=True)
@@ -216,6 +221,7 @@ def report(args):
         version = data['metadata']['version']
         meta = data['metadata']
         signature = {key:meta[key] for key in ('cpu','platform','machine','python','dependencies','threads','repeats')}
+        signature['affinity'] = meta.get('affinity')
         if environment is None: environment = signature
         assert environment == signature, 'benchmark environments differ'
         assert revisions.setdefault(version, meta['revision']) == meta['revision'], 'source revisions differ'
@@ -248,6 +254,7 @@ def main():
     worker.add_argument('--corpus',type=Path,required=True)
     worker.add_argument('--output',type=Path,required=True)
     worker.add_argument('--threads',type=int,default=4)
+    worker.add_argument('--case', action='append', help='limit timings to named corpus entries')
     worker.add_argument('--round',type=int,required=True)
     worker.add_argument('--repeats',type=int,default=15)
     summarize=sub.add_parser('report');summarize.add_argument('--directory',type=Path,required=True);summarize.add_argument('--output',type=Path,required=True)

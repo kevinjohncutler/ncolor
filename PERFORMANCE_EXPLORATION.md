@@ -480,3 +480,12 @@ identifies new targets: validated casting, 3D coloring, native region
 properties, and dense thin diagonal components. Stage profiles with
 controlled core placement distinguish these from broad scheduling noise.
 Use the revised priority list there for the next optimization round.
+
+## Regression follow-up
+
+[Regression recheck](REGRESSION_RECHECK.md) revisits those targets with fresh
+before/after measurements. The integrated fixes restore vectorizable
+negative-label validation, specialize ordinary coloring palettes without
+reducing the supported range, and reduce thin-volume component seam work.
+The report distinguishes regressions against ncolor 2.2.0 from remaining
+competitor gaps and from scheduling-dependent timing variation.

@@ -1,5 +1,9 @@
 # Release performance comparison
 
+Follow-up: [Regression recheck](REGRESSION_RECHECK.md) contains repeated
+measurements and fixes for the slow cases identified here. The tables below
+retain the original checkpoint measurements.
+
 Measured September 16, 2026. Current production code is `a6d09de`, compared
 with the unmodified tagged sources for 2.2.0 (`6858d805`) and 1.5.3
 (`07fb076c`). These are source-build comparisons, not downloaded wheel

@@ -29,6 +29,7 @@ def test_release_summary_excludes_invalid_baseline(tmp_path):
 
 @pytest.mark.parametrize('field,value', [('corpus', {'image': 'different'}), ('threads', 1),
                                          ('cpu', 'different'), ('platform', 'different'), ('machine', 'different'),
+                                         ('affinity', [0, 1, 2, 3]),
                                          ('revision', 'different')])
 def test_release_summary_rejects_mixed_runs(tmp_path, field, value):
     report = runpy.run_path(str(Path(__file__).parents[1] / 'bench/release_comparison.py'))['report']
