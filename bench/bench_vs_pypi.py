@@ -6,8 +6,12 @@ ncolor module). Each image × backend × n is timed with 12 reps + 4
 warmups, reporting min and median ms plus n_used (whether the picker
 actually reached the requested ``n`` or had to fall back to ``n+1``).
 
-PyPI 1.5.3 is the latest released ncolor on pip; install it into a
-dedicated target directory before running:
+Historical benchmark only. Its minimum-time ratios and unchecked v1
+foreground behavior are unsuitable for new README claims. Use
+bench/release_comparison.py for validated release comparisons.
+
+To reproduce this older script, install 1.5.3 into a dedicated target
+directory before running:
 
     pip install ncolor==1.5.3 --target /tmp/ncolor_pypi/install --no-deps --force-reinstall
 """

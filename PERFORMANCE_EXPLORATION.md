@@ -461,3 +461,14 @@ The earlier thin-component and private byte-presence improvements remain
 integrated. Connected components support cleanup and per-label processing
 as well as the public convenience operation; they are not an extra pass
 required by every coloring call.
+
+
+## Tagged-release comparison
+
+[Release benchmarks](RELEASE_BENCHMARKS.md) now compare the completed code
+with tagged 2.2.0 and 1.5.3 sources and equivalent scikit-image/SciPy
+operations. That report contains repeated one-worker and four-worker
+measurements, the historical version 1 foreground-formatting caveat,
+a dense thin-component case that remains slower than scikit-image, and
+draft README wording for release. Use those direct comparisons for release
+claims rather than multiplying the development-checkpoint ratios above.
