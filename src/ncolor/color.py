@@ -10,6 +10,15 @@ from ._engines import _use
 from .format import format_labels, _compact_wide_labels
 
 
+def _validate_coloring_budget(n, max_depth):
+    n, max_depth = int(n), int(max_depth)
+    if not 1 <= n <= 255:
+        raise ValueError("n must be between 1 and 255")
+    if max_depth < 1:
+        raise ValueError("max_depth must be >= 1")
+    return n, max_depth
+
+
 def _get_solver():
     """The process-wide ``Solver``.
 
@@ -34,7 +43,9 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
 
     Returns a uint8 image where every foreground pixel of ``lab`` has
     been assigned a color in ``1..n`` such that adjacent cells receive
-    different colors. Background (``lab == 0``) stays 0.
+    different colors. Background after label conversion and normalization
+    stays 0. A negative minimum becomes background; floating labels are
+    truncated to integers before background detection.
 
     Default behavior (call with no kwargs beyond ``lab``):
         4-color, 4-connectivity (face-only), ``clean`` Voronoi expand
@@ -46,11 +57,11 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
     Pass ``out=`` (uint8 array, exact shape) to reuse an output buffer
     across calls.
 
-    ``n`` is the *maximum* color budget. The picker tries ``cur_n``
-    starting at the minimum needed (clique lower bound) and increments
-    up to ``n``. If the graph is genuinely (n+1)-chromatic, the call
-    returns with ``n_used == n+1`` and may not satisfy the coloring
-    constraint — check ``return_n=True`` or ``check_conflicts=True``.
+    ``n`` is the starting color target, from 1 through 255. The picker
+    may increase it when the graph needs more colors. ``max_depth`` must
+    be positive and limits these attempts. Search stops at 255 colors,
+    the output dtype's limit. Check ``return_conflicts=True`` or use
+    ``check_conflicts=True`` to detect exhausted searches.
 
     ``conn`` is the connectivity for the *hard* adjacency graph:
         conn=1: face-only (4-conn in 2D, 6-conn in 3D)
@@ -91,6 +102,7 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
     cell pairs beyond the geometric graph. ``(E, 2) int32`` array,
     1-indexed by cell label. Use case: forcing specific cells to be
     differently colored regardless of whether they touch geometrically.
+    With boundary weighting enabled, explicit edges receive unit weight.
 
     ``soft_conn`` / ``soft_radius`` enable an auto-built soft-constraint
     post-pass (default ``2`` / ``2``, on). After the hard 4-coloring,
@@ -175,6 +187,7 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
     pass an ``(n+1) × (n+1)`` float array.
 
     """
+    n, max_depth = _validate_coloring_budget(n, max_depth)
     # A GeoDataFrame / GeoSeries / Shapely geometry would otherwise
     # become an object array and fail deep in the dtype dispatch.
     if hasattr(lab, "__geo_interface__") or (
@@ -208,14 +221,14 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
 
     extra_arr = None
     if extra_edges is not None:
-        extra_arr = np.ascontiguousarray(extra_edges, dtype=np.int32)
+        extra_arr = _as_edge_array(extra_edges, "extra_edges")
         if extra_arr.ndim != 2 or extra_arr.shape[1] != 2:
             raise ValueError(
                 f"extra_edges must be an (E, 2) int array of 1-indexed "
                 f"cell-pair constraints; got shape {extra_arr.shape}")
     soft_extra_arr = None
     if soft_extra_edges is not None:
-        soft_extra_arr = np.ascontiguousarray(soft_extra_edges, dtype=np.int32)
+        soft_extra_arr = _as_edge_array(soft_extra_edges, "soft_extra_edges")
         if soft_extra_arr.ndim != 2 or soft_extra_arr.shape[1] != 2:
             raise ValueError(
                 f"soft_extra_edges must be an (E, 2) int array of 1-indexed "
@@ -306,21 +319,28 @@ def connect(img, conn=1, _engine=None):
         return engine._solver.connect(img, conn=int(conn))
 
 
-def connected_components(mask, conn=2):
+def connected_components(mask, conn=None, _engine=None):
     """N-D connected-components labeling. Foreground = ``mask != 0``.
+
+    Large arrays use parallel slabs with boundary merging; small arrays
+    stay serial. Component IDs follow first appearance in raster order.
+    Use :meth:`Engine.connected_components` to choose a worker budget.
 
     Returns a tuple ``(labels, n_components)``: ``labels`` is an int32
     array of the same shape as ``mask`` with dense 1..N component IDs
     (0 = bg); ``n_components`` is the number of components found.
 
     ``conn`` selects the connectivity (1 = face-only, ndim = full
-    diagonal; equivalent to scipy/skimage's ``connectivity`` argument).
+    diagonal). The default uses 2 in two or more dimensions and 1 for
+    a one-dimensional input.
 
     Drop-in replacement for ``skimage.measure.label`` for callers that
     only need the labeled array, without the scikit-image dep.
     """
-    from ._backend import _impl as _b
-    return _b.cc_label(mask, conn=int(conn))
+    if conn is None:
+        conn = min(2, np.ndim(mask))
+    with _use(_engine) as engine:
+        return engine._expand.connected_components(np.asarray(mask), conn=int(conn))
 
 
 def regionprops(labels, n_labels=0):
@@ -355,15 +375,14 @@ def _as_edge_array(edges, name):
     if edges is None:
         return np.zeros((0, 2), dtype=np.int32)
     arr = np.asarray(edges)
-    if arr.size and arr.dtype.kind in "iu":
-        info = np.iinfo(np.int32)
-        hi = int(arr.max())
-        lo = int(arr.min()) if arr.dtype.kind == "i" else 0
-        if hi > info.max or lo < info.min:
-            raise OverflowError(
-                f"{name} contains vertex ids outside int32 "
-                f"([{lo}, {hi}]); ncolor.color_graph indexes vertices as "
-                f"int32, so pass 0-indexed ids below {info.max}")
+    if arr.size:
+        if arr.dtype.kind not in "biuf":
+            raise ValueError(f"{name} must contain integer values")
+        if arr.dtype.kind == "f" and (
+                not np.isfinite(arr).all() or np.any(arr != np.trunc(arr))):
+            raise ValueError(f"{name} must contain finite integer values")
+        if arr.min() < -(2**31) or arr.max() > 2**31 - 1:
+            raise OverflowError(f"{name} contains ids outside int32")
     return np.ascontiguousarray(arr, dtype=np.int32)
 
 
@@ -389,17 +408,16 @@ def color_graph(edges, n_vertices=None, n=4, soft_edges=None, max_depth=30,
         silently drops trailing isolated vertices, so pass it explicitly
         when the count matters.
     n : int
-        Color target. The picker works up from the clique lower bound
-        and spends its search budget trying to fit the graph into ``n``;
-        a graph that genuinely needs more escalates past it (up to
-        ``max_depth`` increments) rather than returning a broken
-        coloring. Read the count back with ``return_n=True``.
+        Color target, from 1 through 255. The picker tries this target
+        or a proven larger lower bound, then increases the palette if
+        needed. Read the actual count with ``return_n=True``.
     soft_edges : (E, 2) array_like of int, optional
         Pairs that *should* differ in color but do not constrain the
         hard coloring. A local-search post-pass minimizes how many of
         them end up sharing a color.
     max_depth : int
-        Cap on those escalation steps. Only a graph that exhausts it
+        Positive cap on those escalation steps. The palette is also capped
+        at 255 colors. A graph that exhausts either limit
         comes back with conflicts. Surface that with
         ``check_conflicts=True`` (raises) or ``return_conflicts=True``.
 
@@ -415,6 +433,7 @@ def color_graph(edges, n_vertices=None, n=4, soft_edges=None, max_depth=30,
     >>> len(set(colors.tolist()))          # a triangle needs three
     3
     """
+    n, max_depth = _validate_coloring_budget(n, max_depth)
     edges_arr = _as_edge_array(edges, "edges")
     if edges_arr.ndim != 2 or edges_arr.shape[1] != 2:
         raise ValueError(

@@ -27,6 +27,8 @@
 #include <climits>
 #include <algorithm>
 
+#include "timing.hpp"
+
 namespace ncolor_cpp {
 
 struct BBDSatur {
@@ -124,8 +126,7 @@ struct BBDSatur {
             // deadline is set — steady_clock cost (~50-100 ns) is
             // negligible vs the ~5 µs per descent at N=5000.
             if (deadline_ns > 0 &&
-                std::chrono::steady_clock::now()
-                    .time_since_epoch().count() > deadline_ns) return LIMIT;
+                steady_time_ns() > deadline_ns) return LIMIT;
             ++node_count;
             if (node_budget > 0 && node_count > node_budget) return LIMIT;
             const int32_t u = pick_next();

@@ -210,11 +210,17 @@ class _Borrowed:
         # Plain increments: a lock here cost more than the call itself,
         # and a miscount only means one call picks the other engine.
         _in_flight += 1
+        try:
+            self.engine._call_lock.acquire()
+        except BaseException:
+            _in_flight -= 1
+            raise
         return self.engine
 
     def __exit__(self, *exc):
         global _in_flight
         _in_flight -= 1
+        self.engine._call_lock.release()
         return False
 
 
@@ -286,12 +292,13 @@ class Engine:
         between 0 and 1 is that share of the core count.
     """
 
-    __slots__ = ("_solver", "_expand", "_n_threads")
+    __slots__ = ("_solver", "_expand", "_n_threads", "_call_lock")
 
     def __init__(self, n_threads=-1, *, _pool_group=None):
         from ._backend import ExpandEngine, Solver
         # One pool per engine, shared by its two halves: they are never
         # in a call at the same time, so they need only one between them.
+        self._call_lock = threading.RLock()
         group = _new_group() if _pool_group is None else _pool_group
         self._solver = Solver(n_threads, pool_group=group)
         self._expand = ExpandEngine(n_threads, pool_group=group)
@@ -322,15 +329,26 @@ class Engine:
         from .expand import expand_labels as _expand_labels
         return _expand_labels(label_image, _engine=self, **kwargs)
 
+    def connected_components(self, mask, conn=None):
+        """As :func:`ncolor.connected_components`, using this engine's pool."""
+        from .color import connected_components
+        return connected_components(mask, conn=conn, _engine=self)
+
     def format_labels(self, labels, **kwargs):
         """As :func:`ncolor.format_labels`, on this engine."""
         from .format import format_labels as _format_labels
         return _format_labels(labels, _engine=self, **kwargs)
 
+    def delete_spurs(self, arr, **kwargs):
+        """As :func:`ncolor.delete_spurs`, using this engine's pool."""
+        from .format import delete_spurs as _delete_spurs
+        return _delete_spurs(arr, _engine=self, **kwargs)
+
     def release_buffers(self):
         """Free this engine's scratch buffers; the pool is kept."""
-        self._solver.release()
-        self._expand.release()
+        with self._call_lock:
+            self._solver.release()
+            self._expand.release()
 
     def __repr__(self):
         return f"<ncolor.Engine n_threads={self._n_threads}>"

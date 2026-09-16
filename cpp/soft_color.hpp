@@ -16,6 +16,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bitset>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -47,13 +48,13 @@ inline double soft_total_penalty(
 
 // Compute hard-conflict color mask for vertex u (bit c set if some hard
 // neighbor of u uses color c).
-inline uint32_t hard_color_mask(
+inline std::bitset<256> hard_color_mask(
     int32_t u, const uint8_t* colors,
     const int32_t* hard_indptr, const int32_t* hard_indices)
 {
-    uint32_t mask = 0u;
+    std::bitset<256> mask;
     for (int32_t j = hard_indptr[u]; j < hard_indptr[u + 1]; ++j) {
-        mask |= (1u << colors[hard_indices[j]]);
+        mask.set(colors[hard_indices[j]]);
     }
     return mask;
 }
@@ -83,14 +84,11 @@ inline bool single_vertex_pass(
     int n_colors,
     double& penalty)
 {
-    const uint32_t all_colors = ((1u << (n_colors + 1)) - 1u) & ~1u;
     bool improved = false;
     for (int32_t u = 0; u < N; ++u) {
         const uint8_t cur_c = colors[u];
-        const uint32_t hard_mask = hard_color_mask(u, colors,
+        const auto hard_mask = hard_color_mask(u, colors,
                                                      hard_indptr, hard_indices);
-        uint32_t valid_mask = all_colors & ~hard_mask & ~(1u << cur_c);
-        if (valid_mask == 0) continue;
 
         const double cur_soft = soft_at_color(u, cur_c, colors,
                                                soft_indptr, soft_indices,
@@ -99,10 +97,8 @@ inline bool single_vertex_pass(
 
         double best_new = cur_soft;
         uint8_t best_c = cur_c;
-        uint32_t mask = valid_mask;
-        while (mask) {
-            int c = ctz_u32(mask);
-            mask &= mask - 1;
+        for (int c = 1; c <= n_colors; ++c) {
+            if (c == cur_c || hard_mask.test(c)) continue;
             const double new_soft = soft_at_color(u, c, colors,
                                                     soft_indptr, soft_indices,
                                                     soft_weights);
@@ -159,7 +155,6 @@ inline bool kempe_chain_pass(
 {
     if ((int32_t)visited_stamp.size() < N) visited_stamp.assign(N, 0);
     bool improved = false;
-    const uint32_t all_colors = ((1u << (n_colors + 1)) - 1u) & ~1u;
 
     const int32_t n_iter = stuck_worklist
         ? (int32_t)stuck_worklist->size() : N;
@@ -170,10 +165,8 @@ inline bool kempe_chain_pass(
                            soft_indices, soft_weights) == 0.0) continue;
 
         // Try each target color b != cur_c.
-        uint32_t mask = all_colors & ~(1u << cur_c);
-        while (mask) {
-            int b = ctz_u32(mask);
-            mask &= mask - 1;
+        for (int b = 1; b <= n_colors; ++b) {
+            if (b == cur_c) continue;
             // BFS the Kempe chain of u in colors {cur_c, b} via hard edges.
             // Mark visited with stamp_counter to avoid clearing.
             ++stamp_counter;
@@ -547,14 +540,13 @@ inline void build_soft_csr(
 {
     indptr.assign((size_t)N + 1, 0);
     // Pass 1: count out-degree per vertex (both directions).
-    int32_t valid = 0;
     for (int32_t e = 0; e < n_soft; ++e) {
-        int32_t a = soft_pairs[2 * e]     - 1;
-        int32_t b = soft_pairs[2 * e + 1] - 1;
-        if (a < 0 || b < 0 || a >= N || b >= N || a == b) continue;
+        int32_t a = soft_pairs[2 * e];
+        int32_t b = soft_pairs[2 * e + 1];
+        if (a < 1 || b < 1 || a > N || b > N || a == b) continue;
+        --a; --b;
         indptr[a + 1]++;
         indptr[b + 1]++;
-        ++valid;
     }
     // Prefix sum.
     for (int32_t i = 1; i <= N; ++i) indptr[i] += indptr[i - 1];
@@ -562,9 +554,10 @@ inline void build_soft_csr(
     weights.assign(indptr[N], 0.f);
     std::vector<int32_t> pos(N, 0);
     for (int32_t e = 0; e < n_soft; ++e) {
-        int32_t a = soft_pairs[2 * e]     - 1;
-        int32_t b = soft_pairs[2 * e + 1] - 1;
-        if (a < 0 || b < 0 || a >= N || b >= N || a == b) continue;
+        int32_t a = soft_pairs[2 * e];
+        int32_t b = soft_pairs[2 * e + 1];
+        if (a < 1 || b < 1 || a > N || b > N || a == b) continue;
+        --a; --b;
         const float w = weights_in ? weights_in[e] : 1.0f;
         const int32_t pa = indptr[a] + pos[a]++;
         const int32_t pb = indptr[b] + pos[b]++;

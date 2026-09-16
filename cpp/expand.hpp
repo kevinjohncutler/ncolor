@@ -612,7 +612,7 @@ void batch_transpose(
         const T* src_a, const T* src_b,
         T* dst_a, T* dst_b,
         int64_t A, int64_t B, int64_t C,
-        ForkJoinPool& pool, int n_threads) {
+        ForkJoinPool& pool, int n_threads, bool copy_distances = true) {
     constexpr int Bi = 64;
     const int64_t n_b = (B + Bi - 1) / Bi;
     const int64_t n_c = (C + Bi - 1) / Bi;
@@ -639,7 +639,7 @@ void batch_transpose(
                 const T* base_sb = src_b + plane;
                 T*       base_da = dst_a + tplane;
                 T*       base_db = dst_b + tplane;
-                for (int pass = 0; pass < 2; ++pass) {
+                for (int pass = 0; pass < (copy_distances ? 2 : 1); ++pass) {
                     const T* base_s = (pass == 0) ? base_sa : base_sb;
                     T*       base_d = (pass == 0) ? base_da : base_db;
                     for (int64_t b = b0; b < b1m; b += 4) {
@@ -671,7 +671,7 @@ void batch_transpose(
                     dst_a[tplane + c * B + b] = sa[c];
                 }
             }
-            for (int64_t b = b0; b < b1; ++b) {
+            if (copy_distances) for (int64_t b = b0; b < b1; ++b) {
                 const T* sb = src_b + plane + b * C;
                 for (int64_t c = c0; c < c1; ++c) {
                     dst_b[tplane + c * B + b] = sb[c];
@@ -695,27 +695,36 @@ void batch_transpose(
 // Holds buffers for repeated calls. Keep one per Python ExpandEngine instance.
 class ExpandBuffers {
 public:
-    void resize(int64_t total) {
-        if (total > capacity_) {
+    void resize(int64_t total, bool working_labels = true) {
+        if (working_labels && h_lbl_.size() < static_cast<size_t>(total))
             h_lbl_.resize(total);
-            h_dist_.resize(total);
-            t_lbl_.resize(total);
-            t_dist_.resize(total);
-            capacity_ = total;
-        }
+        if (h_dist_.size() < static_cast<size_t>(total)) h_dist_.resize(total);
         size_ = total;
+        wide_ = false;
     }
     int32_t* lbl()   { return h_lbl_.data(); }
     int32_t* dist()  { return h_dist_.data(); }
-    int32_t* lbl_T()  { return t_lbl_.data(); }
-    int32_t* dist_T() { return t_dist_.data(); }
+    int32_t* lbl_T() {
+        if (t_lbl_.size() < static_cast<size_t>(size_)) t_lbl_.resize(size_);
+        return t_lbl_.data();
+    }
+    int32_t* dist_T() {
+        if (t_dist_.size() < static_cast<size_t>(size_)) t_dist_.resize(size_);
+        return t_dist_.data();
+    }
+    void use_wide_distance() { wide_dist_.resize(size_); wide_ = true; }
+    bool wide_distance() const { return wide_; }
+    int64_t* dist64() { return wide_dist_.data(); }
+    double distance_at(int64_t i) const {
+        return wide_ ? static_cast<double>(wide_dist_[i])
+                     : static_cast<double>(h_dist_[i]);
+    }
     int64_t size() const { return size_; }
     // Per-worker envelope scratch (resized lazily).
     std::vector<EnvelopeScratch>& scratch() { return scratch_; }
-    // Give the memory back. The buffers hold 16 bytes per pixel of the
-    // largest image seen (plus per-worker scratch) for the engine's
-    // lifetime; after one whole-slide call that is gigabytes. The next
-    // call simply reallocates.
+    // Give back persistent image and worker scratch. Transpose and wide
+    // distance buffers are allocated only when their kernels need them.
+    // The next call simply reallocates.
     void release() {
         std::vector<int32_t>().swap(h_lbl_);
         std::vector<int32_t>().swap(h_dist_);
@@ -723,7 +732,8 @@ public:
         std::vector<int32_t>().swap(t_dist_);
         std::vector<EnvelopeScratch>().swap(scratch_);
         std::vector<uint8_t>().swap(nbr_);
-        capacity_ = 0;
+        std::vector<int64_t>().swap(wide_dist_);
+        wide_ = false;
         size_ = 0;
     }
     // Per-pixel neighbor-count scratch for the clean expand's bridge
@@ -731,7 +741,8 @@ public:
     std::vector<uint8_t>& nbr_scratch() { return nbr_; }
 private:
     std::vector<int32_t> h_lbl_, h_dist_, t_lbl_, t_dist_;
-    int64_t capacity_ = 0;
+    std::vector<int64_t> wide_dist_;
+    bool wide_ = false;
     int64_t size_ = 0;
     std::vector<EnvelopeScratch> scratch_;
     std::vector<uint8_t> nbr_;
@@ -740,24 +751,130 @@ private:
 
 // =============================================================================
 
+// Choose distance storage from geometry, not pixel count. Reserve headroom
+// for squared ghost positions and envelope intersections in the wide path.
+inline bool l2_needs_wide_distance(const std::vector<int64_t>& shape) {
+    constexpr int64_t limit = INT64_MAX / 16;
+    int64_t bound = 0;
+    for (int64_t n : shape) {
+        if (n <= 1) continue;
+        const int64_t span = n - 1;
+        if (span > limit / span || span * span > limit - bound)
+            throw std::overflow_error("squared image diameter exceeds distance capacity");
+        bound += span * span;
+    }
+    return bound > INT32_MAX;
+}
+
+// Wide envelope uses exact integer breakpoints: the first lattice position
+// at which the later seed wins. This also preserves the narrow path's tie
+// rule without floating-point cancellation on long axes.
+struct WideEnvelopeScratch {
+    std::vector<int64_t> v, g, start;
+    std::vector<int32_t> label;
+    explicit WideEnvelopeScratch(size_t n) : v(n), g(n), start(n), label(n) {}
+};
+
+inline void envelope_row_wide(int32_t* lbl, int64_t* dist,
+                              int64_t n, int64_t stride,
+                              WideEnvelopeScratch& sc, bool wrap) {
+    int64_t k = 0;
+    const int64_t begin = wrap ? -n : 0;
+    const int64_t end = wrap ? 2 * n : n;
+    for (int64_t i = begin; i < end; ++i) {
+        const int64_t src = ((i + n) % n) * stride;
+        if (!lbl[src]) continue;
+        int64_t start = INT64_MIN;
+        while (k) {
+            const int64_t j = k - 1;
+            const int64_t num = dist[src] - sc.g[j] + i * i - sc.v[j] * sc.v[j];
+            const int64_t den = 2 * (i - sc.v[j]);
+            start = num / den + (num % den > 0);
+            if (start > sc.start[j]) break;
+            --k;
+        }
+        if (!k) start = INT64_MIN;
+        sc.v[k] = i;
+        sc.g[k] = dist[src];
+        sc.label[k] = lbl[src];
+        sc.start[k++] = start;
+    }
+    for (int64_t j = 0; j < k; ++j) {
+        const int64_t lo = std::max<int64_t>(0, sc.start[j]);
+        const int64_t hi = j + 1 == k ? n : std::min(n, sc.start[j + 1]);
+        for (int64_t i = lo; i < hi; ++i) {
+            const int64_t off = i * stride;
+            if (dist[off] == INT32_MIN) continue;  // sticky clean barrier
+            const int64_t delta = i - sc.v[j];
+            lbl[off] = sc.label[j];
+            dist[off] = sc.g[j] + delta * delta;
+        }
+    }
+}
+
+inline void l2_sweep_axis_wide(int32_t* lbl, int64_t* dist,
+                              const std::vector<int64_t>& shape, int ax,
+                              ForkJoinPool& pool, int n_threads, bool wrap) {
+    int64_t a = 1, c = 1;
+    for (int d = 0; d < ax; ++d) a *= shape[d];
+    for (size_t d = ax + 1; d < shape.size(); ++d) c *= shape[d];
+    const int64_t n = shape[ax];
+    if (ax == static_cast<int>(shape.size()) - 1) {
+        for (int64_t i = 0; i < a * n * c; ++i)
+            dist[i] = lbl[i] ? 0 : INT64_MAX / 16;
+    }
+    if (n <= 1) return;
+    const size_t workers = compute_threads(std::max(1, n_threads), a * c, n);
+    std::vector<WideEnvelopeScratch> scratch;
+    for (size_t t = 0; t < workers; ++t)
+        scratch.emplace_back(static_cast<size_t>(wrap ? 3 * n : n));
+    dispatch_parallel_with_scratch(pool, workers, a * c,
+        workers * DISPATCH_CHUNKS_PER_THREAD, scratch,
+        [&](WideEnvelopeScratch& sc, size_t lo, size_t hi) {
+            for (size_t line = lo; line < hi; ++line) {
+                const int64_t off = (line / c) * n * c + line % c;
+                envelope_row_wide(lbl + off, dist + off, n, c, sc, wrap);
+            }
+        });
+}
+
 // Run expand_labels on a row-major label image of arbitrary ndim.
 // `shape` is the image shape; total = product of shape entries; the output
 // is written into `bufs.lbl()` which is also the working scratch.
 inline void expand_labels_inplace(
         const int32_t* input, ExpandBuffers& bufs,
         const std::vector<int64_t>& shape,
-        ForkJoinPool& pool, int n_threads, bool wrap = false) {
+        ForkJoinPool& pool, int n_threads, bool wrap = false,
+        bool keep_distances = true) {
+    // Singleton axes contribute no distance. Removing them preserves axis
+    // order and lets the first active axis use the sparse-seed fast pass.
+    if (shape.empty()) {
+        expand_labels_inplace(input, bufs, {1}, pool, n_threads, wrap, keep_distances);
+        return;
+    }
+    if (shape.size() > 1 && std::find(shape.begin(), shape.end(), 1) != shape.end()) {
+        std::vector<int64_t> active;
+        for (int64_t n : shape) if (n != 1) active.push_back(n);
+        if (active.empty()) active.push_back(1);
+        expand_labels_inplace(input, bufs, active, pool, n_threads, wrap, keep_distances);
+        return;
+    }
     const int ndim = static_cast<int>(shape.size());
     int64_t total = 1;
     for (int64_t d : shape) total *= d;
     bufs.resize(total);
     int32_t* h_lbl = bufs.lbl();
     int32_t* h_dist = bufs.dist();
-    int32_t* t_lbl = bufs.lbl_T();
-    int32_t* t_dist = bufs.dist_T();
 
     if (input != h_lbl) {
         std::memcpy(h_lbl, input, total * sizeof(int32_t));
+    }
+    if (total == 0) return;
+    if (l2_needs_wide_distance(shape)) {
+        bufs.use_wide_distance();
+        for (int ax = ndim - 1; ax >= 0; --ax)
+            l2_sweep_axis_wide(h_lbl, bufs.dist64(), shape, ax, pool, n_threads, wrap);
+        return;
     }
     // dist init unnecessary — pass0 overwrites every entry. (For wrap mode
     // we initialise dist explicitly below since the first axis routes to
@@ -784,6 +901,7 @@ inline void expand_labels_inplace(
             }
             continue;
         }
+        if (n == 1) continue;
         int64_t A = 1;
         for (int d = 0; d < ax; ++d) A *= shape[d];
         int64_t C = 1;
@@ -807,9 +925,12 @@ inline void expand_labels_inplace(
             envelope_pass_strided_abc(h_lbl, h_dist, A, B, C,
                                       pool, n_threads, bufs.scratch(), wrap);
         } else {
+            int32_t* t_lbl = bufs.lbl_T();
+            int32_t* t_dist = bufs.dist_T();
             batch_transpose<int32_t>(h_lbl, h_dist, t_lbl, t_dist, A, B, C, pool, n_threads);
             envelope_pass(t_lbl, t_dist, A * C, B, pool, n_threads, bufs.scratch(), wrap);
-            batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads);
+            batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads,
+                                      keep_distances || ax != 0);
         }
     }
 }

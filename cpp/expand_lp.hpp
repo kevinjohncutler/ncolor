@@ -49,14 +49,15 @@ struct LpExpand<2> {
     static void expand(const int32_t* input, int32_t* output,
                        ExpandBuffers& bufs,
                        const std::vector<int64_t>& shape,
-                       ForkJoinPool& pool, int n_threads, bool wrap = false) {
+                       ForkJoinPool& pool, int n_threads, bool wrap = false,
+                       bool keep_distances = true) {
         // wrap=true routes the inner envelope sweeps through their
         // ghost-seed (toroidal) variants — see envelope_pass_row_impl
         // <Wrap=true> in expand.hpp. The innermost-axis pass0 fast path
         // is skipped in wrap mode (its midpoint trick doesn't generalize
         // cleanly to torus tie-break); expand_labels_inplace falls back
         // to envelope_pass(wrap=true) there. ~2-3× the standard cost.
-        expand_labels_inplace(input, bufs, shape, pool, n_threads, wrap);
+        expand_labels_inplace(input, bufs, shape, pool, n_threads, wrap, keep_distances);
         if (output != bufs.lbl()) {
             std::memcpy(output, bufs.lbl(), bufs.size() * sizeof(int32_t));
         }
@@ -73,10 +74,12 @@ struct LpExpand<1> {
     static void expand(const int32_t* input, int32_t* output,
                        ExpandBuffers& bufs,
                        const std::vector<int64_t>& shape,
-                       ForkJoinPool& pool, int n_threads, bool wrap = false) {
+                       ForkJoinPool& pool, int n_threads, bool wrap = false,
+                       bool /*keep_distances*/ = true) {
         int64_t total = 1;
         for (int64_t d : shape) total *= d;
-        bufs.resize(total);  // for the dist scratch
+        bufs.resize(total, false);  // Labels already live in the caller output.
+        if (total == 0) return;
         if (input != output) {
             std::memcpy(output, input, total * sizeof(int32_t));
         }
@@ -90,8 +93,9 @@ template <int P>
 inline void expand_labels_lp(const int32_t* input, int32_t* output,
                              ExpandBuffers& bufs,
                              const std::vector<int64_t>& shape,
-                             ForkJoinPool& pool, int n_threads, bool wrap = false) {
-    LpExpand<P>::expand(input, output, bufs, shape, pool, n_threads, wrap);
+                             ForkJoinPool& pool, int n_threads, bool wrap = false,
+                       bool keep_distances = true) {
+    LpExpand<P>::expand(input, output, bufs, shape, pool, n_threads, wrap, keep_distances);
 }
 
 }  // namespace ncolor_cpp

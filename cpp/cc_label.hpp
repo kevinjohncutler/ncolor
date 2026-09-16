@@ -4,8 +4,8 @@
  * Two-pass union-find (Wu et al. 2009-style) over an N-D foreground mask.
  * Backward-neighbor set is computed via the same odometer machinery as
  * connect.hpp, so connectivity (conn ∈ [1, ndim]) generalizes cleanly to
- * any ndim. Single-threaded for the prototype; parallelization via
- * strip-merge is straightforward if benchmarks demand it.
+ * any ndim. Serial scans are also used within parallel slabs; cross-slab
+ * boundary unions preserve the serial component numbering.
  *
  * Public entry points:
  *   - ncolor_cpp::cc_label_nd<T>(...) → int32_t (n_components)
@@ -130,6 +130,12 @@ inline int32_t cc_label_nd(const T* input, int32_t* output,
                            CCStageTimes* times = nullptr) {
     const int ndim = static_cast<int>(shape.size());
     validate_neighborhood_ndim(ndim);
+    if (shape.size() > 1 && std::find(shape.begin(), shape.end(), 1) != shape.end()) {
+        std::vector<int64_t> active;
+        for (int64_t n : shape) if (n != 1) active.push_back(n);
+        if (active.empty()) active.push_back(1);
+        return cc_label_nd(input, output, active, conn, times);
+    }
     if (conn < 1) conn = 1;
     if (conn > ndim) conn = ndim;
     int64_t total = 1;
@@ -324,6 +330,12 @@ inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
                                       std::vector<T>& source_labels_out) {
     const int ndim = static_cast<int>(shape.size());
     validate_neighborhood_ndim(ndim);
+    if (shape.size() > 1 && std::find(shape.begin(), shape.end(), 1) != shape.end()) {
+        std::vector<int64_t> active;
+        for (int64_t n : shape) if (n != 1) active.push_back(n);
+        if (active.empty()) active.push_back(1);
+        return cc_label_per_label_nd(input, output, active, conn, source_labels_out);
+    }
     if (conn < 1) conn = 1;
     if (conn > ndim) conn = ndim;
     int64_t total = 1;
@@ -446,6 +458,144 @@ inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
     return next_label;
 }
 
+
+// Label contiguous slabs independently, merge only their shared boundaries,
+// then remap local component IDs in parallel. Slab-local IDs follow raster
+// order, so increasing (slab, local ID) gives the same final numbering as
+// the serial scan regardless of worker scheduling.
+template <typename T, bool PerLabel = false>
+inline int32_t cc_label_parallel_nd(
+        const T* input, int32_t* output, const std::vector<int64_t>& input_shape,
+        int conn, ForkJoinPool& pool, int n_threads,
+        std::vector<T>* sources = nullptr) {
+    if constexpr (PerLabel) {
+        if (!sources) throw std::invalid_argument("per-label components require a source table");
+    }
+    validate_neighborhood_ndim(static_cast<int>(input_shape.size()));
+    std::vector<int64_t> shape;
+    int64_t total = 1;
+    for (int64_t extent : input_shape) {
+        total *= extent;
+        if (extent != 1) shape.push_back(extent);
+    }
+    if (shape.empty()) shape.push_back(1);
+    conn = std::max(1, std::min(conn, static_cast<int>(shape.size())));
+    auto serial = [&](const T* src, int32_t* dst,
+                      const std::vector<int64_t>& dims, std::vector<T>& values) {
+        if constexpr (PerLabel) return cc_label_per_label_nd(src, dst, dims, conn, values);
+        else return cc_label_nd(src, dst, dims, conn);
+    };
+    const int slabs = static_cast<int>(std::min<int64_t>(
+        std::min<int64_t>(std::max(1, n_threads), shape[0]), total / 131072));
+    if (total < 262144 || shape.size() < 2 || slabs < 2) {
+        std::vector<T> unused;
+        return serial(input, output, shape, sources ? *sources : unused);
+    }
+    const int64_t plane = total / shape[0];
+    std::vector<int64_t> starts(slabs + 1);
+    std::vector<int32_t> counts(slabs), bases(slabs + 1, 0);
+    std::vector<std::vector<T>> local_sources(slabs);
+    for (int s = 0; s <= slabs; ++s) starts[s] = shape[0] * s / slabs;
+    dispatch_parallel(pool, slabs, slabs, [&](size_t lo, size_t hi) {
+        for (size_t s = lo; s < hi; ++s) {
+            auto dims = shape;
+            dims[0] = starts[s + 1] - starts[s];
+            counts[s] = serial(input + starts[s] * plane,
+                output + starts[s] * plane, dims, local_sources[s]);
+        }
+    });
+    int64_t provisional = 0;
+    for (int s = 0; s < slabs; ++s) {
+        provisional += counts[s];
+        if (provisional >= std::numeric_limits<int32_t>::max())
+            throw std::overflow_error("component count exceeds int32 capacity");
+        bases[s + 1] = static_cast<int32_t>(provisional);
+    }
+    cc_detail::UnionFind uf;
+
+    std::vector<int64_t> strides, flat;
+    std::vector<int8_t> offsets;
+    detail::build_forward_neighbors(shape, conn, strides, flat, offsets);
+    std::vector<int> crossing;
+    const int ndim = static_cast<int>(shape.size());
+    for (size_t k = 0; k < flat.size(); ++k)
+        if (offsets[k * ndim] == 1) crossing.push_back(static_cast<int>(k));
+    std::vector<int64_t> point(ndim, 0);
+    for (int s = 1; s < slabs; ++s) {
+        std::fill(point.begin(), point.end(), 0);
+        const int64_t first = starts[s] * plane - plane;
+        for (int64_t i = 0; i < plane; ++i) {
+            const int64_t at = first + i;
+            const int32_t a = output[at];
+            if (a) for (int k : crossing) {
+                bool valid = true;
+                for (int d = 1; d < ndim; ++d) {
+                    const int64_t q = point[d] + offsets[k * ndim + d];
+                    if (q < 0 || q >= shape[d]) { valid = false; break; }
+                }
+                if (!valid) continue;
+                const int64_t neighbor = at + flat[k];
+                const int32_t b = output[neighbor];
+                if (!b) continue;
+                if constexpr (PerLabel) if (input[at] != input[neighbor]) continue;
+                if (uf.parent.empty()) {
+                    uf.parent.resize(static_cast<size_t>(provisional) + 1);
+                    uf.rank_.assign(uf.parent.size(), 0);
+                    for (size_t id = 0; id < uf.parent.size(); ++id)
+                        uf.parent[id] = static_cast<int32_t>(id);
+                }
+                uf.unite(bases[s - 1] + a, bases[s] + b);
+            }
+            for (int d = ndim - 1; d > 0; --d) {
+                if (++point[d] < shape[d]) break;
+                point[d] = 0;
+            }
+        }
+    }
+    // Disconnected slabs need only an ID offset. Avoid a global union-find
+    // for fragmented masks whose components never cross a slab boundary.
+    if (uf.parent.empty()) {
+        if constexpr (PerLabel) {
+            sources->clear();
+            for (const auto& local : local_sources)
+                sources->insert(sources->end(), local.begin(), local.end());
+        }
+        dispatch_parallel(pool, slabs, slabs, [&](size_t lo, size_t hi) {
+            for (size_t s = lo; s < hi; ++s)
+                for (int64_t i = starts[s] * plane; i < starts[s + 1] * plane; ++i)
+                    if (output[i]) output[i] += bases[s];
+        });
+        return static_cast<int32_t>(provisional);
+    }
+    // Reuse union-find storage for the root-to-final and local-to-final
+    // tables. No extra full component-sized remapping arrays are needed.
+    for (size_t i = 1; i < uf.parent.size(); ++i)
+        uf.parent[i] = uf.find(static_cast<int32_t>(i));
+    std::fill(uf.rank_.begin(), uf.rank_.end(), 0);
+    auto& root_ids = uf.rank_;
+    auto& remap = uf.parent;
+    int32_t count = 0;
+    if constexpr (PerLabel) sources->clear();
+    for (int s = 0; s < slabs; ++s) {
+        for (int32_t local = 1; local <= counts[s]; ++local) {
+            const int32_t id = bases[s] + local;
+            const int32_t root = remap[id];
+            if (!root_ids[root]) {
+                root_ids[root] = ++count;
+                if constexpr (PerLabel) sources->push_back(local_sources[s][local - 1]);
+            }
+            remap[id] = root_ids[root];
+        }
+    }
+    dispatch_parallel(pool, slabs, slabs, [&](size_t lo, size_t hi) {
+        for (size_t s = lo; s < hi; ++s) {
+            const int32_t* table = remap.data() + bases[s];
+            for (int64_t i = starts[s] * plane; i < starts[s + 1] * plane; ++i)
+                if (output[i]) output[i] = table[output[i]];
+        }
+    });
+    return count;
+}
 
 // Region properties for a labeled image (output of cc_label_nd or any
 // dense 1..N labeling). Fills the four output arrays:

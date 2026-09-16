@@ -89,4 +89,19 @@ The rewrite also brings drop-in C++ replacements for the scikit-image and `scipy
 | `ncolor.delete_spurs` | hand-rolled morphology / not in scikit-image | ND, parallel |
 
 
+Connected components is a separate utility and is also used by
+`format_labels(clean=True)` to split disconnected pieces of a label.
+Ordinary `label()` calls do not run it: their `expand_mode="clean"` uses
+bridge and spur cleanup within label expansion. Large component jobs now
+use parallel slabs and boundary merging; small arrays stay serial.
+`Engine(n_threads=4).connected_components(mask)` selects an explicit worker
+budget. Component IDs retain the serial scan order.
+
+The latest measured optimizations preserve label propagation while avoiding
+an unnecessary final distance transpose and an intermediate input copy.
+Distance-returning and distance-weighted calls retain the distances they
+need. See [PERFORMANCE_EXPLORATION.md](PERFORMANCE_EXPLORATION.md) for direct
+before/after comparisons, memory costs, and experiments that were not kept.
+
+
 For C++ engine internals, file-by-file architecture, and threadpool design, see [ARCHITECTURE.md](ARCHITECTURE.md).

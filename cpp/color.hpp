@@ -11,11 +11,26 @@
 #ifndef NCOLOR_COLOR_HPP
 #define NCOLOR_COLOR_HPP
 
+#include <algorithm>
+#include <bitset>
+#include <stdexcept>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
 namespace ncolor_cpp {
+
+inline void validate_color_count(int n_colors) {
+    if (n_colors < 1 || n_colors > 255)
+        throw std::invalid_argument("n_colors must be between 1 and 255");
+}
+
+inline void validate_coloring_budget(int n_colors, int max_depth) {
+    validate_color_count(n_colors);
+    if (max_depth < 1)
+        throw std::invalid_argument("max_depth must be >= 1");
+}
+
 
 // Build symmetric CSR from M directed pairs (src[i], dst[i]). Output:
 // indptr[N+1] and indices[2*M]. Neighbors within each row are unordered.
@@ -71,7 +86,8 @@ inline void build_csr_from_pairs_weighted(
     }
 }
 
-// BFS-based legacy coloring. Returns true if all nodes were assigned a
+// Active queue-based coloring kernel used by serial and parallel attempts.
+// The historical "legacy" name is retained. Returns true if nodes got a
 // non-zero color before max_iter; false if the queue still had pending
 // nodes (caller should retry with bigger n or repair).
 //
@@ -96,6 +112,7 @@ inline bool color_graph_csr_legacy(
         const double* weights = nullptr,
         const double* de_table = nullptr,
         int weight_obj = 0) {
+    validate_color_count(n_colors);
     const bool use_weighted = welsh_powell && weights != nullptr &&
                               de_table != nullptr && weight_obj != 0;
     const int32_t de_stride = n_colors + 1;
@@ -209,7 +226,8 @@ inline bool color_graph_csr_legacy(
         }
     }
 
-    const uint32_t fullmask = (1u << (n_colors + 1)) - 2;
+    std::bitset<256> fullmask;
+    for (int c = 1; c <= n_colors; ++c) fullmask.set(c);
     int64_t count = 0;
     while (head < tail && count < max_iter) {
         const int32_t u = q[head++];
@@ -218,12 +236,12 @@ inline bool color_graph_csr_legacy(
 
         const int32_t row_beg = indptr[u];
         const int32_t row_end = indptr[u + 1];
-        uint32_t mask = 0;
+        std::bitset<256> mask;
         bool all_present = false;
         for (int32_t k = row_beg; k < row_end; ++k) {
             const uint8_t cv = colors[indices[k]];
             if (cv != 0) {
-                mask |= (1u << cv);
+                mask.set(cv);
                 if (mask == fullmask) { all_present = true; break; }
             }
         }
@@ -252,7 +270,7 @@ inline bool color_graph_csr_legacy(
                     ? balance_coeff * w_local : 0.0;
                 double best_score = (weight_obj > 0) ? -1e30 : 1e30;
                 for (int32_t c = 1; c <= n_colors; ++c) {
-                    if ((mask & (1u << c)) != 0) continue;
+                    if (mask.test(c)) continue;
                     double score = 0.0;
                     for (int32_t k = row_beg; k < row_end; ++k) {
                         const uint8_t cv = colors[indices[k]];
@@ -281,7 +299,7 @@ inline bool color_graph_csr_legacy(
                 // a near-uniform 4-color distribution.
                 int32_t best = 2147483647;
                 for (int32_t c = 1; c <= n_colors; ++c) {
-                    if ((mask & (1u << c)) != 0) continue;
+                    if (mask.test(c)) continue;
                     if (color_counts[c] < best) {
                         best = color_counts[c];
                         csel = static_cast<uint8_t>(c);
@@ -290,16 +308,16 @@ inline bool color_graph_csr_legacy(
             } else {
                 // Lowest-numbered valid color (bit-identical with numba).
                 for (int32_t c = 1; c <= n_colors; ++c) {
-                    if ((mask & (1u << c)) == 0) { csel = static_cast<uint8_t>(c); break; }
+                    if (!mask.test(c)) { csel = static_cast<uint8_t>(c); break; }
                 }
             }
             counter[u] = 0;
         } else {
             // Tally colors among neighbors, pick least-used (excluding u's current).
-            int32_t cnt[32] = {0};  // max 31 colors — comfortably above any usage
+            int32_t cnt[256] = {};  // One counter per representable color.
             for (int32_t k = row_beg; k < row_end; ++k) {
                 const uint8_t cv = colors[indices[k]];
-                if (cv != 0 && cv < 32) cnt[cv] += 1;
+                if (cv != 0) cnt[cv] += 1;
             }
             int32_t minv = cnt[1];
             csel = 1;
@@ -369,6 +387,7 @@ inline bool repair_coloring(
         const int32_t* indptr, const int32_t* indices, int32_t N,
         int32_t n_colors, int max_passes,
         std::vector<uint8_t>& colors) {
+    validate_color_count(n_colors);
     int passes = 0;
     bool changed = true;
     while (changed && passes < max_passes) {
@@ -376,17 +395,17 @@ inline bool repair_coloring(
         ++passes;
         for (int32_t u = 0; u < N; ++u) {
             const uint8_t cu = colors[u];
-            uint32_t mask = 0;
+            std::bitset<256> mask;
             const int32_t row_beg = indptr[u];
             const int32_t row_end = indptr[u + 1];
             for (int32_t k = row_beg; k < row_end; ++k) {
                 const uint8_t cv = colors[indices[k]];
-                if (cv != 0) mask |= (1u << cv);
+                if (cv != 0) mask.set(cv);
             }
-            if (cu == 0 || (mask & (1u << cu)) != 0) {
+            if (cu == 0 || mask.test(cu)) {
                 uint8_t csel = 0;
                 for (int32_t c = 1; c <= n_colors; ++c) {
-                    if ((mask & (1u << c)) == 0) { csel = static_cast<uint8_t>(c); break; }
+                    if (!mask.test(c)) { csel = static_cast<uint8_t>(c); break; }
                 }
                 if (csel != 0 && csel != cu) {
                     colors[u] = csel;

@@ -34,6 +34,8 @@ Rewritten by William Silversmith and Kevin Cutler, 2025-2026.
 #include <cstdlib>
 #include <system_error>
 #include <functional>
+#include <exception>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -188,10 +190,20 @@ public:
             fn();
             return;
         }
-        work_fn_ = std::forward<F>(fn);
+        work_error_ = nullptr;
+        work_fn_ = [this, &fn]() {
+            try {
+                fn();
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex_);
+                if (!work_error_) work_error_ = std::current_exception();
+            }
+        };
         barrier_wait_();   // release workers (they're waiting at start barrier)
         work_fn_();        // main thread participates
-        barrier_wait_();   // wait for all workers to finish
+        barrier_wait_();   // every participant finishes, including after exceptions
+        work_fn_ = {};
+        if (work_error_) std::rethrow_exception(work_error_);
     }
 
     ~ForkJoinPool() {
@@ -295,6 +307,8 @@ private:
 
     // Current work function (set by parallel(), read by workers)
     std::function<void()> work_fn_;
+    std::exception_ptr work_error_;
+    std::mutex error_mutex_;
 
     std::vector<std::thread> workers_;
 };

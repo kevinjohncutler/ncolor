@@ -127,6 +127,17 @@ inline void chamfer_st_l1_nd(int32_t* lbl, int32_t* dist,
                              const std::vector<int64_t>& shape,
                              ForkJoinPool& pool, int n_threads,
                              bool wrap = false) {
+    if (shape.empty()) {
+        chamfer_st_l1_nd(lbl, dist, {1}, pool, n_threads, wrap);
+        return;
+    }
+    if (shape.size() > 1 && std::find(shape.begin(), shape.end(), 1) != shape.end()) {
+        std::vector<int64_t> active;
+        for (int64_t n : shape) if (n != 1) active.push_back(n);
+        if (active.empty()) active.push_back(1);
+        chamfer_st_l1_nd(lbl, dist, active, pool, n_threads, wrap);
+        return;
+    }
     const int ndim = static_cast<int>(shape.size());
     if (ndim == 0) return;
 

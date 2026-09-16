@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <chrono>
 
+#include "timing.hpp"
+
 namespace ncolor_cpp {
 
 // Returns true iff the function found a k-coloring with zero
@@ -110,8 +112,7 @@ inline bool tabucol(
             return false;
         }
         if (deadline_ns > 0 && (it & 0x1f) == 0) {
-            const auto now = std::chrono::steady_clock::now()
-                              .time_since_epoch().count();
+            const auto now = steady_time_ns();
             if (now > deadline_ns) {
                 if (dbg_traj) std::fprintf(stderr,
                     "[tabu seed=%llu] DEADLINE it=%d final=%d best=%d\n",

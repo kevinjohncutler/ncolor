@@ -1,18 +1,18 @@
 // Fast despur via pre-computed face-count.
 //
 // The classic ``delete_spurs_labels`` does its iter-0 work as a full-
-// image scan that, for each pixel, counts same-label face-neighbours
+// image scan that, for each pixel, counts same-label face-neighbors
 // and marks spurs. On a 2000×2000 MM image that scan alone costs
 // ~4 ms — the dominant term of the whole despur (subsequent iters
 // are queue-based and cheap).
 //
 // This file separates that scan from the despur logic:
 //   1. ``compute_face_count_nd``: tight, parallel, branchless full-image
-//      scan that writes the per-pixel same-label face-neighbour count
+//      scan that writes the per-pixel same-label face-neighbor count
 //      into a uint8 array. Targets ~1 ms on MM.
 //   2. ``despur_via_face_count_nd``: drives spur removal from a pre-
 //      computed face_count array. Initial spurs (count ≤ threshold) are
-//      reverted; the queue-based peel-back decrements neighbours' counts
+//      reverted; the queue-based peel-back decrements neighbors' counts
 //      and re-checks until quiescent. No full-image rescans.
 //
 // The face_count array is also useful downstream (it tells us which
@@ -31,11 +31,11 @@
 namespace ncolor_cpp {
 
 // Branchless face-count for an ND label image. ``count[i]`` is set to
-// the number of same-label face-neighbours pixel i has (0 if labels[i]
+// the number of same-label face-neighbors pixel i has (0 if labels[i]
 // is bg). Each axis is checked in order; same-label face-pairs simply
 // produce coincident increments on each pixel.
 //
-// 2D fast path: hand-written; ND fallback uses strides.
+// Flat block dispatch is independent of the leading axis.
 template <typename T>
 inline void compute_face_count_nd(
     const T* labels, uint8_t* count,
@@ -58,7 +58,7 @@ inline void compute_face_count_nd(
 
     auto kernel_nd = [&](int64_t i_lo, int64_t i_hi) {
         // Compute coords incrementally.
-        int64_t c[8] = {0};
+        std::vector<int64_t> c(ndim, 0);
         int64_t rem = i_lo;
         for (int d = 0; d < ndim; ++d) {
             c[d] = rem / strides[d];
@@ -84,16 +84,15 @@ inline void compute_face_count_nd(
     };
 
     if (nt > 1 && total >= 1024) {
-        const int64_t outer = shape[0];
-        const int64_t slab_size = strides[0];
+        const int64_t outer = total;
         std::atomic<int64_t> next_slab{0};
-        const int64_t chunk_slabs = std::max<int64_t>(1, outer / (nt * 4));
+        const int64_t chunk_slabs = std::max<int64_t>(4096, outer / (nt * 4));
         pool->parallel([&]() {
             while (true) {
                 int64_t s_lo = next_slab.fetch_add(chunk_slabs);
                 if (s_lo >= outer) break;
                 int64_t s_hi = std::min(outer, s_lo + chunk_slabs);
-                kernel_nd(s_lo * slab_size, s_hi * slab_size);
+                kernel_nd(s_lo, s_hi);
             }
         });
     } else {
@@ -103,13 +102,14 @@ inline void compute_face_count_nd(
 
 
 // Despur via a pre-computed face_count array. Returns the number of
-// pixels removed (zeroed in labels).
+// pixels removed (zeroed in labels). max_iters caps synchronous removal
+// rounds; zero is a no-op, and a negative value runs to convergence.
 //
 //   • Initial pass: any pixel with face_count[i] ≤ threshold AND
 //     labels[i] != 0 is a spur — revert (set to 0) and enqueue.
-//   • Queue peel-back: for each reverted pixel, walk its face-neighbours.
-//     If a neighbour's label matches what we just reverted, decrement
-//     its face_count. If the neighbour's face_count now ≤ threshold,
+//   • Queue peel-back: for each reverted pixel, walk its face-neighbors.
+//     If a neighbor's label matches what we just reverted, decrement
+//     its face_count. If the neighbor's face_count now ≤ threshold,
 //     it becomes a new spur — enqueue it.
 //   • No full-image rescans.
 template <typename T>
@@ -117,31 +117,30 @@ inline int64_t despur_via_face_count_nd(
     T* labels, uint8_t* face_count,
     const std::vector<int64_t>& shape,
     int threshold = 1,
-    ForkJoinPool* pool = nullptr, int n_threads = 1)
+    ForkJoinPool* pool = nullptr, int n_threads = 1, int max_iters = -1)
 {
     const int ndim = (int)shape.size();
     if (ndim == 0) return 0;
     int64_t total = 1;
     for (auto s : shape) total *= s;
-    if (total == 0) return 0;
+    if (total == 0 || max_iters == 0) return 0;
 
     const int nt = (pool && n_threads > 1) ? n_threads : 1;
-    const int8_t th = (int8_t)threshold;
+    const int th = threshold;
 
     // Build initial spur queue. Each entry stores (flat_idx, label_at_time_of_revert)
-    // so that during peel-back we can check whether a neighbour's
+    // so that during peel-back we can check whether a neighbor's
     // face_count was contributed-to by THIS particular reverted pixel
     // (and decrement only then). Without the stored label we'd decrement
-    // any labelled neighbour and over-revert by ~10× on real data.
+    // any labeled neighbor and over-revert by ~10× on real data.
     using QEnt = std::pair<int64_t, T>;
     std::vector<QEnt> queue;
     if (nt > 1 && total >= 1024) {
-        const int64_t outer = shape[0];
-        const int64_t slab_size = total / outer;
+        const int64_t outer = total;
         std::vector<std::vector<QEnt>> per_thread(nt);
         std::atomic<int> tid_counter{0};
         std::atomic<int64_t> next_slab{0};
-        const int64_t chunk_slabs = std::max<int64_t>(1, outer / (nt * 4));
+        const int64_t chunk_slabs = std::max<int64_t>(4096, outer / (nt * 4));
         pool->parallel([&]() {
             int my_tid = tid_counter.fetch_add(1);
             if (my_tid >= nt) return;
@@ -150,11 +149,11 @@ inline int64_t despur_via_face_count_nd(
                 int64_t s_lo = next_slab.fetch_add(chunk_slabs);
                 if (s_lo >= outer) break;
                 int64_t s_hi = std::min(outer, s_lo + chunk_slabs);
-                int64_t i_lo = s_lo * slab_size;
-                int64_t i_hi = s_hi * slab_size;
+                int64_t i_lo = s_lo;
+                int64_t i_hi = s_hi;
                 for (int64_t i = i_lo; i < i_hi; ++i) {
                     const T lab = labels[i];
-                    if (lab != 0 && (int8_t)face_count[i] <= th) {
+                    if (lab != 0 && face_count[i] <= th) {
                         local.emplace_back(i, lab);
                     }
                 }
@@ -167,7 +166,7 @@ inline int64_t despur_via_face_count_nd(
     } else {
         for (int64_t i = 0; i < total; ++i) {
             const T lab = labels[i];
-            if (lab != 0 && (int8_t)face_count[i] <= th) queue.emplace_back(i, lab);
+            if (lab != 0 && face_count[i] <= th) queue.emplace_back(i, lab);
         }
     }
 
@@ -188,14 +187,17 @@ inline int64_t despur_via_face_count_nd(
     }
 
     // Queue peel-back. For each reverted pixel i (with stored label
-    // ``old_lab``), decrement face_count only on those face-neighbours
+    // ``old_lab``), decrement face_count only on those face-neighbors
     // j whose current label equals old_lab — i.e. only those that
     // actually had a same-label contribution from us. This is what
     // keeps the decrements correct.
     size_t head = 0;
     {
         std::vector<int64_t> c(ndim, 0);
+        int round = 1;
+        size_t layer_end = queue.size();
         while (head < queue.size()) {
+            if (head == layer_end) { ++round; layer_end = queue.size(); }
             const int64_t i = queue[head].first;
             const T old_lab  = queue[head].second;
             ++head;
@@ -210,7 +212,7 @@ inline int64_t despur_via_face_count_nd(
                     if (labels[j] == old_lab) {
                         uint8_t fc = face_count[j];
                         if (fc > 0) { fc = (uint8_t)(fc - 1); face_count[j] = fc; }
-                        if ((int8_t)fc <= th) {
+                        if (fc <= th && (max_iters < 0 || round < max_iters)) {
                             labels[j] = 0; ++removed; queue.emplace_back(j, old_lab);
                         }
                     }
@@ -220,7 +222,7 @@ inline int64_t despur_via_face_count_nd(
                     if (labels[j] == old_lab) {
                         uint8_t fc = face_count[j];
                         if (fc > 0) { fc = (uint8_t)(fc - 1); face_count[j] = fc; }
-                        if ((int8_t)fc <= th) {
+                        if (fc <= th && (max_iters < 0 || round < max_iters)) {
                             labels[j] = 0; ++removed; queue.emplace_back(j, old_lab);
                         }
                     }

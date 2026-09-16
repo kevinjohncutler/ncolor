@@ -41,14 +41,15 @@ inline void dispatch_parallel(ForkJoinPool& pool, size_t total,
         work(size_t{0}, total);
         return;
     }
-    const size_t n_chunks = std::min(max_chunks, total);
-    const size_t chunk_sz = (total + n_chunks - 1) / n_chunks;
+    const size_t requested = std::min(max_chunks, total);
+    const size_t chunk_sz = 1 + (total - 1) / requested;
+    const size_t n_chunks = 1 + (total - 1) / chunk_sz;
     std::atomic<size_t> next{0};
     pool.parallel([&]() {
         size_t idx;
         while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
             const size_t begin = idx * chunk_sz;
-            const size_t end = std::min(total, begin + chunk_sz);
+            const size_t end = begin + std::min(total - begin, chunk_sz);
             work(begin, end);
         }
     });
@@ -67,12 +68,13 @@ inline void dispatch_parallel_with_scratch(
         ForkJoinPool& pool, int n_threads,
         size_t n_items, size_t max_chunks,
         std::vector<ScratchT>& scratch_pool, Work work) {
-    if (n_threads <= 1 || n_items < 2) {
+    if (n_threads <= 1 || n_items < 2 || max_chunks == 0) {
         work(scratch_pool[0], size_t{0}, n_items);
         return;
     }
-    const size_t n_chunks = std::min<size_t>(n_items, max_chunks);
-    const size_t chunk_sz = (n_items + n_chunks - 1) / n_chunks;
+    const size_t requested = std::min(n_items, max_chunks);
+    const size_t chunk_sz = 1 + (n_items - 1) / requested;
+    const size_t n_chunks = 1 + (n_items - 1) / chunk_sz;
     std::atomic<int> tid_next{0};
     std::atomic<size_t> chunk_next{0};
     pool.parallel([&]() {
@@ -82,7 +84,7 @@ inline void dispatch_parallel_with_scratch(
         size_t idx;
         while ((idx = chunk_next.fetch_add(1, std::memory_order_relaxed)) < n_chunks) {
             const size_t begin = idx * chunk_sz;
-            const size_t end = std::min(n_items, begin + chunk_sz);
+            const size_t end = begin + std::min(n_items - begin, chunk_sz);
             work(sc, begin, end);
         }
     });

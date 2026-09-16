@@ -66,15 +66,20 @@ namespace py = pybind11;
 // but ``py::object`` constructors break import on macOS arm64 with
 // pybind11 3.0.4, so we use double here and let users pass -1 for auto.
 static int resolve_threads(double v) {
+    if (!std::isfinite(v))
+        throw std::invalid_argument("n_threads must be finite");
     if (v <= 0.0) {
         return py::module_::import("ncolor._backend._smt").attr("auto_threads")().cast<int>();
     }
     if (v < 1.0) {
-        const long ncpu = py::module_::import("os").attr("cpu_count")().cast<long>();
-        const long n = static_cast<long>(v * static_cast<double>(ncpu) + 0.5);
-        return static_cast<int>(std::max<long>(1, n));
+        py::object count = py::module_::import("os").attr("cpu_count")();
+        const long ncpu = count.is_none() ? 1 : std::max<long>(1, count.cast<long>());
+        v *= static_cast<double>(ncpu);
     }
-    return static_cast<int>(std::max<long>(1, static_cast<long>(v + 0.5)));
+    const double rounded = std::max(1.0, std::round(v));
+    if (rounded > std::numeric_limits<int>::max())
+        throw std::overflow_error("n_threads exceeds integer capacity");
+    return static_cast<int>(rounded);
 }
 
 // Dispatch on a numpy buffer's dtype, calling `f<T>()` with the matched
@@ -155,6 +160,87 @@ static inline void dispatch_cast_dtype(const std::string& fmt, py::ssize_t items
         "automatically.");
 }
 
+static py::array_t<int32_t> graph_int_array(py::object obj, const char* name) {
+    auto arr = py::array::ensure(obj, py::array::c_style);
+    if (!arr || arr.ndim() != 1)
+        throw std::invalid_argument(std::string(name) + " must be one-dimensional");
+    if (arr.size() > INT32_MAX)
+        throw std::overflow_error(std::string(name) + " exceeds int32 capacity");
+    if (arr.size() == 0) return py::array_t<int32_t>(0);
+    if (arr.dtype().is(py::dtype::of<int32_t>()))
+        return py::reinterpret_borrow<py::array_t<int32_t>>(arr);
+    auto buf = arr.request();
+    py::array_t<int32_t> result(arr.size());
+    int32_t* dst = result.mutable_data();
+    dispatch_int_dtype(buf.format, buf.itemsize, name, [&](auto* tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        const T* src = static_cast<const T*>(buf.ptr);
+        for (py::ssize_t i = 0; i < buf.size; ++i) {
+            bool fits;
+            if constexpr (std::is_signed_v<T>)
+                fits = static_cast<int64_t>(src[i]) >= INT32_MIN &&
+                       static_cast<int64_t>(src[i]) <= INT32_MAX;
+            else fits = static_cast<uint64_t>(src[i]) <= INT32_MAX;
+            if (!fits) throw std::overflow_error(std::string(name) + " exceeds int32 capacity");
+            dst[i] = static_cast<int32_t>(src[i]);
+        }
+    });
+    return result;
+}
+
+// Preserve shape while checking every conversion before narrowing.
+static py::array_t<int32_t> checked_labels(py::array labels, const char* name,
+                                          bool integer_only = false) {
+    auto arr = py::array::ensure(labels, py::array::c_style);
+    if (!arr) throw std::invalid_argument(std::string(name) + ": expected an array");
+    if (arr.dtype().is(py::dtype::of<int32_t>()))
+        return py::reinterpret_borrow<py::array_t<int32_t>>(arr);
+    auto buf = arr.request();
+    py::array_t<int32_t> out(buf.shape);
+    int32_t* dst = out.mutable_data();
+    dispatch_cast_dtype(buf.format, buf.itemsize, name, [&](auto* tag) {
+        using T = std::remove_pointer_t<decltype(tag)>;
+        const T* src = static_cast<const T*>(buf.ptr);
+        bool ok = true;
+        for (py::ssize_t i = 0; i < buf.size; ++i) {
+            if constexpr (std::is_floating_point_v<T>) {
+                if (integer_only && (!std::isfinite(src[i]) || std::trunc(src[i]) != src[i]))
+                    throw std::invalid_argument(std::string(name) + ": expected finite integer values");
+            }
+            dst[i] = ncolor_cpp::detail::checked_cast_int32<T>(src[i], ok);
+        }
+        if (!ok) throw_label_overflow(name);
+    });
+    return out;
+}
+
+static py::array_t<int32_t> checked_edges(py::object obj, const char* name) {
+    auto arr = py::array::ensure(obj, py::array::c_style);
+    if (!arr || arr.ndim() != 2 || arr.shape(1) != 2)
+        throw std::invalid_argument(std::string(name) + " must have shape (M, 2)");
+    if (arr.size() > INT32_MAX)
+        throw std::overflow_error(std::string(name) + " exceeds int32 capacity");
+    return checked_labels(arr, name, true);
+}
+
+static int32_t validate_csr(const py::buffer_info& ip, const py::buffer_info& ix,
+                            const char* name, int32_t expected_n = -1) {
+    auto fail = [&]() { throw std::invalid_argument(std::string(name) + " is not a valid CSR graph"); };
+    if (ip.ndim != 1 || ix.ndim != 1 || ip.size < 1) fail();
+    if (ip.size > INT32_MAX || ix.size > INT32_MAX)
+        throw std::overflow_error(std::string(name) + " exceeds int32 capacity");
+    const int32_t n = static_cast<int32_t>(ip.size - 1);
+    if (expected_n >= 0 && n != expected_n) fail();
+    const auto* p = static_cast<const int32_t*>(ip.ptr);
+    const auto* x = static_cast<const int32_t*>(ix.ptr);
+    if (p[0] != 0 || p[n] != ix.size) fail();
+    for (int32_t u = 0; u < n; ++u)
+        if (p[u] < 0 || p[u] > p[u + 1] || p[u + 1] > ix.size) fail();
+    for (py::ssize_t j = 0; j < ix.size; ++j)
+        if (x[j] < 0 || x[j] >= n) fail();
+    return n;
+}
+
 // Pack a vector of (lo, hi) adjacency pairs into a fresh (M, 2) int32 array.
 static inline py::array_t<int32_t> pairs_to_array(
         const std::vector<std::pair<int32_t, int32_t>>& pairs) {
@@ -196,11 +282,112 @@ static std::shared_ptr<PoolSlot> resolve_pool(int n_threads, int pool_group) {
     static std::mutex registry_mutex;
     static std::map<std::pair<int, int>, std::weak_ptr<PoolSlot>> registry;
     std::lock_guard<std::mutex> lk(registry_mutex);
-    auto& slot = registry[{n, pool_group}];
-    if (auto live = slot.lock()) return live;
+    const auto key = std::make_pair(n, pool_group);
+    auto found = registry.find(key);
+    if (found != registry.end()) {
+        if (auto live = found->second.lock()) return live;
+    }
+    // Creating and discarding engines must not retain expired registry nodes.
+    for (auto it = registry.begin(); it != registry.end();) {
+        if (it->second.expired()) it = registry.erase(it);
+        else ++it;
+    }
     auto fresh = std::make_shared<PoolSlot>(n);
-    slot = fresh;
+    registry[key] = fresh;
     return fresh;
+}
+
+// Shared component wrapper for standalone calls and engine-owned pools.
+template <bool PerLabel>
+static py::tuple component_arrays(py::array input, int conn,
+                                  std::shared_ptr<PoolSlot> slot = nullptr,
+                                  int n_threads = 1) {
+    if constexpr (PerLabel) input = checked_labels(input, "cc_label_per_label");
+    else input = py::array::ensure(input, py::array::c_style);
+    const auto buf = input.request();
+    const int ndim = static_cast<int>(buf.ndim);
+    if (ndim < 1) throw std::invalid_argument("cc_label: input must have at least one dimension");
+    if (conn < 1 || conn > ndim)
+        throw std::invalid_argument("cc_label: conn must be in [1, ndim]");
+    std::vector<int64_t> shape(buf.shape.begin(), buf.shape.end());
+    py::array_t<int32_t> output(buf.shape);
+    int32_t* dst = output.mutable_data();
+    std::vector<int32_t> sources;
+    int32_t count;
+    {
+        py::gil_scoped_release release;
+        std::unique_lock<std::mutex> lock;
+        if (slot) lock = std::unique_lock<std::mutex>(slot->mu);
+        if constexpr (PerLabel) {
+            const auto* src = static_cast<const int32_t*>(buf.ptr);
+            count = slot ? ncolor_cpp::cc_label_parallel_nd<int32_t, true>(
+                src, dst, shape, conn, slot->pool, n_threads, &sources)
+                : ncolor_cpp::cc_label_per_label_nd(src, dst, shape, conn, sources);
+        } else {
+            dispatch_cast_dtype(buf.format, buf.itemsize, "cc_label", [&](auto* tag) {
+                using T = std::remove_pointer_t<decltype(tag)>;
+                const auto* src = static_cast<const T*>(buf.ptr);
+                count = slot ? ncolor_cpp::cc_label_parallel_nd<T>(
+                    src, dst, shape, conn, slot->pool, n_threads)
+                    : ncolor_cpp::cc_label_nd(src, dst, shape, conn);
+            });
+        }
+    }
+    if constexpr (PerLabel) {
+        py::array_t<int32_t> values(static_cast<py::ssize_t>(sources.size()));
+        if (!sources.empty()) std::memcpy(values.mutable_data(), sources.data(), sources.size() * sizeof(int32_t));
+        return py::make_tuple(output, count, values);
+    } else return py::make_tuple(output, count);
+}
+
+static std::pair<py::array, int64_t> delete_spurs_labels_array(
+        py::array labels_in, int threshold, int max_iters, int n_threads,
+        bool remove_thin, std::shared_ptr<PoolSlot> slot = nullptr) {
+    if (!(labels_in.flags() & py::array::c_style)) {
+        labels_in = py::array::ensure(labels_in, py::array::c_style);
+    }
+    const auto buf = labels_in.request();
+    const int ndim = static_cast<int>(buf.ndim);
+    if (ndim < 1) throw std::invalid_argument(
+        "delete_spurs_labels requires ndim >= 1");
+    std::vector<int64_t> shape(ndim);
+    std::vector<py::ssize_t> out_shape(ndim);
+    for (int d = 0; d < ndim; ++d) {
+        shape[d]     = static_cast<int64_t>(buf.shape[d]);
+        out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
+    }
+    py::array out(labels_in.dtype(), out_shape);
+    std::memcpy(out.request().ptr, buf.ptr,
+                (size_t)buf.size * (size_t)buf.itemsize);
+    int64_t n_removed = 0;
+    const int nt = buf.size >= 8192 && max_iters != 0
+        ? std::max(1, n_threads) : 1;
+    if (nt > 1 && !slot) {
+        // Retain only the last requested pool per calling thread.
+        // Group zero also shares with default engines when present.
+        static thread_local std::shared_ptr<PoolSlot> cached;
+        static thread_local int cached_threads = 0;
+        if (!cached || cached_threads != nt) {
+            cached = resolve_pool(nt, 0);
+            cached_threads = nt;
+        }
+        slot = cached;
+    }
+    void* out_ptr = out.mutable_data();
+    {
+        py::gil_scoped_release release;
+        std::unique_lock<std::mutex> lock;
+        if (nt > 1) lock = std::unique_lock<std::mutex>(slot->mu);
+        dispatch_int_dtype(buf.format, buf.itemsize, "delete_spurs_labels",
+            [&](auto* tag) {
+                using T = std::remove_pointer_t<decltype(tag)>;
+                n_removed = ncolor_cpp::delete_spurs_labels_nd_inplace<T>(
+                    static_cast<T*>(out_ptr),
+                    shape, threshold, max_iters,
+                    nt > 1 ? &slot->pool : nullptr, nt, remove_thin);
+            });
+    }
+    return std::make_pair(std::move(out), n_removed);
 }
 
 // Persistent-pool wrapper for expand_labels + parallel LUT apply.
@@ -212,9 +399,23 @@ public:
         : n_threads_(resolve_threads(n_threads)),
           pool_(resolve_pool(n_threads_, pool_group)) {}
 
+    std::pair<py::array, int64_t> delete_spurs_labels(
+            py::array labels, int threshold = 1, int max_iters = 20,
+            bool remove_thin = false) {
+        return delete_spurs_labels_array(labels, threshold, max_iters,
+                                         n_threads_, remove_thin, pool_);
+    }
+
     int n_threads() const { return n_threads_; }
 
     // Free the persistent scratch buffers (see ExpandBuffers::release).
+    py::tuple connected_components(py::array input, int conn) {
+        return component_arrays<false>(input, conn, pool_, n_threads_);
+    }
+    py::tuple components_per_label(py::array input, int conn) {
+        return component_arrays<true>(input, conn, pool_, n_threads_);
+    }
+
     void release() {
         py::gil_scoped_release gil;
         std::lock_guard<std::mutex> engine_lock(pool_->mu);
@@ -253,10 +454,12 @@ public:
         {
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> engine_lock(pool_->mu);
-            cast_into_(buf, src_ptr, out_ptr, total, "ExpandEngine.expand_labels");
             if (p == 2) {
-                ncolor_cpp::expand_labels_lp<2>(out_ptr, out_ptr, bufs_, shape, pool_->pool, n_threads_, wrap);
+                bufs_.resize(total);
+                cast_into_(buf, src_ptr, bufs_.lbl(), total, "ExpandEngine.expand_labels");
+                ncolor_cpp::expand_labels_lp<2>(bufs_.lbl(), out_ptr, bufs_, shape, pool_->pool, n_threads_, wrap, false);
             } else {
+                cast_into_(buf, src_ptr, out_ptr, total, "ExpandEngine.expand_labels");
                 ncolor_cpp::expand_labels_lp<1>(out_ptr, out_ptr, bufs_, shape, pool_->pool, n_threads_, wrap);
             }
         }
@@ -287,9 +490,10 @@ public:
         {
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> engine_lock(pool_->mu);
-            cast_into_(buf, src_ptr, out_ptr, total, "ExpandEngine.expand_labels_clean");
+            bufs_.resize(total);
+            cast_into_(buf, src_ptr, bufs_.lbl(), total, "ExpandEngine.expand_labels_clean");
             ncolor_cpp::expand_labels_clean_inplace(
-                out_ptr, bufs_, shape, pool_->pool, n_threads_, p, wrap);
+                bufs_.lbl(), bufs_, shape, pool_->pool, n_threads_, p, wrap, false);
             std::memcpy(out_ptr, bufs_.lbl(),
                         bufs_.size() * sizeof(int32_t));
         }
@@ -302,8 +506,10 @@ public:
     // distance internally as scratch — exposing it costs one extra
     // ``shape``-sized buffer + parallel sqrt.
     std::pair<py::array_t<int32_t>, py::array_t<double>> expand_labels_with_dist(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
+            py::array labels,
             int p = 2, bool wrap = false) {
+        if (p != 1 && p != 2) throw std::invalid_argument("expand_labels_with_dist: p must be 1 or 2");
+        labels = checked_labels(labels, "expand_labels_with_dist");
         const auto buf = labels.request();
         std::vector<int64_t> shape(buf.ndim);
         int64_t total = 1;
@@ -323,9 +529,8 @@ public:
             std::lock_guard<std::mutex> engine_lock(pool_->mu);
             if (p == 2) {
                 ncolor_cpp::expand_labels_lp<2>(input, out_lbl_ptr, bufs_, shape, pool_->pool, n_threads_, wrap);
-                const int32_t* d = bufs_.dist();
                 for (int64_t i = 0; i < total; ++i) {
-                    out_dist_ptr[i] = std::sqrt(static_cast<double>(d[i]));
+                    out_dist_ptr[i] = std::sqrt(bufs_.distance_at(i));
                 }
             } else if (p == 1) {
                 ncolor_cpp::expand_labels_lp<1>(input, out_lbl_ptr, bufs_, shape, pool_->pool, n_threads_, wrap);
@@ -351,9 +556,12 @@ public:
     // ``class_of[label] == c``. ``p=2`` returns Euclidean (sqrt-applied);
     // ``p=1`` returns L1. Pixels in classes with no seeds get +inf.
     py::array_t<double> per_class_min_edt(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> class_of,
+            py::array labels,
+            py::object class_of_obj,
             int n_classes, int p = 2, bool wrap = false) {
+        if (p != 1 && p != 2) throw std::invalid_argument("per_class_min_edt: p must be 1 or 2");
+        labels = checked_labels(labels, "per_class_min_edt");
+        auto class_of = graph_int_array(class_of_obj, "class_of");
         const auto lbuf = labels.request();
         const auto cbuf = class_of.request();
         std::vector<int64_t> shape(lbuf.ndim);
@@ -380,7 +588,6 @@ public:
 
         // Scratch: per-class masked label image (rewritten each pass).
         std::vector<int32_t> masked(static_cast<size_t>(total));
-        std::vector<int32_t> labels_out_scratch(static_cast<size_t>(total));
 
         {
             py::gil_scoped_release release;
@@ -407,16 +614,14 @@ public:
                 if (!any_seed) continue;  // out stays +inf for this class
 
                 if (p == 2) {
-                    ncolor_cpp::expand_labels_lp<2>(masked.data(),
-                        labels_out_scratch.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
-                    const int32_t* d = bufs_.dist();
+                    ncolor_cpp::expand_labels_inplace(masked.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
                     double* out_c = out_ptr + static_cast<int64_t>(c - 1) * total;
                     for (int64_t i = 0; i < total; ++i) {
-                        out_c[i] = std::sqrt(static_cast<double>(d[i]));
+                        out_c[i] = std::sqrt(bufs_.distance_at(i));
                     }
                 } else if (p == 1) {
                     ncolor_cpp::expand_labels_lp<1>(masked.data(),
-                        labels_out_scratch.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
+                        masked.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
                     const int32_t* d = bufs_.dist();
                     double* out_c = out_ptr + static_cast<int64_t>(c - 1) * total;
                     for (int64_t i = 0; i < total; ++i) {
@@ -438,8 +643,10 @@ public:
     //
     // Output shape (N, N) float64. ``p=2`` returns Euclidean, ``p=1`` L1.
     py::array_t<double> pairwise_nearest_distance(
-            py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
+            py::array labels,
             int n_labels, int p = 2, bool wrap = false) {
+        if (p != 1 && p != 2) throw std::invalid_argument("pairwise_nearest_distance: p must be 1 or 2");
+        labels = checked_labels(labels, "pairwise_nearest_distance");
         const auto lbuf = labels.request();
         std::vector<int64_t> shape(lbuf.ndim);
         int64_t total = 1;
@@ -455,7 +662,6 @@ public:
         double* D = static_cast<double*>(out.request().ptr);
 
         std::vector<int32_t> masked(static_cast<size_t>(total));
-        std::vector<int32_t> labels_out_scratch(static_cast<size_t>(total));
 
         {
             py::gil_scoped_release release;
@@ -475,11 +681,10 @@ public:
                 if (!any_seed) continue;
 
                 if (p == 2) {
-                    ncolor_cpp::expand_labels_lp<2>(masked.data(),
-                        labels_out_scratch.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
+                    ncolor_cpp::expand_labels_inplace(masked.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
                 } else if (p == 1) {
                     ncolor_cpp::expand_labels_lp<1>(masked.data(),
-                        labels_out_scratch.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
+                        masked.data(), bufs_, shape, pool_->pool, n_threads_, wrap);
                 } else {
                     throw std::invalid_argument("pairwise_nearest_distance: p must be 1 or 2");
                 }
@@ -492,7 +697,7 @@ public:
                     for (int64_t i = 0; i < total; ++i) {
                         const int32_t v = lbl_in[i];
                         if (v <= 0 || v == u || v > n_labels) continue;
-                        const double dd = std::sqrt(static_cast<double>(d[i]));
+                        const double dd = std::sqrt(bufs_.distance_at(i));
                         if (dd < D_row[v - 1]) D_row[v - 1] = dd;
                     }
                 } else {
@@ -627,7 +832,7 @@ public:
         py::gil_scoped_release gil;
         std::lock_guard<std::mutex> engine_lock(pool_->mu);
         expand_bufs_.release();
-        drop_(bg_mask_); drop_(partials_);
+        drop_(bg_mask_); drop_(partials_); drop_(seen_);
         drop_(src_idx_); drop_(dst_idx_);
         drop_(indptr_); drop_(indices_); drop_(edge_weights_);
         drop_(soft_indptr_); drop_(soft_indices_); drop_(soft_weights_);
@@ -645,7 +850,11 @@ public:
 
     // Per-stage timing breakdown of the most recent label() call. Empty
     // unless capture_stages=true was passed.
-    std::vector<std::pair<std::string, double>> get_last_stages() const { return last_stages_; }
+    std::vector<std::pair<std::string, double>> get_last_stages() const {
+        py::gil_scoped_release release;
+        std::lock_guard<std::mutex> lock(pool_->mu);
+        return last_stages_;
+    }
 
     // Adjacency pairs for a label image. Takes the image directly (any of
     // the supported integer dtypes) and returns an (M, 2) int32 array of
@@ -671,28 +880,29 @@ public:
         }
         // Unified ND unpadded find_pairs handles all (ndim, conn) cases.
         const void* src_ptr = buf.ptr;
+        const bool native_int32 = mask.dtype().is(py::dtype::of<int32_t>());
 
         std::vector<std::pair<int32_t, int32_t>> pairs;
         {
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> engine_lock(pool_->mu);
-            // Cast to int32 in expand_bufs_.lbl(); the bg mask is unused
-            // here (Solver.connect never applies a LUT) but cast_with_bg
-            // is the parallel cast we already use elsewhere — bg writes
-            // are cheap and let us share the kernel.
-            expand_bufs_.resize(total);
-            int32_t* labels = expand_bufs_.lbl();
-            bg_mask_.resize(static_cast<size_t>(total));
-            uint8_t* bg = bg_mask_.data();
-            bool fits = true;
-            dispatch_cast_dtype(buf.format, buf.itemsize, "Solver.connect",
-                [&](auto* tag) {
-                    using T = std::remove_pointer_t<decltype(tag)>;
-                    fits = ncolor_cpp::cast_with_bg<T>(
-                        static_cast<const T*>(src_ptr), labels, bg, total,
-                        pool_->pool, n_threads_);
-                });
-            if (!fits) throw_label_overflow("Solver.connect");
+            // Read canonical input directly. Other dtypes use checked conversion;
+            // adjacency does not need a background mask or a copy of int32 labels.
+            const int32_t* labels = static_cast<const int32_t*>(src_ptr);
+            if (!native_int32) {
+                expand_bufs_.resize(total);
+                int32_t* converted = expand_bufs_.lbl();
+                bool fits = true;
+                dispatch_cast_dtype(buf.format, buf.itemsize, "Solver.connect",
+                    [&](auto* tag) {
+                        using T = std::remove_pointer_t<decltype(tag)>;
+                        fits = ncolor_cpp::cast_to_int32<T>(
+                            static_cast<const T*>(src_ptr), converted, total,
+                            pool_->pool, n_threads_);
+                    });
+                if (!fits) throw_label_overflow("Solver.connect");
+                labels = converted;
+            }
 
             const int32_t max_label = parallel_max_label_(labels, total);
             const int32_t n_labels = distinct_labels_(labels, total, max_label);
@@ -730,6 +940,7 @@ public:
             int soft_conn = 2,
             int soft_radius = 2,
             bool clean_mask = false) {
+        ncolor_cpp::validate_coloring_budget(n_colors, max_depth);
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
         // coloring path without rebuilding the extension.
@@ -761,12 +972,6 @@ public:
         uint8_t* out_ptr = static_cast<uint8_t*>(out.request().ptr);
 
         int n_used = 0;
-        last_stages_.clear();
-        // Reset per-call accessor state so get_last_lut() / get_last_n_conflicts()
-        // always reflect the current call (and never silently report data from
-        // the previous call when this one short-circuits).
-        last_n_conflicts_ = 0;
-        lut_.assign(1, 0);  // {bg=0}; overwritten if pipeline runs to completion
         std::chrono::steady_clock::time_point t_start, t_now;
         if (capture_stages) t_start = std::chrono::steady_clock::now();
         auto stage = [&](const char* name) {
@@ -785,15 +990,9 @@ public:
         const int32_t* extra_ptr = nullptr;
         py::array_t<int32_t> extra_arr_holder;
         if (!extra_edges_obj.is_none()) {
-            extra_arr_holder = py::array_t<int32_t,
-                py::array::c_style | py::array::forcecast>::ensure(extra_edges_obj);
-            if (extra_arr_holder) {
-                const auto eb = extra_arr_holder.request();
-                if (eb.ndim == 2 && eb.shape[1] == 2) {
-                    n_extra = static_cast<int32_t>(eb.shape[0]);
-                    extra_ptr = static_cast<const int32_t*>(eb.ptr);
-                }
-            }
+            extra_arr_holder = checked_edges(extra_edges_obj, "extra_edges");
+            n_extra = static_cast<int32_t>(extra_arr_holder.shape(0));
+            extra_ptr = extra_arr_holder.data();
         }
         // Same parse for soft_extra_edges (Nx2 int32 pairs). Soft edges
         // are NOT added to the hard CSR; they go to a separate post-solve
@@ -803,15 +1002,11 @@ public:
         const int32_t* soft_ptr = nullptr;
         py::array_t<int32_t> soft_arr_holder;
         if (!soft_extra_edges_obj.is_none()) {
-            soft_arr_holder = py::array_t<int32_t,
-                py::array::c_style | py::array::forcecast>::ensure(soft_extra_edges_obj);
-            if (soft_arr_holder) {
-                const auto sb = soft_arr_holder.request();
-                if (sb.ndim == 2 && sb.shape[1] == 2) {
-                    n_soft = static_cast<int32_t>(sb.shape[0]);
-                    soft_ptr = static_cast<const int32_t*>(sb.ptr);
-                }
-            }
+            soft_arr_holder = checked_edges(soft_extra_edges_obj, "soft_extra_edges");
+            n_soft = static_cast<int32_t>(soft_arr_holder.shape(0));
+            soft_ptr = soft_arr_holder.data();
+            soft_conn = 0;
+            soft_radius = 0;
         }
         // Same pre-release parse for de_table (user-supplied (n+1)x(n+1)
         // perceptual-distance palette override). Calling py::array_t::ensure
@@ -819,24 +1014,29 @@ public:
         // when users passed a custom palette; copy here, use the data
         // pointer below.
         const double* user_de_ptr = nullptr;
-        int32_t user_de_dim = 0;
         py::array_t<double> de_arr_holder;
         if (!de_table_obj.is_none()) {
             de_arr_holder = py::array_t<double,
                 py::array::c_style | py::array::forcecast>::ensure(de_table_obj);
-            if (de_arr_holder) {
-                const auto db = de_arr_holder.request();
-                if (db.ndim == 2 && db.shape[0] == db.shape[1]) {
-                    user_de_dim = static_cast<int32_t>(db.shape[0]);
-                    user_de_ptr = static_cast<const double*>(db.ptr);
-                }
-            }
+            if (!de_arr_holder || de_arr_holder.ndim() != 2 ||
+                de_arr_holder.shape(0) != n_colors + 1 ||
+                de_arr_holder.shape(1) != n_colors + 1)
+                throw std::invalid_argument("de_table must have shape (n+1, n+1)");
+            user_de_ptr = de_arr_holder.data();
+            for (py::ssize_t i = 0; i < de_arr_holder.size(); ++i)
+                if (!std::isfinite(user_de_ptr[i]))
+                    throw std::invalid_argument("de_table must contain finite values");
         }
 
         bool early_exit_empty = false;
         {
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> engine_lock(pool_->mu);
+            last_stages_.clear();
+            fused_soft_pairs_.clear();
+            last_n_conflicts_ = 0;
+            n_soft_violations_last_ = 0.0;
+            lut_.assign(1, 0);
 
             // 0a. Cast input dtype → int32 (in expand_bufs_.lbl()) AND
             // capture the bg pattern (input == 0) into bg_mask_, all in
@@ -870,12 +1070,23 @@ public:
             const int32_t* expand_input = expanded;
             int32_t input_max_label = 0;
             if (format_input) {
+                bool background_changed = false;
                 const int n_labels = first_seen
                     ? ncolor_cpp::format_labels_inplace_first_seen(
-                        expanded, total, pool_->pool, n_threads_)
+                        expanded, total, pool_->pool, n_threads_, &background_changed)
                     : ncolor_cpp::format_labels_inplace(
-                        expanded, total, pool_->pool, n_threads_);
+                        expanded, total, pool_->pool, n_threads_, &background_changed);
                 input_max_label = n_labels;
+                // Rebuild the mask only when normalization changed its background.
+                if (background_changed) {
+                    auto update_background = [expanded, bg](size_t begin, size_t end) {
+                        for (size_t i = begin; i < end; ++i) bg[i] = expanded[i] == 0;
+                    };
+                    if (n_threads_ <= 1 || total < 500000) update_background(0, total);
+                    else ncolor_cpp::dispatch_parallel(pool_->pool, static_cast<size_t>(total),
+                        static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
+                        update_background);
+                }
                 stage("format");
                 // Empty / all-bg input: output is all zeros, no
                 // expansion / coloring needed.
@@ -921,6 +1132,9 @@ public:
             if (need_orig_snapshot) {
                 orig_labels_.assign(expand_input, expand_input + total);
             }
+            // Labels are still propagated exactly. Only the final distance
+            // transpose is optional once no later stage consumes distances.
+            const bool keep_distances = weight_objective != 0 && weight_mode != 4;
             if (expand) {
                 if (em == "clean") {
                     // Voronoi expand + antipodal-bridge test + despur
@@ -930,10 +1144,10 @@ public:
                     // already points to.
                     ncolor_cpp::expand_labels_clean_inplace(
                         expand_input, expand_bufs_, shape,
-                        pool_->pool, n_threads_, p, wrap);
+                        pool_->pool, n_threads_, p, wrap, keep_distances);
                 } else if (em == "standard") {
                     if (p == 2) {
-                        ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, pool_->pool, n_threads_, wrap);
+                        ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, pool_->pool, n_threads_, wrap, keep_distances);
                     } else {
                         ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, pool_->pool, n_threads_, wrap);
                     }
@@ -998,7 +1212,7 @@ public:
                         &pool_->pool, n_threads_);
                     ncolor_cpp::despur_via_face_count_nd<int32_t>(
                         expanded, despur_face_count_.data(), shape,
-                        /*threshold=*/1, &pool_->pool, n_threads_);
+                        /*threshold=*/1, &pool_->pool, n_threads_, despur_iters);
                 }
                 stage("despur");
             }
@@ -1013,48 +1227,61 @@ public:
             std::vector<std::pair<int32_t, int32_t>> pairs;
             std::vector<double> pair_primary;
             std::vector<int32_t> pair_counts;
-            // Start every call with an empty soft list. Only some branches
-            // below produce one, and the Solver is a process-global
-            // singleton: without this, a call taking the weighted or
-            // min_contact branch would inherit the previous call's soft
-            // pairs. Those are label ids of a different image, so the ones
-            // that happen to fall inside the new label range get applied
-            // as soft constraints and can push the color count up.
-            fused_soft_pairs_.clear();
             if (wobj != 0) {
                 // Fused weighted find_pairs: same parallel scan computes
                 // a per-pair reducer over (d_i + d_j) at boundary pixels.
                 // The reducer (min/max/mean/count/harmonic) is picked by
                 // weight_mode; templated dispatch eliminates dead branches.
                 using ncolor_cpp::ReduceMode;
-                switch (static_cast<ReduceMode>(wmode)) {
-                    case ReduceMode::Max:
-                        pairs = find_pairs_weighted_<ReduceMode::Max>(
-                            expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            n_labels, pair_primary, pair_counts); break;
-                    case ReduceMode::Mean:
-                        pairs = find_pairs_weighted_<ReduceMode::Mean>(
-                            expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            n_labels, pair_primary, pair_counts); break;
-                    case ReduceMode::Count:
-                        pairs = find_pairs_weighted_<ReduceMode::Count>(
-                            expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            n_labels, pair_primary, pair_counts); break;
-                    case ReduceMode::Harmonic:
-                        pairs = find_pairs_weighted_<ReduceMode::Harmonic>(
-                            expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            n_labels, pair_primary, pair_counts); break;
-                    case ReduceMode::MeanInv:
-                        pairs = find_pairs_weighted_<ReduceMode::MeanInv>(
-                            expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            n_labels, pair_primary, pair_counts); break;
-                    case ReduceMode::Min:
-                    default:
-                        pairs = find_pairs_weighted_<ReduceMode::Min>(
-                            expanded, expand_bufs_.dist(), shape, conn, wrap,
-                            n_labels, pair_primary, pair_counts); break;
+                auto scan_weighted = [&](auto* distances) {
+                    switch (static_cast<ReduceMode>(wmode)) {
+                        case ReduceMode::Max:
+                            pairs = find_pairs_weighted_<ReduceMode::Max>(
+                                expanded, distances, shape, conn, wrap,
+                                n_labels, pair_primary, pair_counts, connect_radius); break;
+                        case ReduceMode::Mean:
+                            pairs = find_pairs_weighted_<ReduceMode::Mean>(
+                                expanded, distances, shape, conn, wrap,
+                                n_labels, pair_primary, pair_counts, connect_radius); break;
+                        case ReduceMode::Count:
+                            pairs = find_pairs_weighted_<ReduceMode::Count>(
+                                expanded, distances, shape, conn, wrap,
+                                n_labels, pair_primary, pair_counts, connect_radius); break;
+                        case ReduceMode::Harmonic:
+                            pairs = find_pairs_weighted_<ReduceMode::Harmonic>(
+                                expanded, distances, shape, conn, wrap,
+                                n_labels, pair_primary, pair_counts, connect_radius); break;
+                        case ReduceMode::MeanInv:
+                            pairs = find_pairs_weighted_<ReduceMode::MeanInv>(
+                                expanded, distances, shape, conn, wrap,
+                                n_labels, pair_primary, pair_counts, connect_radius); break;
+                        case ReduceMode::Min:
+                        default:
+                            pairs = find_pairs_weighted_<ReduceMode::Min>(
+                                expanded, distances, shape, conn, wrap,
+                                n_labels, pair_primary, pair_counts, connect_radius); break;
+                    }
+                };
+                // No expansion means zero boundary costs; never read scratch
+                // left behind by a previous call on the shared engine.
+                if (expand && expand_bufs_.wide_distance())
+                    scan_weighted(expand_bufs_.dist64());
+                else
+                    scan_weighted(expand ? expand_bufs_.dist() : nullptr);
+                pair_primary.resize(pairs.size(), 0.0);
+                if (min_contact > 1) {
+                    size_t kept = 0;
+                    for (size_t i = 0; i < pairs.size(); ++i) {
+                        if (pair_counts[i] < min_contact) continue;
+                        pairs[kept] = pairs[i];
+                        pair_primary[kept] = pair_primary[i];
+                        pair_counts[kept++] = pair_counts[i];
+                    }
+                    pairs.resize(kept);
+                    pair_primary.resize(kept);
+                    pair_counts.resize(kept);
                 }
-            } else if (min_contact > 1 && connect_radius > 1) {
+            } else if (min_contact > 1) {
                 // Contact-filtered pair-find: tracks per-pair pixel-
                 // contact count via ReduceMode::Count and drops pairs
                 // whose count is below `min_contact`. At r=2 the
@@ -1064,12 +1291,12 @@ public:
                 // legitimate r=1 face-adjacent pairs). Filtering
                 // these by contact count removes the spurious
                 // Mycielski-like obstruction that pushes χ from 4 to
-                // 5. Only fires when r > 1 and the user asks for it.
+                // 5. Applied at every radius when explicitly requested.
                 using ncolor_cpp::ReduceMode;
                 std::vector<double> primary_unused;
                 pair_counts.clear();
                 pairs = find_pairs_weighted_<ReduceMode::Count>(
-                    expanded, /*dist=*/nullptr, shape, conn, wrap,
+                    expanded, static_cast<const int32_t*>(nullptr), shape, conn, wrap,
                     n_labels, primary_unused, pair_counts,
                     connect_radius);
                 // Filter pairs by count.
@@ -1163,7 +1390,34 @@ public:
             // TabuCol's heuristic can be sensitive to. Sorting gives
             // determinism + matches the legacy weight-find_pairs path
             // that emitted in canonical order via sort+unique.
-            std::sort(pairs.begin(), pairs.end());
+            if (wobj == 0) {
+                std::sort(pairs.begin(), pairs.end());
+            } else {
+                // Keep measurements aligned while canonicalizing edge order.
+                std::vector<size_t> order(pairs.size());
+                std::iota(order.begin(), order.end(), size_t{0});
+                std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                    return pairs[a] < pairs[b];
+                });
+                auto old_pairs = pairs;
+                auto old_primary = pair_primary;
+                auto old_counts = pair_counts;
+                for (size_t i = 0; i < order.size(); ++i) {
+                    pairs[i] = old_pairs[order[i]];
+                    pair_primary[i] = old_primary[order[i]];
+                    pair_counts[i] = old_counts[order[i]];
+                }
+            }
+            if ((wobj != 0 || min_contact > 1) &&
+                soft_conn > 0 && soft_radius > 0 &&
+                (min_contact > 1 || soft_conn > conn || soft_radius > connect_radius)) {
+                auto soft_all = find_pairs_(expanded, shape, soft_conn, wrap,
+                                            max_label, soft_radius);
+                std::sort(soft_all.begin(), soft_all.end());
+                std::set_difference(soft_all.begin(), soft_all.end(),
+                                    pairs.begin(), pairs.end(),
+                                    std::back_inserter(fused_soft_pairs_));
+            }
             stage("find_pairs");
             static bool dbg_pairs = std::getenv("NCOLOR_DEBUG_PAIRS") != nullptr;
             if (dbg_pairs) {
@@ -1190,14 +1444,14 @@ public:
                 dst_idx_[i] = pairs[i].second - 1;
             }
             for (int32_t e = 0; e < n_extra; ++e) {
-                int32_t a = extra_ptr[2 * e]     - 1;
-                int32_t b = extra_ptr[2 * e + 1] - 1;
-                if (a < 0 || b < 0 || a >= N || b >= N || a == b) {
+                int32_t a = extra_ptr[2 * e];
+                int32_t b = extra_ptr[2 * e + 1];
+                if (a < 1 || b < 1 || a > N || b > N || a == b) {
                     // Skip invalid entries.
                     continue;
                 }
-                src_idx_[M] = a;
-                dst_idx_[M] = b;
+                src_idx_[M] = a - 1;
+                dst_idx_[M] = b - 1;
                 ++M;
             }
             src_idx_.resize(M);
@@ -1216,6 +1470,12 @@ public:
                 pair_w.resize(static_cast<size_t>(M));
                 const auto mode = static_cast<ReduceMode>(wmode);
                 for (int32_t i = 0; i < M; ++i) {
+                    // Explicit constraints have no measured boundary. Give
+                    // them unit weight, independent of the reducer mode.
+                    if (static_cast<size_t>(i) >= pairs.size()) {
+                        pair_w[i] = 1.0;
+                        continue;
+                    }
                     if (mode == ReduceMode::Mean) {
                         const double mean = pair_counts[i] > 0
                             ? pair_primary[i] / static_cast<double>(pair_counts[i])
@@ -1252,7 +1512,7 @@ public:
             std::vector<double> de_table_vec;
             const double* de_ptr = nullptr;
             if (wobj != 0) {
-                if (user_de_ptr != nullptr && user_de_dim == n_colors + 1) {
+                if (user_de_ptr != nullptr) {
                     const size_t total_de = static_cast<size_t>(n_colors + 1) * (n_colors + 1);
                     de_table_vec.assign(user_de_ptr, user_de_ptr + total_de);
                     de_ptr = de_table_vec.data();
@@ -1284,7 +1544,8 @@ public:
             // dispatch.
             n_used = solve_coloring_(N, M, n_colors, max_depth, rand_period,
                                      color_mode,
-                                     static_cast<int>(shape.size()), wrap,
+                                     static_cast<int>(std::count_if(shape.begin(), shape.end(),
+                                         [](int64_t extent) { return extent > 1; })), wrap,
                                      edge_weights_ptr, de_ptr, wobj);
             stage("color");
 
@@ -1391,8 +1652,7 @@ public:
             bool capture_stages = false) {
         if (n_vertices < 0) throw std::invalid_argument(
             "Solver.color_graph: n_vertices must be >= 0");
-        if (n_colors < 1) throw std::invalid_argument(
-            "Solver.color_graph: n_colors must be >= 1");
+        ncolor_cpp::validate_coloring_budget(n_colors, max_depth);
         const int32_t N = static_cast<int32_t>(n_vertices);
 
         // Parse both edge arrays HERE, while we still hold the GIL; the
@@ -1402,8 +1662,7 @@ public:
                               py::array_t<int32_t>& holder,
                               const int32_t*& ptr) -> int32_t {
             if (obj.is_none()) return 0;
-            holder = py::array_t<int32_t,
-                py::array::c_style | py::array::forcecast>::ensure(obj);
+            holder = checked_edges(obj, name);
             if (!holder) throw std::invalid_argument(
                 std::string("Solver.color_graph: ") + name +
                 " must be an (M, 2) integer array");
@@ -1426,10 +1685,6 @@ public:
         uint8_t* out_ptr = static_cast<uint8_t*>(out.request().ptr);
 
         int n_used = 0;
-        last_stages_.clear();
-        last_n_conflicts_ = 0;
-        n_soft_violations_last_ = 0.0;
-        lut_.assign(1, 0);
         std::chrono::steady_clock::time_point t_start, t_now;
         if (capture_stages) t_start = std::chrono::steady_clock::now();
         auto stage = [&](const char* name) {
@@ -1458,6 +1713,11 @@ public:
         {
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> engine_lock(pool_->mu);
+            last_stages_.clear();
+            fused_soft_pairs_.clear();
+            last_n_conflicts_ = 0;
+            n_soft_violations_last_ = 0.0;
+            lut_.assign(1, 0);
             if (N > 0) {
                 std::vector<std::pair<int32_t, int32_t>> uniq;
                 clean_pairs(edge_ptr, n_edges_in, uniq);
@@ -1524,18 +1784,34 @@ public:
     // ncolor.label wrapper to satisfy return_lut / check_conflicts /
     // return_conflicts without re-running connect()/coloring.
     py::array_t<uint8_t> get_last_lut() const {
-        py::array_t<uint8_t> arr(static_cast<py::ssize_t>(lut_.size()));
-        std::memcpy(arr.request().ptr, lut_.data(),
-                    lut_.size() * sizeof(uint8_t));
+        std::vector<uint8_t> snapshot;
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(pool_->mu);
+            snapshot = lut_;
+        }
+        py::array_t<uint8_t> arr(static_cast<py::ssize_t>(snapshot.size()));
+        std::memcpy(arr.mutable_data(), snapshot.data(), snapshot.size());
         return arr;
     }
-    int get_last_n_conflicts() const { return last_n_conflicts_; }
-    double get_last_n_soft_violations() const { return n_soft_violations_last_; }
-    // Soft (delta-kernel) pairs from the most recent label() call: an
-    // (M, 2) int32 array of 1-indexed (lo, hi) label ids, hard pairs
-    // excluded. Empty when the call built no auto-soft kernel.
+    int get_last_n_conflicts() const {
+        py::gil_scoped_release release;
+        std::lock_guard<std::mutex> lock(pool_->mu);
+        return last_n_conflicts_;
+    }
+    double get_last_n_soft_violations() const {
+        py::gil_scoped_release release;
+        std::lock_guard<std::mutex> lock(pool_->mu);
+        return n_soft_violations_last_;
+    }
     py::array_t<int32_t> get_last_soft_pairs() const {
-        return pairs_to_array(fused_soft_pairs_);
+        std::vector<std::pair<int32_t, int32_t>> snapshot;
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(pool_->mu);
+            snapshot = fused_soft_pairs_;
+        }
+        return pairs_to_array(snapshot);
     }
 
 private:
@@ -1559,6 +1835,8 @@ private:
             throw std::invalid_argument("Solver.label: out buffer must be uint8");
         }
         py::array_t<uint8_t> out = py::cast<py::array_t<uint8_t>>(out_arg);
+        if (!out.writeable()) throw std::invalid_argument(
+            "Solver.label: out buffer must be writable");
         const auto out_buf = out.request();
         if (out_buf.ndim != ndim) {
             throw std::invalid_argument(
@@ -1585,14 +1863,11 @@ private:
     // different for sparse ids: an image whose 500 cells were numbered
     // up to a million got a table for a million, 9.4 ms of connect()
     // against 0.6 ms for the same cells numbered 1..500. Distinct count
-    // is what the table actually has to hold. The pass is a byte per
-    // label value, set in parallel (every writer stores 1, so the race
-    // is benign) and counted once; the array is kept between calls
-    // like the other scratch. Pairs are still emitted with the labels
-    // as given; nothing is renumbered.
+    // is what the table actually has to hold. Dense ranges use atomic
+    // presence flags; sparse ranges use sorted unique values so scratch
+    // scales with pixels rather than the largest source identifier.
     int32_t distinct_labels_(const int32_t* lbl, int64_t total,
                              int32_t max_label) {
-        if (max_label <= 0) return 0;
         // Only when the table it can shrink is big. Below this the
         // table sized from max_label is small enough that allocating
         // and probing it costs less than counting, and the count is
@@ -1603,29 +1878,34 @@ private:
         // 0.10x on a 64-core machine, for inputs the pass could not
         // have helped. Above the threshold the array is large, the
         // stores spread out, and the pass pays for itself many times.
-        if (max_label <= DISTINCT_PASS_MIN_MAX_LABEL) return max_label;
-        seen_.assign(static_cast<size_t>(max_label) + 1, 0);
-        uint8_t* seen = seen_.data();
-        const size_t total_sz = static_cast<size_t>(total);
-        if (n_threads_ <= 1 || total < 8192) {
-            for (size_t i = 0; i < total_sz; ++i) seen[lbl[i]] = 1;
-        } else {
-            const size_t n_chunks = static_cast<size_t>(n_threads_) *
-                                    ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD;
-            const size_t actual_chunks = std::min(n_chunks, total_sz);
-            const size_t chunk_sz = (total_sz + actual_chunks - 1) / actual_chunks;
-            std::atomic<size_t> next{0};
-            pool_->pool.parallel([&]() {
-                size_t idx;
-                while ((idx = next.fetch_add(1, std::memory_order_relaxed)) < actual_chunks) {
-                    const size_t i0 = idx * chunk_sz;
-                    const size_t i1 = std::min(i0 + chunk_sz, total_sz);
-                    for (size_t i = i0; i < i1; ++i) seen[lbl[i]] = 1;
-                }
-            });
+        if (max_label > 0 && max_label <= DISTINCT_PASS_MIN_MAX_LABEL) return max_label;
+        if (max_label <= 0 || max_label > std::max<int64_t>(65536, total * 4)) {
+            std::vector<int32_t> values;
+            if (max_label > 0) values.reserve(static_cast<size_t>(total));
+            for (int64_t i = 0; i < total; ++i)
+                if (lbl[i] != 0) values.push_back(lbl[i]);
+            std::sort(values.begin(), values.end());
+            return static_cast<int32_t>(std::unique(values.begin(), values.end()) - values.begin());
         }
+        const size_t required = static_cast<size_t>(max_label) + 1;
+        if (seen_.size() < required) {
+            std::vector<std::atomic<uint8_t>> fresh(required);
+            seen_.swap(fresh);
+        }
+        for (size_t i = 0; i < required; ++i) std::atomic_init(&seen_[i], uint8_t{0});
+        auto mark = [&](size_t begin, size_t end) {
+            for (size_t i = begin; i < end; ++i) {
+                const int32_t v = lbl[i];
+                if (v > 0 && !seen_[v].load(std::memory_order_relaxed))
+                    seen_[v].store(1, std::memory_order_relaxed);
+            }
+        };
+        if (n_threads_ <= 1 || total < 8192) mark(0, total);
+        else ncolor_cpp::dispatch_parallel(pool_->pool, static_cast<size_t>(total),
+            static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD, mark);
         int64_t n = 0;
-        for (size_t v = 1; v <= static_cast<size_t>(max_label); ++v) n += seen[v];
+        for (size_t v = 1; v < required; ++v)
+            n += seen_[v].load(std::memory_order_relaxed);
         return static_cast<int32_t>(n);
     }
 
@@ -1716,9 +1996,9 @@ private:
     // picks the reducer (min/max/mean/count/harmonic of d_i+d_j).
     // Out arrays ``primary``/``counts`` are parallel to the returned
     // pair list; the caller picks the right one per mode.
-    template <ncolor_cpp::ReduceMode Mode>
+    template <ncolor_cpp::ReduceMode Mode, typename Distance>
     std::vector<std::pair<int32_t, int32_t>> find_pairs_weighted_(
-            const int32_t* labels, const int32_t* dist,
+            const int32_t* labels, const Distance* dist,
             const std::vector<int64_t>& shape,
             int conn, bool wrap, int32_t max_label,
             std::vector<double>& primary,
@@ -1807,7 +2087,7 @@ private:
     ncolor_cpp::ExpandBuffers expand_bufs_;
     std::vector<uint8_t> bg_mask_;     // captured from cast, used by apply_lut
     std::vector<int32_t> partials_;     // max-reduce partials, reused across calls
-    std::vector<uint8_t> seen_;         // distinct-label scratch, reused across calls
+    std::vector<std::atomic<uint8_t>> seen_;         // distinct-label scratch, reused across calls
     std::vector<int32_t> src_idx_, dst_idx_;
     std::vector<int32_t> indptr_, indices_;
     // Optional parallel-to-indices_ edge weights used by the boundary-
@@ -1833,14 +2113,14 @@ private:
     // as bridges/stubs for graph cleanup. Only populated when
     // clean_mask=false AND expand_mode="clean" AND expand=true.
     std::vector<int32_t> orig_labels_;
-    // Per-pixel same-label face-neighbour count, reused by fast_despur
+    // Per-pixel same-label face-neighbor count, reused by fast_despur
     // (compute_face_count_nd + despur_via_face_count_nd). Only allocated
     // when fast_despur runs.
     std::vector<uint8_t> despur_face_count_;
     // Persistent per-thread hashtable buffer for find_pairs (n_threads_ *
     // ht_size entries). Reused across calls so we don't pay malloc/free
     // for ~tens of MB on every label() invocation. find_pairs itself
-    // re-initialises per-thread slots to HT_EMPTY at the start of each
+    // re-initializes per-thread slots to HT_EMPTY at the start of each
     // scan, so leaving stale data here between calls is safe.
     std::vector<uint64_t> fp_ht_buf_;
     // Companion scratch for the boundary-weighted find_pairs path only;
@@ -1872,6 +2152,13 @@ PYBIND11_MODULE(_impl, m) {
         .def(py::init<double, int>(), py::arg("n_threads") = -1.0,
              py::arg("pool_group") = 0)
         .def_property_readonly("n_threads", &ExpandEngine::n_threads)
+        .def("connected_components", &ExpandEngine::connected_components,
+             py::arg("mask"), py::arg("conn") = 2)
+        .def("components_per_label", &ExpandEngine::components_per_label,
+             py::arg("labels"), py::arg("conn") = 2)
+        .def("delete_spurs_labels", &ExpandEngine::delete_spurs_labels,
+             py::arg("labels"), py::arg("threshold") = 1,
+             py::arg("max_iters") = 20, py::arg("remove_thin") = false)
         .def("expand_labels", &ExpandEngine::expand_labels,
              py::arg("labels"), py::arg("p") = 2, py::arg("wrap") = false,
              "Voronoi label expansion under L_p metric. p=1 (Manhattan,\n"
@@ -2022,49 +2309,19 @@ PYBIND11_MODULE(_impl, m) {
              "label() output. 0 means the coloring is valid; nonzero\n"
              "means the solver bailed out without finding a clean coloring.")
         .def("get_last_n_soft_violations", &Solver::get_last_n_soft_violations,
-             "Total weight (or count if unit weights) of soft_extra_edges\n"
-             "whose endpoints share a color after the post-solve local\n"
-             "search. 0 means all soft preferences satisfied. Only nonzero\n"
-             "when soft_extra_edges was passed to label().")
+             "Number of soft edges whose endpoints share a color after the\n"
+             "post-solve local search, for explicit or automatic soft edges.\n"
+             "0 means all soft preferences are satisfied.")
         .def("get_last_soft_pairs", &Solver::get_last_soft_pairs,
              "Soft (delta-kernel) pairs from the most recent label() call as\n"
-             "an (M, 2) int32 array of 1-indexed (lo, hi) label ids, hard\n"
-             "pairs excluded. Empty when no auto-soft kernel was built.")
+             "an (M, 2) int32 array of 1-indexed (lo, hi) label ids, geometric\n"
+             "hard pairs excluded. Empty when no auto-soft kernel was built.")
         .def("release", &Solver::release,
              "Free every persistent scratch buffer (the working set of the\n"
              "largest image processed so far); the next call reallocates.");
 
     m.def("cc_label",
-          [](py::array mask, int conn) -> std::pair<py::array_t<int32_t>, int32_t> {
-              if (!(mask.flags() & py::array::c_style)) {
-                  mask = py::array::ensure(mask, py::array::c_style);
-              }
-              const auto buf = mask.request();
-              const int ndim = static_cast<int>(buf.ndim);
-              if (ndim < 1) throw std::invalid_argument("cc_label: input must be ≥ 1-D");
-              if (conn < 1 || conn > ndim) throw std::invalid_argument(
-                  "cc_label: conn must be in [1, ndim]");
-              std::vector<int64_t> shape(ndim);
-              std::vector<py::ssize_t> out_shape(ndim);
-              for (int d = 0; d < ndim; ++d) {
-                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
-                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
-              }
-              py::array_t<int32_t> out(out_shape);
-              int32_t* out_ptr = static_cast<int32_t*>(out.request().ptr);
-              const void* src_ptr = buf.ptr;
-              int32_t n_labels = 0;
-              {
-                  py::gil_scoped_release release;
-                  dispatch_cast_dtype(buf.format, buf.itemsize, "cc_label",
-                      [&](auto* tag) {
-                          using T = std::remove_pointer_t<decltype(tag)>;
-                          n_labels = ncolor_cpp::cc_label_nd<T>(
-                              static_cast<const T*>(src_ptr), out_ptr, shape, conn);
-                      });
-              }
-              return {std::move(out), n_labels};
-          },
+          [](py::array mask, int conn) { return component_arrays<false>(mask, conn); },
           py::arg("mask"), py::arg("conn") = 2,
           "N-D connected-components labeling. Returns (labels, n_components).\n"
           "Foreground = (mask != 0). conn = 1 (face only) up to ndim\n"
@@ -2072,8 +2329,9 @@ PYBIND11_MODULE(_impl, m) {
           "format (int32, dense 1..N labels, 0 = bg).");
 
     m.def("regionprops",
-          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> labels,
+          [](py::array labels,
              int n_labels_arg) -> py::dict {
+              labels = checked_labels(labels, "regionprops");
               const auto buf = labels.request();
               const int ndim = static_cast<int>(buf.ndim);
               std::vector<int64_t> shape(ndim);
@@ -2129,38 +2387,7 @@ PYBIND11_MODULE(_impl, m) {
           "Python objects.");
 
     m.def("cc_label_per_label",
-          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> input,
-             int conn) {
-              const auto buf = input.request();
-              const int ndim = static_cast<int>(buf.ndim);
-              if (ndim < 1) throw std::invalid_argument("cc_label_per_label: input must be ≥ 1-D");
-              if (conn < 1 || conn > ndim) throw std::invalid_argument(
-                  "cc_label_per_label: conn must be in [1, ndim]");
-              std::vector<int64_t> shape(ndim);
-              for (int d = 0; d < ndim; ++d) shape[d] = static_cast<int64_t>(buf.shape[d]);
-
-              std::vector<py::ssize_t> py_shape(ndim);
-              for (int d = 0; d < ndim; ++d) py_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
-              py::array_t<int32_t> output(py_shape);
-
-              const int32_t* in_ptr  = static_cast<const int32_t*>(buf.ptr);
-              int32_t*       out_ptr = static_cast<int32_t*>(output.request().ptr);
-
-              std::vector<int32_t> source_labels;
-              int32_t n;
-              {
-                  py::gil_scoped_release release;
-                  n = ncolor_cpp::cc_label_per_label_nd<int32_t>(
-                      in_ptr, out_ptr, shape, conn, source_labels);
-              }
-              py::array_t<int32_t> sl_arr({static_cast<py::ssize_t>(n)});
-              if (n > 0) {
-                  std::memcpy(sl_arr.mutable_data(),
-                              source_labels.data(),
-                              static_cast<size_t>(n) * sizeof(int32_t));
-              }
-              return py::make_tuple(output, n, sl_arr);
-          },
+          [](py::array input, int conn) { return component_arrays<true>(input, conn); },
           py::arg("input"), py::arg("conn") = 2,
           "Per-label connected components: pixels merge into one component\n"
           "only when they share the same nonzero input value. Returns\n"
@@ -2214,7 +2441,7 @@ PYBIND11_MODULE(_impl, m) {
           "pixels (face-connected), then iteratively strip pixels whose\n"
           "fg-neighbor count under the chosen connectivity is below\n"
           "``threshold`` (default ndim). ``conn_kind`` = 1 → cardinal\n"
-          "(face only, omnipose-style external-spur rule, fewer iters);\n"
+          "(face only, external-spur rule, fewer iters);\n"
           "ndim → full diagonal (preserves 1-voxel skeletons). Isolated\n"
           "pixels (count == 0) are always preserved. ``max_iter`` < 0\n"
           "runs to convergence.");
@@ -2222,41 +2449,10 @@ PYBIND11_MODULE(_impl, m) {
     m.def("delete_spurs_labels",
           [](py::array labels_in, int threshold, int max_iters, int n_threads,
              bool remove_thin) {
-              if (!(labels_in.flags() & py::array::c_style)) {
-                  labels_in = py::array::ensure(labels_in, py::array::c_style);
-              }
-              const auto buf = labels_in.request();
-              const int ndim = static_cast<int>(buf.ndim);
-              if (ndim < 1) throw std::invalid_argument(
-                  "delete_spurs_labels requires ndim >= 1");
-              std::vector<int64_t> shape(ndim);
-              std::vector<py::ssize_t> out_shape(ndim);
-              for (int d = 0; d < ndim; ++d) {
-                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
-                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
-              }
-              py::array out(labels_in.dtype(), out_shape);
-              std::memcpy(out.request().ptr, buf.ptr,
-                          (size_t)buf.size * (size_t)buf.itemsize);
-              int64_t n_removed = 0;
               const int nt = n_threads > 0 ? n_threads :
-                  (int)std::thread::hardware_concurrency();
-              {
-                  py::gil_scoped_release release;
-                  std::unique_ptr<ncolor_cpp::ForkJoinPool> pool;
-                  if (nt > 1) {
-                      pool = std::make_unique<ncolor_cpp::ForkJoinPool>(nt);
-                  }
-                  dispatch_int_dtype(buf.format, buf.itemsize, "delete_spurs_labels",
-                      [&](auto* tag) {
-                          using T = std::remove_pointer_t<decltype(tag)>;
-                          n_removed = ncolor_cpp::delete_spurs_labels_nd_inplace<T>(
-                              static_cast<T*>(out.mutable_data()),
-                              shape, threshold, max_iters,
-                              pool.get(), nt, remove_thin);
-                      });
-              }
-              return std::make_pair(std::move(out), n_removed);
+                  static_cast<int>(std::thread::hardware_concurrency());
+              return delete_spurs_labels_array(labels_in, threshold, max_iters,
+                                                nt, remove_thin);
           },
           py::arg("labels"), py::arg("threshold") = 1, py::arg("max_iters") = 20,
           py::arg("n_threads") = 0, py::arg("remove_thin") = false,
@@ -2276,15 +2472,15 @@ PYBIND11_MODULE(_impl, m) {
     // Fast despur built on a pre-computed face-count array. Avoids the
     // iter-0 full-image scan that dominates ``delete_spurs_labels``.
     m.def("two_hop_csr",
-          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indptr,
-             py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indices)
+          [](py::object adj_indptr_obj,
+             py::object adj_indices_obj)
              -> std::pair<py::array_t<int32_t>, py::array_t<int32_t>>
           {
+              auto adj_indptr = graph_int_array(adj_indptr_obj, "adj_indptr");
+              auto adj_indices = graph_int_array(adj_indices_obj, "adj_indices");
               const auto ai = adj_indptr.request();
               const auto ax = adj_indices.request();
-              if (ai.size < 1) throw std::invalid_argument(
-                  "two_hop_csr: empty adj_indptr");
-              const int32_t N = static_cast<int32_t>(ai.size - 1);
+              const int32_t N = validate_csr(ai, ax, "two_hop_csr");
               std::vector<int32_t> out_indptr, out_indices;
               {
                   py::gil_scoped_release release;
@@ -2306,17 +2502,30 @@ PYBIND11_MODULE(_impl, m) {
           "Both directions emitted (symmetric output). O(N · avg_deg²) time.");
 
     m.def("symmetric_pair_csr",
-          [](py::array_t<int32_t, py::array::c_style | py::array::forcecast> pair_u,
-             py::array_t<int32_t, py::array::c_style | py::array::forcecast> pair_v,
+          [](py::object pair_u_obj,
+             py::object pair_v_obj,
              py::array_t<double,  py::array::c_style | py::array::forcecast> pair_w,
              int32_t N)
              -> std::tuple<py::array_t<int32_t>, py::array_t<int32_t>, py::array_t<double>>
           {
+              auto pair_u = graph_int_array(pair_u_obj, "pair_u");
+              auto pair_v = graph_int_array(pair_v_obj, "pair_v");
               const auto pu = pair_u.request();
               const auto pv = pair_v.request();
               const auto pw = pair_w.request();
-              if (pu.size != pv.size || pu.size != pw.size)
+              if (N < 0 || N == INT32_MAX)
+                  throw std::invalid_argument("N must be nonnegative and below int32 capacity");
+              if (pw.ndim != 1 || pu.size != pv.size || pu.size != pw.size)
                   throw std::invalid_argument("symmetric_pair_csr: u/v/w size mismatch");
+              if (pu.size > INT32_MAX / 2)
+                  throw std::overflow_error("symmetric_pair_csr exceeds int32 edge capacity");
+              for (py::ssize_t i = 0; i < pu.size; ++i) {
+                  if (pair_u.data()[i] < 0 || pair_u.data()[i] >= N ||
+                      pair_v.data()[i] < 0 || pair_v.data()[i] >= N)
+                      throw std::invalid_argument("pair vertex outside [0, N)");
+                  if (!std::isfinite(pair_w.data()[i]))
+                      throw std::invalid_argument("pair weights must be finite");
+              }
               const int32_t n_pairs = static_cast<int32_t>(pu.size);
               std::vector<int32_t> indptr; std::vector<int32_t> indices;
               std::vector<double>  weights;
@@ -2342,19 +2551,26 @@ PYBIND11_MODULE(_impl, m) {
           "(indptr, indices, weights).");
 
     m.def("kempe_sa",
-          [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> initial_colors,
-             py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indptr,
-             py::array_t<int32_t, py::array::c_style | py::array::forcecast> adj_indices,
-             py::array_t<int32_t, py::array::c_style | py::array::forcecast> twohop_indptr,
-             py::array_t<int32_t, py::array::c_style | py::array::forcecast> twohop_indices,
-             py::array_t<int32_t, py::array::c_style | py::array::forcecast> iou_indptr,
-             py::array_t<int32_t, py::array::c_style | py::array::forcecast> iou_indices,
+          [](py::object initial_colors_obj,
+             py::object adj_indptr_obj,
+             py::object adj_indices_obj,
+             py::object twohop_indptr_obj,
+             py::object twohop_indices_obj,
+             py::object iou_indptr_obj,
+             py::object iou_indices_obj,
              py::array_t<double,  py::array::c_style | py::array::forcecast> iou_weights,
              int n_colors, double alpha_2hop, double gamma_iou,
              int n_iters, int patience,
              double T0, double T_min, double alpha_cool,
              uint64_t rng_seed) -> std::pair<py::array_t<uint8_t>, double>
           {
+              auto adj_indptr = graph_int_array(adj_indptr_obj, "adj_indptr");
+              auto adj_indices = graph_int_array(adj_indices_obj, "adj_indices");
+              auto twohop_indptr = graph_int_array(twohop_indptr_obj, "twohop_indptr");
+              auto twohop_indices = graph_int_array(twohop_indices_obj, "twohop_indices");
+              auto iou_indptr = graph_int_array(iou_indptr_obj, "iou_indptr");
+              auto iou_indices = graph_int_array(iou_indices_obj, "iou_indices");
+              auto initial_colors = graph_int_array(initial_colors_obj, "initial_colors");
               const auto ic_buf = initial_colors.request();
               const auto ai_buf = adj_indptr.request();
               const auto ax_buf = adj_indices.request();
@@ -2363,21 +2579,22 @@ PYBIND11_MODULE(_impl, m) {
               const auto ii_buf = iou_indptr.request();
               const auto ix_buf = iou_indices.request();
               const auto iw_buf = iou_weights.request();
-              if (ai_buf.size < 1) throw std::invalid_argument(
-                  "kempe_sa: adj_indptr empty");
-              const int32_t N = static_cast<int32_t>(ai_buf.size - 1);
-              if (ic_buf.size != N) throw std::invalid_argument(
-                  "kempe_sa: initial_colors length must equal N");
-              if (ti_buf.size != N + 1) throw std::invalid_argument(
-                  "kempe_sa: twohop_indptr length must be N+1");
-              if (ii_buf.size != N + 1) throw std::invalid_argument(
-                  "kempe_sa: iou_indptr length must be N+1");
-              if (ix_buf.size != iw_buf.size) throw std::invalid_argument(
-                  "kempe_sa: iou_indices and iou_weights must have same length");
-
+              ncolor_cpp::validate_color_count(n_colors);
+              const int32_t N = validate_csr(ai_buf, ax_buf, "kempe_sa adjacency");
+              validate_csr(ti_buf, tx_buf, "kempe_sa twohop", N);
+              validate_csr(ii_buf, ix_buf, "kempe_sa weighted adjacency", N);
+              if (ic_buf.size != N || iw_buf.ndim != 1 || ix_buf.size != iw_buf.size)
+                  throw std::invalid_argument("kempe_sa: color or weight length mismatch");
+              for (py::ssize_t i = 0; i < iw_buf.size; ++i)
+                  if (!std::isfinite(iou_weights.data()[i]))
+                      throw std::invalid_argument("kempe_sa weights must be finite");
               std::vector<uint8_t> colors(static_cast<size_t>(N));
-              std::memcpy(colors.data(), ic_buf.ptr,
-                          static_cast<size_t>(N) * sizeof(uint8_t));
+              for (int32_t u = 0; u < N; ++u) {
+                  const int32_t c = initial_colors.data()[u];
+                  if (c < 0 || c > n_colors)
+                      throw std::invalid_argument("initial_colors must be in [0, n_colors]");
+                  colors[u] = static_cast<uint8_t>(c);
+              }
 
               ncolor_cpp::KempeSAParams params;
               params.n_colors   = n_colors;

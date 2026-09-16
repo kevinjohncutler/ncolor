@@ -88,10 +88,11 @@ does. `cpp/ncolor.hpp` includes all of them and
 | `color.hpp` | BFS coloring + Welsh-Powell + repair |
 | `picker.hpp` | The coloring picker: the per-color-count race of strategies that `label` and `color_graph` run. The winner is the lowest-numbered search that succeeds, and a search is abandoned only once a lower-numbered one has won, so the coloring does not depend on the thread schedule |
 | `bb_dsatur.hpp` | Iterative branch-and-bound exact DSATUR for the race |
-| `tabucol.hpp`, `hea.hpp`, `kempe_sa.hpp`, `clique_lb.hpp` | Picker fallbacks: TabuCol, HEA, Kempe SA, clique lower bound |
+| `tabucol.hpp`, `hea.hpp`, `clique_lb.hpp` | Picker searches: TabuCol, hybrid evolutionary algorithm, clique lower bound |
+| `kempe_sa.hpp` | Separately exposed Kempe-chain simulated annealing refinement |
 | `soft_color.hpp` | Soft-edge local search (ILS + triangle weights) |
 | `delete_spurs.hpp`, `delete_spurs_labels.hpp`, `fast_despur.hpp` | Skeleton spur / 1-voxel-thick bridge removal |
-| `geometry.hpp`, `dispatch.hpp` | ND helpers + dtype dispatch |
+| `geometry.hpp`, `dispatch.hpp` | Graph adjacency helpers and dtype dispatch |
 | `threadpool.h` | Persistent fork-join pool with wait-on-address idle |
 
 ### Why the engine is structured this way
@@ -235,7 +236,7 @@ both loops stay fully unrolled.
 
 1. `smt_threads.json` — the per-host SMT/HT-aware thread count chosen
    by `ncolor._backend._smt.calibrate()`. Keyed by `(hostname, CPU
-   model)`. Read on every `Solver()` / `ConnectEngine()` /
+   model)`. Read on every `Solver()` /
    `ExpandEngine()` construction via `auto_threads()`.
 2. `lib/<mtime_ns>_<size>/_impl.<so|pyd>` — only used when the package
    directory is on a network filesystem. The compiled extension is

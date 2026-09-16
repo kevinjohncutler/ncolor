@@ -1,414 +1,196 @@
-// Label-aware ND despur. Iteratively remove pixels whose count of
-// face-adjacent same-label neighbors is ≤ `threshold`. Unlike the
-// existing `delete_spurs.hpp` (which is binary — any nonzero pixel
-// treated as foreground), this version respects label boundaries:
-// a pixel of cell A whose only face-neighbor from cell A is one
-// other pixel (the rest are other labels or bg) counts as a spur.
-//
-// Use case: after `expand_labels` fills the gaps between adjacent
-// cells, two cells that originally touched only at a single point
-// may now share a 1-pixel-wide "convergence pixel" that's only
-// 1-same-label-neighbor-attached to its parent cell. Removing
-// these widens the inter-cell gap, breaking K_5-creating contact
-// patterns (5 cells meeting at a corner) so that 4-coloring
-// becomes feasible at conn=1 r=1.
-//
-// Operates in place on the label buffer; removed pixels become 0
-// (background).
-//
-// Parallelism: outer-axis-0 slabs are dispatched to the pool when
-// available; threads scan their own slab independently and write to
-// a shared `mark` buffer (no race — each pixel written by exactly
-// one thread).
-
+// Label-aware spur removal in any dimension. Each synchronous round uses
+// the same face-count and optional antipodal thin-line predicates.
 #pragma once
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 #include <vector>
-
 #include "threadpool.h"
 
 namespace ncolor_cpp {
-
-
 namespace despur_detail {
 
-struct NDOffset {
-    std::vector<int8_t> dc;   // length ndim, values in {-1, 0, +1}
-    int64_t flat_offset;      // sum dc[d] * strides[d]
-    bool is_face;             // exactly one nonzero coord
-    int opposite_idx;         // index of -dc in the same table
-};
-
-// Face-only pruning needs just 2*ndim offsets. The optional thin-line
-// test uses the full neighborhood, excluding singleton axes. Face
-// antipodes are adjacent entries; full-neighborhood antipodes are mirror
-// indices. Neither needs a pairwise search.
-inline std::vector<NDOffset> build_nd_offsets(
-    const std::vector<int64_t>& shape, const std::vector<int64_t>& strides,
-    bool remove_thin)
-{
-    const int ndim = static_cast<int>(shape.size());
-    std::vector<NDOffset> out;
-    std::vector<int8_t> dc(ndim, 0);
-    if (!remove_thin) {
-        for (int d = 0; d < ndim; ++d) {
-            if (shape[d] <= 1) continue;
-            dc[d] = -1;
-            out.push_back({dc, -strides[d], true, -1});
-            dc[d] = 1;
-            out.push_back({dc, strides[d], true, -1});
-            dc[d] = 0;
-            const int n = static_cast<int>(out.size());
-            out[n - 2].opposite_idx = n - 1;
-            out[n - 1].opposite_idx = n - 2;
-        }
-        return out;
+inline void coordinates(int64_t i, const std::vector<int64_t>& strides,
+                        std::vector<int64_t>& coords) {
+    for (size_t d = 0; d < strides.size(); ++d) {
+        coords[d] = i / strides[d];
+        i -= coords[d] * strides[d];
     }
-    auto visit = [&](auto&& self, int d, int nonzero, int64_t flat) -> void {
-        if (d == ndim) {
-            if (nonzero) out.push_back({dc, flat, nonzero == 1, -1});
-            return;
-        }
-        const int r = shape[d] > 1 ? 1 : 0;
-        for (int v = -r; v <= r; ++v) {
-            dc[d] = static_cast<int8_t>(v);
-            self(self, d + 1, nonzero + (v != 0), flat + v * strides[d]);
-        }
-    };
-    visit(visit, 0, 0, 0);
-    for (size_t i = 0; i < out.size(); ++i)
-        out[i].opposite_idx = static_cast<int>(out.size() - 1 - i);
-    return out;
 }
 
-// The one marking kernel, for every dimension. With remove_thin = true
-// this catches any 1-voxel-wide straight segment, whether axis-aligned
-// or diagonal: a pixel is marked iff its same-label 8-connectivity
-// neighbours count exactly two AND they sit at opposite offsets
-// (their displacement vectors negate). A 2D specialization used to sit
-// beside it with this as its parity reference; it was the only
-// dimension-specific path in the package and is gone.
+// Enumerate only in-bounds neighbors, with rank-sized scratch. Returning
+// true from visit stops immediately; no exponential offset table is built.
+template <typename F>
+inline void visit_neighbors(const std::vector<int64_t>& shape,
+                            const std::vector<int64_t>& strides,
+                            const std::vector<int64_t>& coords,
+                            std::vector<int64_t>& delta, F&& visit) {
+    const int rank = static_cast<int>(shape.size());
+    int64_t offset = 0;
+    for (int d = 0; d < rank; ++d) {
+        delta[d] = coords[d] > 0 ? -1 : 0;
+        offset += delta[d] * strides[d];
+    }
+    for (;;) {
+        if (offset != 0 && visit(offset, delta)) return;
+        int d = rank - 1;
+        for (; d >= 0; --d) {
+            const int64_t hi = coords[d] + 1 < shape[d] ? 1 : 0;
+            if (delta[d] < hi) { ++delta[d]; offset += strides[d]; break; }
+            const int64_t lo = coords[d] > 0 ? -1 : 0;
+            offset += (lo - delta[d]) * strides[d];
+            delta[d] = lo;
+        }
+        if (d < 0) return;
+    }
+}
+
 template <typename T>
-inline void count_and_mark_nd(
-    const T* labels, uint8_t* mark,
-    const std::vector<int64_t>& shape,
-    const std::vector<int64_t>& strides,
-    const std::vector<NDOffset>& offsets,
-    int threshold, int64_t i_lo, int64_t i_hi,
-    bool remove_thin = false)
-{
-    const int ndim = (int)shape.size();
-    std::vector<int64_t> coords(ndim, 0);
-    {
-        int64_t rem = i_lo;
-        for (int d = 0; d < ndim; ++d) {
-            coords[d] = rem / strides[d];
-            rem -= coords[d] * strides[d];
+inline bool should_remove(const T* labels, int64_t i,
+                          const std::vector<int64_t>& shape,
+                          const std::vector<int64_t>& strides,
+                          const std::vector<int64_t>& coords,
+                          std::vector<int64_t>& delta,
+                          std::vector<int64_t>& first,
+                          int threshold, bool remove_thin) {
+    const T label = labels[i];
+    if (label == 0) return false;
+    int faces = 0, first_axis = -1;
+    bool opposite_faces = false;
+    for (int d = 0; d < static_cast<int>(shape.size()); ++d) {
+        for (int sign : {-1, 1}) {
+            if (coords[d] + sign < 0 || coords[d] + sign >= shape[d]) continue;
+            if (labels[i + sign * strides[d]] != label) continue;
+            if (faces == 0) first_axis = d;
+            else if (faces == 1) opposite_faces = first_axis == d;
+            ++faces;
+            if (faces > threshold && (!remove_thin || faces > 2)) return false;
         }
     }
-    for (int64_t i = i_lo; i < i_hi; ++i) {
-        const T lab = labels[i];
-        if (lab != 0) {
-            int face_count = 0;
-            int total_count = 0;
-            int first_idx = -1, second_idx = -1;
-            bool over_two = false;
-            for (size_t k = 0; k < offsets.size(); ++k) {
-                const auto& o = offsets[k];
-                bool in_bounds = true;
-                for (int d = 0; d < ndim; ++d) {
-                    if (o.dc[d] == 0) continue;
-                    int64_t nc = coords[d] + o.dc[d];
-                    if (nc < 0 || nc >= shape[d]) {
-                        in_bounds = false; break;
-                    }
-                }
-                if (!in_bounds) continue;
-                if (labels[i + o.flat_offset] != lab) continue;
-                ++total_count;
-                if (o.is_face) ++face_count;
-                if (first_idx < 0) first_idx = (int)k;
-                else if (second_idx < 0) second_idx = (int)k;
-                else { over_two = true; }
-                // Both ways of being marked only get harder as the
-                // counts grow: the stub rule needs face_count to stay
-                // at or below the threshold, the thin rule needs exactly
-                // two same-label neighbors. Once neither can hold, the
-                // remaining offsets cannot change the answer. Without
-                // this the thin mode walked all 3^n-1 offsets for every
-                // interior voxel and ran 2.5x slower than the face-only
-                // mode on a 3D image, where an interior voxel settles
-                // after its third neighbor.
-                if (face_count > threshold && (!remove_thin || over_two)) break;
+    if (faces <= threshold) return true;
+    if (!remove_thin || faces == 1 || (faces == 2 && !opposite_faces)) return false;
+
+    int neighbors = 0;
+    bool opposite = false;
+    visit_neighbors(shape, strides, coords, delta,
+        [&](int64_t offset, const std::vector<int64_t>& displacement) {
+            if (labels[i + offset] != label) return false;
+            if (++neighbors == 1) first = displacement;
+            else if (neighbors == 2) {
+                opposite = true;
+                for (size_t d = 0; d < shape.size(); ++d)
+                    if (first[d] != -displacement[d]) { opposite = false; break; }
+                if (!opposite) return true;
             }
-            if (face_count <= threshold) {
-                mark[i] = 1;
-            } else if (remove_thin && !over_two
-                       && total_count == 2 && second_idx >= 0
-                       && offsets[first_idx].opposite_idx == second_idx) {
-                mark[i] = 1;
-            }
-        }
-        // increment coords (row-major)
-        int d = ndim - 1;
-        ++coords[d];
-        while (d > 0 && coords[d] >= shape[d]) {
-            coords[d] = 0;
-            --d;
-            ++coords[d];
-        }
-    }
+            return neighbors > 2;
+        });
+    return neighbors == 2 && opposite;
 }
 
-}  // namespace despur_detail
+} // namespace despur_detail
 
-// Iter 0 is a parallel mark-bitmap scan over the full image; once we
-// know which pixels were zeroed, iter 1+ only re-examines their
-// face-neighbors (the small set of pixels that *could* have become
-// new spurs by losing a same-label connection). Iter-0 cost matches
-// a pure full-scan; iter 1+ cost stays flat as max_iters grows since
-// the frontier shrinks fast.
-//
-// Bench on macOS M1 Ultra (May 2026), 2000² microscopy seg:
-//   max_iters=1:  3.78ms  (matches a plain full-scan)
-//   max_iters=2:  5.44ms  (~10% faster than full-scan)
-//   max_iters=20: 5.99ms  (7.7× faster than full-scan = 46ms)
 template <typename T>
 inline int64_t delete_spurs_labels_nd_inplace(
-    T* labels,
-    const std::vector<int64_t>& shape,
-    int threshold = 1,
-    int max_iters = 20,
-    ForkJoinPool* pool = nullptr,
-    int n_threads = 1,
-    bool remove_thin = false)
-{
-    const int ndim = (int)shape.size();
-    if (ndim < 1) return 0;
+        T* labels, const std::vector<int64_t>& original_shape,
+        int threshold = 1, int max_iters = 20,
+        ForkJoinPool* pool = nullptr, int n_threads = 1,
+        bool remove_thin = false) {
     int64_t total = 1;
-    for (auto s : shape) total *= s;
-    if (total == 0) return 0;
-
-    std::vector<int64_t> strides(ndim);
-    strides[ndim - 1] = 1;
-    for (int d = ndim - 2; d >= 0; --d) strides[d] = strides[d + 1] * shape[d + 1];
-
-    auto coords_of = [&](int64_t i, std::vector<int64_t>& out) {
-        for (int d = 0; d < ndim; ++d) {
-            out[d] = i / strides[d];
-            i -= out[d] * strides[d];
-        }
-    };
-
-    const int nt = (pool && n_threads > 1) ? n_threads : 1;
-
-    // ND offsets table (used by count_and_mark_nd). Built once per call.
-    std::vector<despur_detail::NDOffset> nd_offsets =
-        despur_detail::build_nd_offsets(shape, strides, remove_thin);
-
-    // -- Iter 0: mark spurs in a shared bitmap via parallel slab
-    // dispatch, then zero them out. ``remove_thin`` also kills
-    // 1-voxel-wide straight interior pixels in the same pass.
+    std::vector<int64_t> shape;
+    for (int64_t n : original_shape) {
+        if (n == 0) return 0;
+        if (n < 0 || total > std::numeric_limits<int64_t>::max() / n)
+            throw std::overflow_error("invalid spur image shape");
+        total *= n;
+        if (n > 1) shape.push_back(n);
+    }
+    if (original_shape.empty() || max_iters == 0) return 0;
+    if (shape.empty()) shape.push_back(1);
+    const int rank = static_cast<int>(shape.size());
+    std::vector<int64_t> strides(rank, 1);
+    for (int d = rank - 2; d >= 0; --d) strides[d] = strides[d + 1] * shape[d + 1];
+    const int nt = pool && n_threads > 1 && total >= 8192 ? n_threads : 1;
     std::vector<uint8_t> mark(total, 0);
-    {
-        const int64_t outer = shape[0];
-        const int64_t slab_size = strides[0];
-        if (nt > 1) {
-            std::atomic<int64_t> next_slab{0};
-            const int64_t chunk_slabs = std::max<int64_t>(1, outer / (nt * 4));
-            pool->parallel([&]() {
-                while (true) {
-                    int64_t s_lo = next_slab.fetch_add(chunk_slabs);
-                    if (s_lo >= outer) break;
-                    int64_t s_hi = std::min(outer, s_lo + chunk_slabs);
-                    despur_detail::count_and_mark_nd<T>(
-                        labels, mark.data(), shape, strides, nd_offsets,
-                        threshold,
-                        s_lo * slab_size, s_hi * slab_size, remove_thin);
-                }
-            });
-        } else {
-            despur_detail::count_and_mark_nd<T>(
-                labels, mark.data(), shape, strides, nd_offsets,
-                threshold, 0, total, remove_thin);
-        }
-    }
-
-    // Apply iter 0 removals. Sequential is fine — pure linear write.
+    std::vector<int64_t> frontier, removed;
+    bool full_scan = true;
     int64_t total_removed = 0;
-    for (int64_t i = 0; i < total; ++i) {
-        if (mark[i]) { labels[i] = 0; ++total_removed; }
-    }
-    if (total_removed == 0) return 0;
-    if (max_iters <= 1) return total_removed;
-
-    // -- Collect spurs list from the mark bitmap (parallel scan over
-    // mark[], one pass). Each thread emits indices where mark==1 into
-    // a local vector; we concat at the end. Spurs are the seeds for
-    // the iter-1 frontier.
-    std::vector<std::vector<int64_t>> per_thread_spurs(nt);
-    if (nt > 1) {
-        std::atomic<int> tid_counter{0};
-        std::atomic<int64_t> next_slab{0};
-        const int64_t outer = shape[0];
-        const int64_t slab_size = strides[0];
-        const int64_t chunk_slabs = std::max<int64_t>(1, outer / (nt * 4));
-        pool->parallel([&]() {
-            const int tid = tid_counter.fetch_add(1);
-            if (tid >= nt) return;
-            auto& local = per_thread_spurs[tid];
-            local.reserve(64);
-            while (true) {
-                int64_t s_lo = next_slab.fetch_add(chunk_slabs);
-                if (s_lo >= outer) break;
-                int64_t s_hi = std::min(outer, s_lo + chunk_slabs);
-                int64_t i_lo = s_lo * slab_size;
-                int64_t i_hi = s_hi * slab_size;
-                for (int64_t i = i_lo; i < i_hi; ++i) {
-                    if (mark[i]) local.push_back(i);
-                }
-            }
-        });
-    } else {
-        per_thread_spurs[0].reserve(64);
-        for (int64_t i = 0; i < total; ++i) {
-            if (mark[i]) per_thread_spurs[0].push_back(i);
-        }
-    }
-    std::vector<int64_t> spurs;
-    {
-        size_t n = 0;
-        for (auto& v : per_thread_spurs) n += v.size();
-        spurs.reserve(n);
-        for (auto& v : per_thread_spurs)
-            spurs.insert(spurs.end(), v.begin(), v.end());
-    }
-
-    // -- Build iter-1 frontier: face-neighbors of every spur whose
-    // label is still non-zero. We walk the (small) spurs list in
-    // parallel and emit candidates to per-thread vectors; the final
-    // concatenated list is sort+unique'd to dedup.
-    std::vector<std::vector<int64_t>> per_thread_nbrs(nt);
-    if (nt > 1 && spurs.size() >= 256) {
-        std::atomic<int> tid_counter{0};
-        std::atomic<int64_t> next_chunk{0};
-        const int64_t chunk = std::max<int64_t>(
-            64, (int64_t)spurs.size() / (nt * 4));
-        pool->parallel([&]() {
-            const int tid = tid_counter.fetch_add(1);
-            if (tid >= nt) return;
-            auto& local = per_thread_nbrs[tid];
-            local.reserve(spurs.size() * 4 / nt + 64);
-            std::vector<int64_t> c(ndim, 0);
-            while (true) {
-                int64_t lo = next_chunk.fetch_add(chunk);
-                if (lo >= (int64_t)spurs.size()) break;
-                int64_t hi = std::min((int64_t)spurs.size(), lo + chunk);
-                for (int64_t k = lo; k < hi; ++k) {
-                    int64_t i = spurs[k];
-                    coords_of(i, c);
-                    for (int d = 0; d < ndim; ++d) {
-                        if (c[d] > 0) {
-                            int64_t j = i - strides[d];
-                            if (labels[j] != 0) local.push_back(j);
-                        }
-                        if (c[d] + 1 < shape[d]) {
-                            int64_t j = i + strides[d];
-                            if (labels[j] != 0) local.push_back(j);
-                        }
+    std::vector<int64_t> coords(rank), delta(rank), first(rank);
+    for (int round = 0; max_iters < 0 || round < max_iters; ++round) {
+        if (full_scan) {
+            auto scan = [&](int64_t lo, int64_t hi) {
+                std::vector<int64_t> c(rank), step(rank), first_neighbor(rank);
+                despur_detail::coordinates(lo, strides, c);
+                for (int64_t i = lo; i < hi; ++i) {
+                    mark[i] = despur_detail::should_remove(labels, i, shape, strides,
+                        c, step, first_neighbor, threshold, remove_thin);
+                    for (int d = rank - 1; d >= 0; --d) {
+                        if (++c[d] < shape[d]) break;
+                        c[d] = 0;
                     }
                 }
-            }
-        });
-    } else {
-        per_thread_nbrs[0].reserve(spurs.size() * 4);
-        std::vector<int64_t> c(ndim, 0);
-        for (int64_t i : spurs) {
-            coords_of(i, c);
-            for (int d = 0; d < ndim; ++d) {
-                if (c[d] > 0) {
-                    int64_t j = i - strides[d];
-                    if (labels[j] != 0) per_thread_nbrs[0].push_back(j);
-                }
-                if (c[d] + 1 < shape[d]) {
-                    int64_t j = i + strides[d];
-                    if (labels[j] != 0) per_thread_nbrs[0].push_back(j);
-                }
-            }
-        }
-    }
-    std::vector<int64_t> frontier;
-    {
-        size_t n = 0;
-        for (auto& v : per_thread_nbrs) n += v.size();
-        frontier.reserve(n);
-        for (auto& v : per_thread_nbrs)
-            frontier.insert(frontier.end(), v.begin(), v.end());
-    }
-    // Dedup (a pixel can be a face-neighbor of multiple spurs).
-    std::sort(frontier.begin(), frontier.end());
-    frontier.erase(std::unique(frontier.begin(), frontier.end()),
-                    frontier.end());
-
-    if (frontier.empty()) return total_removed;
-
-    // -- Iter 1+: BFS on the shrinking frontier. Reuse mark as the
-    // "in-frontier" set across iters: a pixel is in this iter's
-    // frontier iff mark[i] == 1. Reset mark[i] = 0 once processed.
-    // (Old mark==1 entries from iter 0 are about to be overwritten —
-    // first reset them, then mark the new frontier.)
-    std::fill(mark.begin(), mark.end(), 0);
-    for (int64_t i : frontier) mark[i] = 1;
-
-    std::vector<int64_t> coords_tmp(ndim, 0);
-    std::vector<int64_t> next_frontier;
-    std::vector<int64_t> just_removed;
-    for (int iter = 1; iter < max_iters; ++iter) {
-        just_removed.clear();
-        for (int64_t i : frontier) {
-            mark[i] = 0;
-            const T lab = labels[i];
-            if (lab == 0) continue;
-            coords_of(i, coords_tmp);
-            int same = 0;
-            for (int d = 0; d < ndim; ++d) {
-                if (coords_tmp[d] > 0 && labels[i - strides[d]] == lab) ++same;
-                if (coords_tmp[d] + 1 < shape[d]
-                    && labels[i + strides[d]] == lab) ++same;
-            }
-            if (same <= threshold) just_removed.push_back(i);
-        }
-        if (just_removed.empty()) break;
-
-        for (int64_t i : just_removed) labels[i] = 0;
-        next_frontier.clear();
-        for (int64_t i : just_removed) {
-            coords_of(i, coords_tmp);
-            for (int d = 0; d < ndim; ++d) {
-                if (coords_tmp[d] > 0) {
-                    int64_t j = i - strides[d];
-                    if (labels[j] != 0 && !mark[j]) {
-                        mark[j] = 1;
-                        next_frontier.push_back(j);
+            };
+            if (nt == 1) scan(0, total);
+            else {
+                std::atomic<int64_t> next{0};
+                const int64_t block = std::max<int64_t>(4096, total / (nt * 4));
+                pool->parallel([&]() {
+                    for (;;) {
+                        const int64_t lo = next.fetch_add(block);
+                        if (lo >= total) break;
+                        scan(lo, std::min(total, lo + block));
                     }
-                }
-                if (coords_tmp[d] + 1 < shape[d]) {
-                    int64_t j = i + strides[d];
-                    if (labels[j] != 0 && !mark[j]) {
-                        mark[j] = 1;
-                        next_frontier.push_back(j);
-                    }
+                });
+            }
+        } else {
+            for (int64_t i : frontier) {
+                despur_detail::coordinates(i, strides, coords);
+                mark[i] = despur_detail::should_remove(labels, i, shape, strides,
+                    coords, delta, first, threshold, remove_thin);
+            }
+        }
+        removed.clear();
+        auto apply = [&](int64_t i) {
+            if (mark[i]) { labels[i] = 0; mark[i] = 0; removed.push_back(i); }
+        };
+        if (full_scan) for (int64_t i = 0; i < total; ++i) apply(i);
+        else for (int64_t i : frontier) apply(i);
+        if (removed.empty()) break;
+        total_removed += static_cast<int64_t>(removed.size());
+        if (total_removed == total || (max_iters >= 0 && round + 1 == max_iters)) break;
+
+        // A dense removal wave is cheaper to rescan than to enumerate all
+        // affected neighborhoods. Sparse waves retain the frontier shortcut.
+        int64_t neighborhood = 2 * rank;
+        if (remove_thin) {
+            neighborhood = 1;
+            for (int64_t n : shape) {
+                if (neighborhood > total / std::min<int64_t>(n, 3)) { neighborhood = total; break; }
+                neighborhood *= std::min<int64_t>(n, 3);
+            }
+        }
+        full_scan = static_cast<int64_t>(removed.size()) > total / std::max<int64_t>(1, neighborhood);
+        frontier.clear();
+        if (full_scan) continue;
+        auto enqueue = [&](int64_t i) {
+            if (labels[i] != 0 && !mark[i]) { mark[i] = 1; frontier.push_back(i); }
+        };
+        for (int64_t i : removed) {
+            despur_detail::coordinates(i, strides, coords);
+            if (remove_thin) {
+                despur_detail::visit_neighbors(shape, strides, coords, delta,
+                    [&](int64_t offset, const auto&) { enqueue(i + offset); return false; });
+            } else {
+                for (int d = 0; d < rank; ++d) {
+                    if (coords[d] > 0) enqueue(i - strides[d]);
+                    if (coords[d] + 1 < shape[d]) enqueue(i + strides[d]);
                 }
             }
         }
-        total_removed += (int64_t)just_removed.size();
-        std::swap(frontier, next_frontier);
-        if (frontier.empty()) break;
+        if (!full_scan && frontier.empty()) break;
     }
     return total_removed;
 }
-
-}  // namespace ncolor_cpp
+} // namespace ncolor_cpp

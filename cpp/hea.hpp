@@ -23,6 +23,8 @@
 #include <algorithm>
 #include "tabucol.hpp"
 
+#include "timing.hpp"
+
 namespace ncolor_cpp {
 
 inline int count_conflicts_csr(const int32_t* indptr, const int32_t* indices,
@@ -101,7 +103,7 @@ inline void gpx_crossover(
     }
 }
 
-// Run HEA on a CSR graph. `colors` is initialised in-place (if it
+// Run HEA on a CSR graph. `colors` is initialized in-place (if it
 // already contains a valid k-coloring, the function returns
 // immediately with that). Returns true if a 0-conflict k-coloring was
 // found.
@@ -136,8 +138,7 @@ inline bool hea(
     // Helper: has the wall-clock deadline expired?
     auto past_deadline = [&]() -> bool {
         return deadline_ns > 0 &&
-               std::chrono::steady_clock::now()
-                   .time_since_epoch().count() > deadline_ns;
+               steady_time_ns() > deadline_ns;
     };
 
     // Build initial population: random colorings + brief TabuCol. Each

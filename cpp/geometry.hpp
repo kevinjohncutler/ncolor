@@ -1,100 +1,15 @@
-// Per-cell geometric features + graph 2-hop CSR construction.
-//
-// Both routines are simple single-pass kernels that were the dominant
-// Python-side bottlenecks in _geometric_fast.py after the Kempe-SA loop
-// moved to C++. Pure C++; no pybind/numpy dependencies in this header.
+// Graph helpers for two-hop neighbors and symmetric pair adjacency.
+// Pure C++; no Python dependencies.
 
 #pragma once
 
 #include <vector>
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
+#include <limits>
+#include <stdexcept>
 
 namespace ncolor_cpp {
-
-// Per-cell geometric features computed from a 2-D label image in a
-// single pass over the pixels.
-struct CellGeom {
-    double cy;       // centroid y
-    double cx;       // centroid x
-    double axis_y;   // major axis unit vector (y component)
-    double axis_x;   // major axis unit vector (x component)
-    double ecc;      // eccentricity (in [0, 1))
-    int32_t area;
-};
-
-template <typename L>
-inline void per_cell_geometry(
-    const L* labels, int64_t H, int64_t W, int32_t N,
-    std::vector<CellGeom>& out,
-    // Optional: extract a per-label LUT from a second label image
-    // (e.g. an existing 4-coloring) in the same pixel pass. Saves a
-    // separate np.unique on the input label image, which scales as
-    // O(M log N) and dominated geometric_fast's runtime at high N.
-    const uint8_t* second_lookup = nullptr,
-    uint8_t* second_lut_out = nullptr)
-{
-    // Accumulate moments per label in one image pass.
-    const size_t Nplus = static_cast<size_t>(N) + 1;
-    std::vector<int64_t> n(Nplus, 0);
-    std::vector<double>  sy(Nplus, 0.0), sx(Nplus, 0.0);
-    std::vector<double>  syy(Nplus, 0.0), sxx(Nplus, 0.0), sxy(Nplus, 0.0);
-    if (second_lut_out) std::fill(second_lut_out, second_lut_out + Nplus, 0);
-    const int64_t HW = H * W;
-    for (int64_t i = 0; i < HW; ++i) {
-        const int64_t lab = static_cast<int64_t>(labels[i]);
-        if (lab > 0 && lab <= N) {
-            const double y = static_cast<double>(i / W);
-            const double x = static_cast<double>(i % W);
-            n[lab]   += 1;
-            sy[lab]  += y;
-            sx[lab]  += x;
-            syy[lab] += y * y;
-            sxx[lab] += x * x;
-            sxy[lab] += y * x;
-            // First-pixel LUT (only writes once per label since 0 = unset
-            // and we only write when the slot is still 0).
-            if (second_lookup && second_lut_out && second_lut_out[lab] == 0) {
-                second_lut_out[lab] = second_lookup[i];
-            }
-        }
-    }
-    out.assign(Nplus, CellGeom{0.0, 0.0, 1.0, 0.0, 0.0, 0});
-    for (int32_t u = 1; u <= N; ++u) {
-        const int64_t area = n[u];
-        if (area == 0) continue;
-        const double cy = sy[u] / static_cast<double>(area);
-        const double cx = sx[u] / static_cast<double>(area);
-        out[u].cy = cy; out[u].cx = cx; out[u].area = static_cast<int32_t>(area);
-        if (area < 3) {
-            out[u].axis_y = 1.0; out[u].axis_x = 0.0; out[u].ecc = 0.0;
-            continue;
-        }
-        const double myy = syy[u] / static_cast<double>(area) - cy * cy;
-        const double mxx = sxx[u] / static_cast<double>(area) - cx * cx;
-        const double mxy = sxy[u] / static_cast<double>(area) - cy * cx;
-        // 2x2 covariance eigendecomp (closed form).
-        const double tr  = myy + mxx;
-        const double det = myy * mxx - mxy * mxy;
-        const double disc = std::max(tr * tr / 4.0 - det, 0.0);
-        const double sq = std::sqrt(disc);
-        double big   = tr / 2.0 + sq;
-        double small = tr / 2.0 - sq;
-        big   = std::max(big, 1e-6);
-        small = std::max(small, 1e-6);
-        out[u].ecc = std::sqrt(std::max(0.0, 1.0 - small / big));
-        // Eigenvector for the larger eigenvalue.
-        double ay, ax;
-        if (std::abs(mxy) > 1e-12) { ay = big - mxx; ax = mxy; }
-        else if (myy >= mxx)       { ay = 1.0; ax = 0.0; }
-        else                        { ay = 0.0; ax = 1.0; }
-        const double norm = std::hypot(ay, ax);
-        if (norm > 0.0) { ay /= norm; ax /= norm; }
-        out[u].axis_y = ay; out[u].axis_x = ax;
-    }
-}
-
 
 // 2-hop neighbors of a graph in CSR form.
 // out[u] = { v : graph_distance(u, v) == 2 }. Both directions emitted
@@ -110,7 +25,7 @@ inline void compute_two_hop_csr(
     out_indptr.assign(static_cast<size_t>(N) + 1, 0);
 
     // Epoch-tag scratch: seen[v] == u + 1 means "marked during u's pass"
-    // (offset by 1 so the zero-initialised state means "never seen").
+    // (offset by 1 so the zero-initialized state means "never seen").
     std::vector<int32_t> seen(static_cast<size_t>(N), 0);
 
     // First pass: count outgoing 2-hop edges per cell.
@@ -135,18 +50,14 @@ inline void compute_two_hop_csr(
         out_indptr[u + 1] = count;
     }
 
-    // Prefix sum to indptr.
-    int32_t total = 0;
+    // Accumulate row ends without overwriting counts before they are read.
+    int64_t total = 0;
     for (int32_t u = 0; u < N; ++u) {
-        const int32_t c = out_indptr[u + 1];
-        out_indptr[u + 1] = total;
-        total += c;
+        total += out_indptr[u + 1];
+        if (total > std::numeric_limits<int32_t>::max())
+            throw std::overflow_error("two-hop graph exceeds int32 edge capacity");
+        out_indptr[u + 1] = static_cast<int32_t>(total);
     }
-    // Now out_indptr[u+1] is the START of u's row, and total is the
-    // grand total. Shift so out_indptr[u] is the start of u's row.
-    for (int32_t u = N; u > 0; --u) out_indptr[u] = out_indptr[u - 1];
-    out_indptr[0] = 0;
-    out_indptr[N] = total;
 
     out_indices.assign(static_cast<size_t>(total), 0);
 

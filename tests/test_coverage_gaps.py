@@ -816,13 +816,18 @@ def test_cpu_model_win32_failure(monkeypatch):
     assert _smt._cpu_model() == "fallback-win"
 
 
+def _pack_lpi_record(relationship, size):
+    import struct
+    return struct.pack("<II", relationship, size).ljust(size, b"\0")
+
+
 def test_physical_cores_win32_counts_core_records(monkeypatch):
     """One RelationProcessorCore record per physical core, whatever the
     SMT layout; other relationship kinds in the buffer are skipped."""
     monkeypatch.setattr(_smt.sys, "platform", "win32")
-    raw = (_smt._pack_lpi_record(0, 48) * 6      # 6 cores
-           + _smt._pack_lpi_record(2, 64)        # a cache record
-           + _smt._pack_lpi_record(3, 40))       # a group record
+    raw = (_pack_lpi_record(0, 48) * 6      # 6 cores
+           + _pack_lpi_record(2, 64)        # a cache record
+           + _pack_lpi_record(3, 40))       # a group record
     monkeypatch.setattr(_smt, "_query_logical_processor_information",
                         lambda: raw)
     assert _smt._physical_cores() == 6
@@ -881,7 +886,7 @@ def test_physical_cores_win32_empty_buffer_falls_back(monkeypatch):
     """A buffer with no core records is treated as a failure."""
     monkeypatch.setattr(_smt.sys, "platform", "win32")
     monkeypatch.setattr(_smt, "_query_logical_processor_information",
-                        lambda: _smt._pack_lpi_record(2, 64))   # cache only
+                        lambda: _pack_lpi_record(2, 64))   # cache only
     monkeypatch.setattr(_smt.os, "cpu_count", lambda: 10)
     assert _smt._physical_cores() == 10
 

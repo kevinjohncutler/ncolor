@@ -32,6 +32,7 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 
 
@@ -79,14 +80,6 @@ def _cpu_model() -> str:
 
 
 _RELATION_PROCESSOR_CORE = 0
-
-
-def _pack_lpi_record(relationship: int, size: int) -> bytes:
-    """A SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX record header padded to
-    ``size`` bytes (the payload is irrelevant to the core count). Used by
-    the tests to build a fake buffer."""
-    import struct
-    return struct.pack("<II", relationship, size).ljust(size, b"\0")
 
 
 def _query_logical_processor_information() -> bytes:
@@ -176,14 +169,32 @@ def _load_cache() -> dict:
     if not CACHE_PATH.exists():
         return {}
     try:
-        return json.loads(CACHE_PATH.read_text())
+        data = json.loads(CACHE_PATH.read_text())
+        if not isinstance(data, dict):
+            return {}
+        valid = {}
+        for key, value in data.items():
+            try:
+                count = int(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if count > 0 and (not isinstance(value, float) or count == value):
+                valid[key] = count
+        return valid
     except (OSError, json.JSONDecodeError):
         return {}
 
 
 def _save_cache(data: dict) -> None:
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CACHE_PATH.write_text(json.dumps(data, indent=2, sort_keys=True))
+    fd, name = tempfile.mkstemp(prefix=".smt-", dir=CACHE_PATH.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+        os.replace(temporary, CACHE_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _make_calibration_mask(H: int, seed: int = 0):

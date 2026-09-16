@@ -38,6 +38,8 @@
 #include "tabucol.hpp"
 #include "threadpool.h"
 
+#include "timing.hpp"
+
 namespace ncolor_cpp {
 
 // Renumber the colors actually present to a dense 1..k, preserving their
@@ -117,6 +119,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                          int& last_n_conflicts_,
                          PickerScratch& scratch,
                          ForkJoinPool* pool_, int n_threads_) {
+    validate_coloring_budget(n_colors, max_depth);
     auto& per_attempt_colors_ = scratch.per_attempt_colors_;
     auto& per_attempt_ok_ = scratch.per_attempt_ok_;
     constexpr int attempts_per_n = 16;
@@ -176,7 +179,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
             ? (2LL * 1000LL * 1000LL)
             : (5LL * 1000LL * 1000LL);
         const int64_t clb_deadline_ns =
-            clb_t0.time_since_epoch().count() + budget_ns;
+            steady_time_ns(clb_t0) + budget_ns;
         const int omega = ncolor_cpp::clique_lower_bound(
             N, indptr_.data(), indices_.data(),
             /*target=*/n_colors + 1, clb_deadline_ns);
@@ -187,10 +190,23 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 "[clique-lb] N=%d ω≥%d (target=%d) %.1fms\n",
                 N, omega, n_colors + 1, clb_ms);
         }
-        if (omega > cur_n) cur_n = omega;  // χ ≥ ω, so skip doomed cur_n values
+        if (omega > cur_n) cur_n = std::min(omega, 255);  // χ ≥ ω, so skip doomed cur_n values
     }
     for (int depth = 0; depth < max_depth && !ok; ++depth) {
-        const auto depth_t0 = std::chrono::steady_clock::now();
+        const auto depth_t0 = dbg_solve ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        // A palette supplied for the original target has no entries for
+        // escalated colors. Preserve its original block and zero-pad new
+        // colors so every attempt uses the correct row stride.
+        std::vector<double> expanded_palette;
+        const double* attempt_palette = de_table;
+        if (de_table && cur_n != n_colors) {
+            expanded_palette.assign(static_cast<size_t>(cur_n + 1) * (cur_n + 1), 0.0);
+            for (int c = 0; c <= n_colors; ++c)
+                std::copy_n(de_table + c * (n_colors + 1), n_colors + 1,
+                            expanded_palette.data() + c * (cur_n + 1));
+            attempt_palette = expanded_palette.data();
+        }
         if (color_parallel) {
             const int local_cur_n = cur_n;
             const int local_depth = depth;
@@ -271,13 +287,10 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 }
             };
 
-            // Run-one-attempt body factored out so we can call it
-            // once sequentially as a warmup before paying pool-
-            // dispatch overhead, and dispatch the rest in parallel
-            // only on warmup failure.
+            // Each worker runs one independently seeded coloring attempt.
             auto run_one_attempt = [&, local_cur_n, local_depth, ip, ix](
                     int idx, const std::atomic<bool>* cancel,
-                    bool allow_tabucol, int64_t race_deadline_ns) -> int {
+                    int64_t race_deadline_ns) -> int {
                 auto& cv = per_attempt_colors_[idx];
                 const int attempt_offset = local_depth + idx;
                 // Special slot: branch-and-bound exact coloring
@@ -325,7 +338,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 const bool weighted_attempt = wobj_active &&
                                               (idx < attempts_per_n - 1);
                 const double* w_ptr = weighted_attempt ? edge_weights : nullptr;
-                const double* de_ptr = weighted_attempt ? de_table : nullptr;
+                const double* de_ptr = weighted_attempt ? attempt_palette : nullptr;
                 const int w_obj_local = weighted_attempt ? weight_obj : 0;
                 const bool finished = ncolor_cpp::color_graph_csr_legacy(
                     ip, ix, N, local_cur_n, rand_period,
@@ -343,12 +356,6 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 // fires for the user's target k. The `cancel`
                 // pointer lets the tabucol loop short-circuit
                 // when a sibling worker has already won.
-                // Disabled for the warmup attempt (allow_tabucol
-                // false): the warmup is meant to be a sub-ms
-                // fast-path; if WP+repair fails we'd rather fall
-                // through to the parallel race (which has
-                // sibling-cancellable tabucol) than burn up to
-                // 5 ms of un-cancellable budget here.
                 if (a_ok) {
                     const bool clean_wp_ok =
                         !(wp && !weighted_attempt) || !conflict;
@@ -361,7 +368,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 const bool tabu_could_matter =
                     best_cheap.load(std::memory_order_relaxed) == attempts_per_n
                     && idx < best_tabu.load(std::memory_order_relaxed);
-                if (!a_ok && local_cur_n == n_colors && allow_tabucol
+                if (!a_ok && local_cur_n == n_colors
                         && tabu_could_matter) {
                     for (int32_t u = 0; u < N; ++u) {
                         if (cv[u] < 1 || cv[u] > local_cur_n) {
@@ -398,8 +405,8 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
             {
                 std::atomic<int> next{0};
                 static const bool dbg_slots = std::getenv("NCOLOR_SLOT_DEBUG") != nullptr;
-                std::vector<double> slot_ms(attempts_per_n, -1.0);
-                std::vector<int> slot_done(attempts_per_n, 0);
+                std::vector<double> slot_ms(dbg_slots ? attempts_per_n : 0, -1.0);
+                std::vector<int> slot_done(dbg_slots ? attempts_per_n : 0, 0);
                 const auto race_t0 = std::chrono::steady_clock::now();
                 // Race wall-clock deadline shared across all slots:
                 // bounds time wasted on infeasible-at-cur_n graphs.
@@ -421,7 +428,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                     ? (15LL * 1000LL * 1000LL)
                     : (50LL * 1000LL * 1000LL);
                 const int64_t race_deadline_ns =
-                    race_t0.time_since_epoch().count()
+                    steady_time_ns(race_t0)
                     + race_budget_ns;
                 pool_->parallel([&]() {
                     int idx;
@@ -432,9 +439,10 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                         // A cheap win below this index settles the
                         // race whatever this slot would have done.
                         if (idx > best_cheap.load(std::memory_order_relaxed)) break;
-                        const auto t0 = std::chrono::steady_clock::now();
+                        const auto t0 = dbg_slots ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
                         const int kind = run_one_attempt(
-                            idx, &slot_cancel[idx], /*allow_tabucol=*/true,
+                            idx, &slot_cancel[idx],
                             race_deadline_ns);
                         if (dbg_slots) {
                             const auto t1 = std::chrono::steady_clock::now();
@@ -491,7 +499,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 const bool weighted_attempt = wobj_active &&
                                               (attempt < attempts_per_n - 1);
                 const double* w_ptr = weighted_attempt ? edge_weights : nullptr;
-                const double* de_ptr = weighted_attempt ? de_table : nullptr;
+                const double* de_ptr = weighted_attempt ? attempt_palette : nullptr;
                 const int w_obj_local = weighted_attempt ? weight_obj : 0;
                 const bool finished = ncolor_cpp::color_graph_csr_legacy(
                     indptr_.data(), indices_.data(), N,
@@ -591,14 +599,12 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                     ? (15LL * 1000LL * 1000LL)
                     : (50LL * 1000LL * 1000LL);
                 const int64_t deadline_ns =
-                    std::chrono::steady_clock::now()
-                        .time_since_epoch().count() + budget_ns;
+                    steady_time_ns() + budget_ns;
                 std::vector<uint8_t> saved = colors_;
                 uint64_t base_seed =
                     (uint64_t)(depth + 1) * 0x9e3779b97f4a7c15ULL;
                 for (int s = 0; s < 24 && !ok; ++s) {
-                    if (std::chrono::steady_clock::now()
-                            .time_since_epoch().count() > deadline_ns) break;
+                    if (steady_time_ns() > deadline_ns) break;
                     uint64_t rs = base_seed + (uint64_t)s * 0xdeadbeefcafebabeULL;
                     auto next32 = [&]() -> uint32_t {
                         rs = rs * 6364136223846793005ULL + 1442695040888963407ULL;
@@ -665,7 +671,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 static const bool dbg_bb = std::getenv("NCOLOR_BB_DEBUG") != nullptr;
                 const auto bb_t0 = std::chrono::steady_clock::now();
                 const int64_t bb_deadline_ns =
-                    bb_t0.time_since_epoch().count() + bb_budget_ns;
+                    steady_time_ns(bb_t0) + bb_budget_ns;
                 const bool bb_ok = ncolor_cpp::bb_dsatur(
                         indptr_.data(), indices_.data(),
                         N, cur_n, bb_colors, node_budget,
@@ -691,7 +697,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 static const bool dbg_hea = std::getenv("NCOLOR_BB_DEBUG") != nullptr;
                 const auto hea_t0 = std::chrono::steady_clock::now();
                 const int64_t hea_deadline_ns =
-                    hea_t0.time_since_epoch().count() + hea_budget_ns;
+                    steady_time_ns(hea_t0) + hea_budget_ns;
                 const bool hea_ok = ncolor_cpp::hea(
                         indptr_.data(), indices_.data(),
                         N, cur_n, hea_colors,
@@ -722,6 +728,7 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
                 depth, cur_n, (int)ok, depth_ms);
         }
         if (!ok) {
+            if (cur_n == 255) break;
             ++cur_n;
             // ndim-aware floor on the FIRST failure only. Planar
             // (ndim=2) inputs hit ≤ 4 colors by the 4-color theorem,
@@ -733,7 +740,8 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
             // user-supplied n_colors and planar workloads remain
             // bit-identical to the pre-patch behavior.
             if (depth == 0 && ndim >= 3) {
-                const int floor_n = 3 * ndim - 2 + (wrap ? 1 : 0);
+                const int floor_n = static_cast<int>(std::min<int64_t>(
+                    255, 3LL * ndim - 2 + (wrap ? 1 : 0)));
                 if (cur_n < floor_n) cur_n = floor_n;
             }
         }

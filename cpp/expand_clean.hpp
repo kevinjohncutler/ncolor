@@ -129,8 +129,9 @@ inline SubspaceAntipodalTable build_subspace_antipodal_table(
 // up by the peel-back automatically, and any cascading thin tails get
 // peeled away too. One fused scan + cascade replaces a chain of
 // (bridge_check, compute_face_count, despur) calls.
+template <typename Distance>
 inline int64_t bridge_check_subspace_nd(
-    int32_t* labels, int32_t* dist,
+    int32_t* labels, Distance* dist,
     const std::vector<int64_t>& shape,
     const std::vector<int>& subset_axes,
     ForkJoinPool* pool = nullptr, int n_threads = 1,
@@ -640,7 +641,8 @@ inline void chamfer_st_l1_axis(int32_t* lbl, int32_t* dist,
                                 const std::vector<int64_t>& shape,
                                 int ax,
                                 ForkJoinPool& pool, int n_threads,
-                                bool barriers_present, bool wrap = false)
+                                bool barriers_present, bool wrap = false,
+                                   bool keep_distances = true)
 {
     const int ndim = (int)shape.size();
     constexpr int64_t MIN_BAND_W = 256;
@@ -750,12 +752,13 @@ inline void envelope_pass_strided_abc_barrier(
 // of expand_labels_inplace for one axis, with the expand_clean_detail
 // barrier-aware envelope_pass when needed.
 inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
-                                   int32_t* t_lbl, int32_t* t_dist,
+                                   ExpandBuffers& bufs,
                                    const std::vector<int64_t>& shape,
                                    int ax,
                                    ForkJoinPool& pool, int n_threads,
                                    std::vector<EnvelopeScratch>& scratch,
-                                   bool barriers_present, bool wrap = false)
+                                   bool barriers_present, bool wrap = false,
+                                   bool keep_distances = true)
 {
     const int ndim = (int)shape.size();
     const int64_t n = shape[ax];
@@ -794,13 +797,16 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
         }
         return;
     }
+    int32_t* t_lbl = bufs.lbl_T();
+    int32_t* t_dist = bufs.dist_T();
     batch_transpose<int32_t>(h_lbl, h_dist, t_lbl, t_dist, A, B, C, pool, n_threads);
     if (barriers_present) {
         envelope_pass_barrier(t_lbl, t_dist, A * C, B, pool, n_threads, scratch, wrap);
     } else {
         envelope_pass(t_lbl, t_dist, A * C, B, pool, n_threads, scratch, wrap);
     }
-    batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads);
+    batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads,
+                             keep_distances || ax != 0);
 }
 
 
@@ -812,10 +818,14 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
 // sweeps respect barriers (skip writes, refuse to propagate from them).
 //
 // p: 1 = L1 (Saito-Toriwaki), 2 = L2 (Felzenszwalb). Default 2.
+// keep_distances=false skips the last distance transpose where possible.
+// Final cleanup reads labels and only writes barrier marks into distances;
+// it does not need the final distances when there is no subsequent sweep.
 inline void expand_labels_clean_nd_inplace(
     const int32_t* input, ExpandBuffers& bufs,
     const std::vector<int64_t>& input_shape,
-    ForkJoinPool& pool, int n_threads, int p = 2, bool wrap = false)
+    ForkJoinPool& pool, int n_threads, int p = 2, bool wrap = false,
+    bool keep_distances = true)
 {
     std::vector<int64_t> shape;
     for (int64_t n : input_shape) if (n != 1) shape.push_back(n);
@@ -827,8 +837,8 @@ inline void expand_labels_clean_nd_inplace(
     if (total == 0) return;
     int32_t* h_lbl  = bufs.lbl();
     int32_t* h_dist = bufs.dist();
-    int32_t* t_lbl  = bufs.lbl_T();
-    int32_t* t_dist = bufs.dist_T();
+    const bool wide = p == 2 && l2_needs_wide_distance(shape);
+    if (wide) bufs.use_wide_distance();
 
     if (input != h_lbl) {
         std::memcpy(h_lbl, input, total * sizeof(int32_t));
@@ -847,10 +857,12 @@ inline void expand_labels_clean_nd_inplace(
         if (p == 1) {
             chamfer_st_l1_axis(h_lbl, h_dist, shape, ax,
                                 pool, n_threads, barriers_present, wrap);
+        } else if (wide) {
+            l2_sweep_axis_wide(h_lbl, bufs.dist64(), shape, ax, pool, n_threads, wrap);
         } else {
-            l2_sweep_axis_barrier(h_lbl, h_dist, t_lbl, t_dist, shape, ax,
+            l2_sweep_axis_barrier(h_lbl, h_dist, bufs, shape, ax,
                                    pool, n_threads, bufs.scratch(),
-                                   barriers_present, wrap);
+                                   barriers_present, wrap, keep_distances);
         }
         // After this axis, the swept subspace is {ax, ax+1, ..., ndim-1}.
         // Skip the innermost (subspace size 1 false-positives); for any
@@ -861,9 +873,11 @@ inline void expand_labels_clean_nd_inplace(
         if (subspace_size >= 2) {
             std::vector<int> subset_axes(subspace_size);
             for (int j = 0; j < subspace_size; ++j) subset_axes[j] = ax + j;
-            int64_t n_new = bridge_check_subspace_nd(
-                h_lbl, h_dist, shape, subset_axes, &pool, n_threads,
-                &bufs.nbr_scratch(), wrap);
+            const int64_t n_new = wide
+                ? bridge_check_subspace_nd(h_lbl, bufs.dist64(), shape, subset_axes,
+                    &pool, n_threads, &bufs.nbr_scratch(), wrap)
+                : bridge_check_subspace_nd(h_lbl, h_dist, shape, subset_axes,
+                    &pool, n_threads, &bufs.nbr_scratch(), wrap);
             if (n_new > 0) barriers_present = true;
         }
     }
@@ -887,10 +901,11 @@ inline void expand_labels_clean_nd_inplace(
 inline void expand_labels_clean_inplace(
     const int32_t* input, ExpandBuffers& bufs,
     const std::vector<int64_t>& shape,
-    ForkJoinPool& pool, int n_threads, int p, bool wrap = false)
+    ForkJoinPool& pool, int n_threads, int p, bool wrap = false,
+    bool keep_distances = true)
 {
     expand_labels_clean_nd_inplace(
-        input, bufs, shape, pool, n_threads, p, wrap);
+        input, bufs, shape, pool, n_threads, p, wrap, keep_distances);
 }
 
 }  // namespace ncolor_cpp

@@ -33,7 +33,7 @@ The pieces, in pipeline order:
 | `picker.hpp` | the coloring picker: the race of strategies (`tabucol.hpp`, `bb_dsatur.hpp`, `hea.hpp`, `clique_lb.hpp`) that `label` and `color_graph` run |
 | `soft_color.hpp` | soft-constraint local search after the hard coloring |
 | `delete_spurs.hpp`, `delete_spurs_labels.hpp`, `fast_despur.hpp` | spur and thin-bridge removal |
-| `geometry.hpp`, `intrinsics.hpp` | N-D index helpers; portable bit intrinsics |
+| `geometry.hpp`, `intrinsics.hpp` | Graph adjacency helpers; portable bit intrinsics |
 
 Design notes, benchmarks and the reasoning behind the kernels are in
 [ARCHITECTURE.md](../ARCHITECTURE.md) at the repository root.

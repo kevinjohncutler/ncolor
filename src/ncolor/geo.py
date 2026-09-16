@@ -34,6 +34,7 @@ types.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 import os
 
 import numpy as np
@@ -58,7 +59,7 @@ def _require_shapely():
     return shapely
 
 
-def _geoms_from_geojson(obj, shapely):
+def _geoms_from_geojson(obj):
     """Extract a geometry list from a parsed GeoJSON mapping."""
     from shapely.geometry import shape
 
@@ -117,13 +118,12 @@ def _as_geometries(geoms):
 
     # GeoJSON mapping, or any object publishing __geo_interface__
     # (Fiona features, GeoPandas objects on older versions, ...).
-    if isinstance(geoms, dict):
-        return np.asarray(_geoms_from_geojson(geoms, shapely), dtype=object), None
-    if hasattr(geoms, "__geo_interface__") and not hasattr(geoms, "__len__"):
-        return _as_geometries(geoms.__geo_interface__)
-
     if isinstance(geoms, BaseGeometry):
         return np.asarray([geoms], dtype=object), None
+    if isinstance(geoms, Mapping):
+        return np.asarray(_geoms_from_geojson(geoms), dtype=object), None
+    if hasattr(geoms, "__geo_interface__"):
+        return _as_geometries(geoms.__geo_interface__)
 
     # A DataFrame-shaped object reaching this point has no geometry we
     # can use: either a plain pandas DataFrame, or a GeoDataFrame whose
@@ -142,11 +142,13 @@ def _as_geometries(geoms):
     for g in geoms:
         if g is None or isinstance(g, BaseGeometry):
             out.append(g)
-        elif isinstance(g, dict):
-            out.append(shape(g.get("geometry", g)))
+        elif isinstance(g, Mapping):
+            mapping = g.get("geometry", g)
+            out.append(None if mapping is None else shape(mapping))
         elif hasattr(g, "__geo_interface__"):
             gi = g.__geo_interface__
-            out.append(shape(gi.get("geometry", gi)))
+            mapping = gi.get("geometry", gi)
+            out.append(None if mapping is None else shape(mapping))
         else:
             raise TypeError(
                 f"cannot interpret {type(g).__name__} as a geometry; pass "
@@ -176,13 +178,14 @@ def _contact_lengths(shapely, geoms, pairs, tolerance):
     tolerance first, so features separated by a hairline gap still
     report the length of the seam that would close it.
     """
-    a = geoms[pairs[:, 0]]
-    b = geoms[pairs[:, 1]]
     if tolerance > 0:
-        half = float(tolerance) / 2.0
-        a = shapely.buffer(a, half)
-        b = shapely.buffer(b, half)
+        # Buffer each participating feature once, even when it has many neighbors.
+        vertices, inverse = np.unique(pairs, return_inverse=True)
+        buffered = shapely.buffer(geoms[vertices], float(tolerance) / 2.0)
+        indices = inverse.reshape(pairs.shape)
+        a, b = buffered[indices[:, 0]], buffered[indices[:, 1]]
         return shapely.length(shapely.intersection(a, b)) / 2.0
+    a, b = geoms[pairs[:, 0]], geoms[pairs[:, 1]]
     return shapely.length(shapely.intersection(a, b))
 
 
@@ -238,6 +241,13 @@ def connect(geoms, tolerance=0.0, min_shared_length=0.0,
 
 def _connect_arr(shapely, geoms, tolerance, min_shared_length, return_rejected):
     """connect() body, on an already-normalized geometry array."""
+    tolerance = float(tolerance)
+    if not np.isfinite(tolerance) or tolerance < 0:
+        raise ValueError("tolerance must be finite and nonnegative")
+    if min_shared_length is not None:
+        min_shared_length = float(min_shared_length)
+        if not np.isfinite(min_shared_length) or min_shared_length < 0:
+            raise ValueError("min_shared_length must be finite and nonnegative, or None")
     pairs = _candidate_pairs(shapely, geoms, tolerance)
 
     rejected = np.zeros((0, 2), dtype=np.int32)
@@ -335,6 +345,7 @@ def label(geoms, n=4, tolerance=0.0, min_shared_length=0.0, soft=True,
         if blank.any():
             colors = colors.copy()
             colors[blank] = 0
+            n_used = int(colors.max(initial=0))
 
     out = colors
     if return_frame:

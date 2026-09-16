@@ -78,6 +78,7 @@ inline double kempe_sa(
     double cur_loss  = params.alpha_2hop * static_cast<double>(n_2hop)
                      + params.gamma_iou  * iou_loss;
     double best_loss = cur_loss;
+    if (N <= 0 || params.n_colors < 2) return best_loss;
     std::vector<uint8_t> best_colors = colors;
 
     // --- RNG, scratch buffers. ---

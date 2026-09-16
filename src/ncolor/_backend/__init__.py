@@ -30,6 +30,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
@@ -64,7 +65,7 @@ def _on_remote_mount(path: Path) -> bool:
         if " on " not in line or " (" not in line:
             continue
         mount_point, opts = line.split(" on ", 1)[1].split(" (", 1)
-        if abs_path.startswith(mount_point.rstrip()) and (
+        if Path(abs_path).is_relative_to(mount_point) and (
             "smbfs" in opts or "nfs" in opts or "afpfs" in opts
         ):
             return True
@@ -99,23 +100,34 @@ def _local_cache_path(src: Path) -> Path:
 
 def _copy_off_remote(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, dst)
-    dst.chmod(0o755)
-    if sys.platform == "darwin":
-        # ``cp`` from a quarantined SMB mount inherits ``com.apple.quarantine``
-        # on the destination (even though the source xattr is hidden by smbfs).
-        # macOS Gatekeeper hangs on quarantined files; strip it.
-        subprocess.run(
-            ["xattr", "-d", "com.apple.quarantine", str(dst)],
-            check=False, stderr=subprocess.DEVNULL,
-        )
+    # Publish only complete binaries. Concurrent imports must never load a
+    # destination while another process is still writing its contents.
+    fd, name = tempfile.mkstemp(prefix=".ncolor-", dir=dst.parent)
+    os.close(fd)
+    temporary = Path(name)
+    try:
+        shutil.copyfile(src, temporary)
+        temporary.chmod(0o755)
+        if sys.platform == "darwin":
+            subprocess.run(
+                ["xattr", "-d", "com.apple.quarantine", str(temporary)],
+                check=False, stderr=subprocess.DEVNULL,
+            )
+        try:
+            os.replace(temporary, dst)
+        except PermissionError:
+            # Windows can lock a binary already published by another importer.
+            if not dst.is_file() or dst.stat().st_size != temporary.stat().st_size:
+                raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _load_impl():
     src = _find_impl()
     if _on_remote_mount(src):
         local = _local_cache_path(src)
-        if not local.exists():
+        if not local.exists() or local.stat().st_size != src.stat().st_size:
             _copy_off_remote(src, local)
         load_path = local
     else:

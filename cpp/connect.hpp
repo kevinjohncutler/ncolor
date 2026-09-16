@@ -58,8 +58,7 @@ constexpr bool mode_uses_primary(ReduceMode m) {
            m == ReduceMode::MeanInv;
 }
 constexpr bool mode_uses_count(ReduceMode m) {
-    return m == ReduceMode::Mean || m == ReduceMode::Count ||
-           m == ReduceMode::MeanInv;
+    return m != ReduceMode::Off;
 }
 
 // Boundary masks use one bit per axis, covering NumPy's maximum rank.
@@ -122,14 +121,15 @@ inline void ht_merge(const uint64_t* src, uint64_t* dst, uint64_t ht_size) {
 // updates actually needed for that mode.
 //
 // Per slot storage layouts (only fields used by the mode are touched):
-//   Min:      primary holds min(d) seen so far. counts unused.
-//   Max:      primary holds max(d). counts unused.
+//   Min:      primary holds min(d) seen so far.
+//   Max:      primary holds max(d).
 //   Mean:     primary holds sum(d). counts holds the pair-pixel count.
 //   Count:    counts holds the count. primary unused.
-//   Harmonic: primary holds sum(1 / (1 + d)). counts unused.
+//   Harmonic: primary holds sum(1 / (1 + d)).
+// All weighted modes collect counts for optional contact filtering.
 template <ReduceMode Mode>
 inline void ht_insert_acc(uint64_t* ht, double* primary, int32_t* counts,
-                          uint64_t ht_mask, uint64_t key, int32_t cost) {
+                          uint64_t ht_mask, uint64_t key, double cost) {
     const uint64_t h = ht_probe(ht, ht_mask, key);
     if (h > ht_mask) return;   // table full ⇒ drop (recovered on retry)
     const bool is_new = (ht[h] == HT_EMPTY);
@@ -153,6 +153,10 @@ inline void ht_insert_acc(uint64_t* ht, double* primary, int32_t* counts,
         const double contrib = 1.0 / (1.0 + static_cast<double>(cost));
         if (is_new) { primary[h] = contrib; counts[h] = 1; }
         else        { primary[h] += contrib; counts[h] += 1; }
+    }
+    if constexpr (Mode == ReduceMode::Min || Mode == ReduceMode::Max ||
+                  Mode == ReduceMode::Harmonic) {
+        if (is_new) counts[h] = 1; else ++counts[h];
     }
     // ReduceMode::Off: nothing else to do; key already inserted above.
 }
@@ -184,19 +188,11 @@ inline void ht_merge_acc(const uint64_t* src_ht,
         } else if constexpr (Mode == ReduceMode::Harmonic) {
             if (is_new) dst_primary[dh] = src_primary[h]; else dst_primary[dh] += src_primary[h];
         }
-    }
-}
-
-// Backward-compat aliases (the old Min-only API surface).
-inline void ht_insert_min(uint64_t* ht, int32_t* mins, uint64_t ht_mask,
-                          uint64_t key, int32_t cost) {
-    const uint64_t h = ht_probe(ht, ht_mask, key);
-    if (h > ht_mask) return;   // table full ⇒ drop (recovered on retry)
-    if (ht[h] == HT_EMPTY) {
-        ht[h] = key;
-        mins[h] = cost;
-    } else if (cost < mins[h]) {
-        mins[h] = cost;
+        if constexpr (Mode == ReduceMode::Min || Mode == ReduceMode::Max ||
+                      Mode == ReduceMode::Harmonic) {
+            if (is_new) dst_counts[dh] = src_counts[h];
+            else dst_counts[dh] += src_counts[h];
+        }
     }
 }
 
@@ -327,11 +323,11 @@ inline void build_forward_neighbors(
 // offsets. Templated on ``N_NBS`` so the per-pixel inner loop unrolls;
 // the offsets are hoisted into local int64s so the compiler keeps them
 // in registers across the x sweep.
-template <typename T, int N_NBS, ReduceMode Mode = ReduceMode::Off>
+template <typename T, int N_NBS, ReduceMode Mode = ReduceMode::Off, typename Distance = int32_t>
 static inline void scan_inner_axis_fast(
         const T* row, int64_t x_start, int64_t x_end,
         const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask,
-        const int32_t* dist_row = nullptr,
+        const Distance* dist_row = nullptr,
         double* primary = nullptr, int32_t* counts = nullptr) {
     int64_t nb[N_NBS];
     for (int i = 0; i < N_NBS; ++i) nb[i] = nb_flat[i];
@@ -339,8 +335,9 @@ static inline void scan_inner_axis_fast(
         const T vi = row[x];
         if (vi == 0) continue;
         const T* p = row + x;
-        int32_t di = 0;
-        if constexpr (Mode != ReduceMode::Off) di = dist_row[x];
+        double di = 0;
+        if constexpr (Mode != ReduceMode::Off && Mode != ReduceMode::Count)
+            di = dist_row ? static_cast<double>(dist_row[x]) : 0;
         // Compile-time-bounded; clang/gcc fully unroll the loop. MSVC
         // doesn't have a portable unroll pragma — its loop unroller
         // handles N_NBS ≤ 16 fine without a hint.
@@ -353,11 +350,12 @@ static inline void scan_inner_axis_fast(
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
             const uint64_t key = (static_cast<uint64_t>(lo) << 32) |
-                                 static_cast<uint64_t>(hi);
+                                 static_cast<uint32_t>(hi);
             if constexpr (Mode == ReduceMode::Off) {
                 ht_insert(ht, ht_mask, key);
             } else {
-                const int32_t dj = dist_row[x + nb[k]];
+                const double dj = Mode == ReduceMode::Count || !dist_row
+                    ? 0 : static_cast<double>(dist_row[x + nb[k]]);
                 ht_insert_acc<Mode>(ht, primary, counts, ht_mask, key, di + dj);
             }
         }
@@ -407,7 +405,7 @@ static inline void scan_inner_axis_dual_fast(
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
             ht_insert(ht_base, base_mask,
-                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint32_t>(hi));
         }
 #if defined(__GNUC__) || defined(__clang__)
 #  pragma GCC unroll 16
@@ -421,7 +419,7 @@ static inline void scan_inner_axis_dual_fast(
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
             ht_insert(ht_soft, soft_mask,
-                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint32_t>(hi));
         }
     }
 }
@@ -447,7 +445,7 @@ static inline void scan_inner_axis_dual_runtime(
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
             ht_insert(ht_base, base_mask,
-                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint32_t>(hi));
         }
         for (int k = 0; k < n_delta; ++k) {
             if (k == n_delta_near && all_same) break;
@@ -458,7 +456,7 @@ static inline void scan_inner_axis_dual_runtime(
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
             ht_insert(ht_soft, soft_mask,
-                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi));
+                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint32_t>(hi));
         }
     }
 }
@@ -499,29 +497,31 @@ static inline void scan_inner_axis_dual_dispatch(
 
 // Runtime-N_NBS fallback for cases that don't hit the dispatch table
 // (e.g. ndim ≥ 5 with custom conn). Identical body, just no unroll.
-template <typename T, ReduceMode Mode = ReduceMode::Off>
+template <typename T, ReduceMode Mode = ReduceMode::Off, typename Distance = int32_t>
 static inline void scan_inner_axis_fast_runtime(
         const T* row, int64_t x_start, int64_t x_end,
         int n_nbs, const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask,
-        const int32_t* dist_row = nullptr,
+        const Distance* dist_row = nullptr,
         double* primary = nullptr, int32_t* counts = nullptr) {
     for (int64_t x = x_start; x < x_end; ++x) {
         const T vi = row[x];
         if (vi == 0) continue;
         const T* p = row + x;
-        int32_t di = 0;
-        if constexpr (Mode != ReduceMode::Off) di = dist_row[x];
+        double di = 0;
+        if constexpr (Mode != ReduceMode::Off && Mode != ReduceMode::Count)
+            di = dist_row ? static_cast<double>(dist_row[x]) : 0;
         for (int k = 0; k < n_nbs; ++k) {
             const T vj = p[nb_flat[k]];
             if (vj == 0 || vj == vi) continue;
             const T lo = vi < vj ? vi : vj;
             const T hi = vi < vj ? vj : vi;
             const uint64_t key = (static_cast<uint64_t>(lo) << 32) |
-                                 static_cast<uint64_t>(hi);
+                                 static_cast<uint32_t>(hi);
             if constexpr (Mode == ReduceMode::Off) {
                 ht_insert(ht, ht_mask, key);
             } else {
-                const int32_t dj = dist_row[x + nb_flat[k]];
+                const double dj = Mode == ReduceMode::Count || !dist_row
+                    ? 0 : static_cast<double>(dist_row[x + nb_flat[k]]);
                 ht_insert_acc<Mode>(ht, primary, counts, ht_mask, key, di + dj);
             }
         }
@@ -532,11 +532,11 @@ static inline void scan_inner_axis_fast_runtime(
 // (ndim, conn): 2D conn=1 → 2; 2D conn=2 → 4; 3D conn=1 → 3; conn=2 → 9;
 // conn=3 → 13. Other counts (5D+ or non-default conn) take the runtime
 // fallback.
-template <typename T, ReduceMode Mode = ReduceMode::Off>
+template <typename T, ReduceMode Mode = ReduceMode::Off, typename Distance = int32_t>
 static inline void scan_inner_axis_dispatch(
         const T* row, int64_t x_start, int64_t x_end,
         int n_nbs, const int64_t* nb_flat, uint64_t* ht, uint64_t ht_mask,
-        const int32_t* dist_row = nullptr,
+        const Distance* dist_row = nullptr,
         double* primary = nullptr, int32_t* counts = nullptr) {
     switch (n_nbs) {
         case 2:  scan_inner_axis_fast<T, 2,  Mode>(row, x_start, x_end, nb_flat, ht, ht_mask, dist_row, primary, counts); break;
@@ -568,23 +568,23 @@ static inline void scan_inner_axis_dispatch(
 // the pre-computed flat offsets in nb_flat; boundary pixels rebuild offsets
 // per-axis (with optional wrap). `Wrap` is templated so the boundary path
 // has no runtime cost when it's off.
-template <typename T, bool Wrap = false, ReduceMode Mode = ReduceMode::Off>
+template <typename T, bool Wrap = false, ReduceMode Mode = ReduceMode::Off, typename Distance = int32_t>
 inline void scan_band_unpadded(
         const T* lbl, const std::vector<int64_t>& shape,
         const int64_t* strides, const int64_t* nb_flat,
         const int8_t* nb_dc, int n_nbs,
         int64_t line_start, int64_t line_end,
         uint64_t* ht, uint64_t ht_mask,
-        const int32_t* dist = nullptr,
+        const Distance* dist = nullptr,
         double* primary = nullptr, int32_t* counts = nullptr,
         int radius = 1) {
     const int ndim = static_cast<int>(shape.size());
     auto emit_pair = [ht_mask, primary, counts](uint64_t* h, T vi, T vj,
-                                                  int32_t di, int32_t dj) {
+                                                  double di, double dj) {
         (void)primary; (void)counts;  // unused when Mode == Off
         if (vj == 0 || vj == vi) return;
         const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
-        const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
+        const uint64_t hi = static_cast<uint32_t>(vi < vj ? vj : vi);
         const uint64_t key = (lo << 32) | hi;
         if constexpr (Mode == ReduceMode::Off) {
             (void)di; (void)dj;
@@ -603,8 +603,9 @@ inline void scan_band_unpadded(
     auto scan_pixel_checked = [&](const int64_t* coords, uint64_t bnd_mask, int64_t flat) {
         const T vi = lbl[flat];
         if (vi == 0) return;
-        int32_t di = 0;
-        if constexpr (Mode != ReduceMode::Off) di = dist[flat];
+        double di = 0;
+        if constexpr (Mode != ReduceMode::Off && Mode != ReduceMode::Count)
+            di = dist ? static_cast<double>(dist[flat]) : 0;
         for (int k = 0; k < n_nbs; ++k) {
             const int8_t* dc = nb_dc + k * ndim;
             if constexpr (Wrap) {
@@ -617,8 +618,9 @@ inline void scan_band_unpadded(
                     if (nc < 0) nc += shape[d];
                     neigh_flat += nc * strides[d];
                 }
-                int32_t dj = 0;
-                if constexpr (Mode != ReduceMode::Off) dj = dist[neigh_flat];
+                double dj = 0;
+                if constexpr (Mode != ReduceMode::Off && Mode != ReduceMode::Count)
+                    dj = dist ? static_cast<double>(dist[neigh_flat]) : 0;
                 emit_pair(ht, vi, lbl[neigh_flat], di, dj);
             } else {
                 bool valid = true;
@@ -630,8 +632,9 @@ inline void scan_band_unpadded(
                     if (nc < 0 || nc >= shape[d]) { valid = false; break; }
                 }
                 if (valid) {
-                    int32_t dj = 0;
-                    if constexpr (Mode != ReduceMode::Off) dj = dist[flat + nb_flat[k]];
+                    double dj = 0;
+                    if constexpr (Mode != ReduceMode::Off && Mode != ReduceMode::Count)
+                    dj = dist ? static_cast<double>(dist[flat + nb_flat[k]]) : 0;
                     emit_pair(ht, vi, lbl[flat + nb_flat[k]], di, dj);
                 }
             }
@@ -685,7 +688,7 @@ inline void scan_band_unpadded(
             if constexpr (Mode != ReduceMode::Off) {
                 scan_inner_axis_dispatch<T, Mode>(
                     lbl + row_base, radius, W - radius, n_nbs, nb_flat, ht, ht_mask,
-                    dist + row_base, primary, counts);
+                    dist ? dist + row_base : nullptr, primary, counts);
             } else {
                 scan_inner_axis_dispatch<T>(
                     lbl + row_base, radius, W - radius, n_nbs, nb_flat, ht, ht_mask);
@@ -713,12 +716,12 @@ inline void scan_band_unpadded(
 // with primary (double) and counts (int32) arrays. Outputs the
 // reducer values via ``out_primary`` and ``out_counts`` (parallel to
 // the returned pair list).
-template <typename T, bool Wrap = false, ReduceMode Mode = ReduceMode::Off>
+template <typename T, bool Wrap = false, ReduceMode Mode = ReduceMode::Off, typename Distance = int32_t>
 inline std::vector<std::pair<int32_t, int32_t>>
 find_pairs_unpadded_impl(const T* lbl, const std::vector<int64_t>& shape,
                          int conn, uint64_t ht_size, int n_threads,
                          ForkJoinPool& pool,
-                         const int32_t* dist = nullptr,
+                         const Distance* dist = nullptr,
                          std::vector<double>* out_primary = nullptr,
                          std::vector<int32_t>* out_counts = nullptr,
                          int radius = 1,
@@ -873,9 +876,9 @@ find_pairs_nd_unpadded(const T* lbl, const std::vector<int64_t>& shape,
     if (radius < 1) radius = 1;
     return wrap
         ? find_pairs_unpadded_impl<T, true >(lbl, shape, conn, ht_size, n_threads, pool,
-                                              nullptr, nullptr, nullptr, radius, ht_scratch)
+                                              static_cast<const int32_t*>(nullptr), nullptr, nullptr, radius, ht_scratch)
         : find_pairs_unpadded_impl<T, false>(lbl, shape, conn, ht_size, n_threads, pool,
-                                              nullptr, nullptr, nullptr, radius, ht_scratch);
+                                              static_cast<const int32_t*>(nullptr), nullptr, nullptr, radius, ht_scratch);
 }
 
 // =============================================================================
@@ -965,7 +968,7 @@ inline void scan_band_unpadded_dual(
     auto emit = [](uint64_t* h, uint64_t mask, T vi, T vj) {
         if (vj == 0 || vj == vi) return;
         const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
-        const uint64_t hi = static_cast<uint64_t>(vi < vj ? vj : vi);
+        const uint64_t hi = static_cast<uint32_t>(vi < vj ? vj : vi);
         ht_insert(h, mask, (lo << 32) | hi);
     };
     // Same interior skip as the fast inner loop (see
@@ -1243,9 +1246,9 @@ inline int find_pairs_dual_nd_unpadded(
 //   Mean:     primary[i] = sum, counts[i] = N → mean = sum/N.
 //   Count:    counts[i] = boundary pixel-pair count. primary unused.
 //   Harmonic: primary[i] = Σ 1/(1+d_i+d_j) over the pair's boundary.
-template <typename T, ReduceMode Mode>
+template <typename T, ReduceMode Mode, typename Distance = int32_t>
 std::vector<std::pair<int32_t, int32_t>>
-find_pairs_weighted_nd_unpadded(const T* lbl, const int32_t* dist,
+find_pairs_weighted_nd_unpadded(const T* lbl, const Distance* dist,
                                 const std::vector<int64_t>& shape,
                                 int conn, uint64_t ht_size, int n_threads,
                                 ForkJoinPool& pool, bool wrap,
