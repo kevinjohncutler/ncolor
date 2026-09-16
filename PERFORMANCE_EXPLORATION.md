@@ -108,10 +108,9 @@ Reusing contacts is useful when recoloring unchanged geometry. The runnable
 `bench/reuse_graph.py` experiment uses the existing graph-coloring interface
 and a lookup table to recolor the original image. It produced identical
 colors and took 8.032 ms versus 12.669 ms for the complete pipeline (1.58x).
-This is a separate 25-sample experiment, not a new automatic graph cache.
-An explicit prepared-contact object could make this easier to use, provided
-it records expansion, connectivity, periodicity, and weighting settings.
-Mutating the image or those settings must invalidate the prepared graph.
+This was a separate 25-sample experiment. The follow-up below implements
+an explicit owned snapshot, with fixed topology settings and no automatic
+cache invalidation.
 
 Fusing final propagation with contact extraction remains a promising next
 experiment. The obstacle is that the final Euclidean sweep uses transposed
@@ -121,10 +120,10 @@ too early can create incorrect edges. A tiled final pass with boundary
 halos and contact extraction after cleanup should be compared against exact
 expanded labels and edge sets before being adopted.
 
-Other candidates are component splitting along a better axis for very thin
-volumes, and optional scratch-retention limits for engines that alternate
-large and small images. Both need measurements that include copying and
-reallocation costs, not just isolated kernel time.
+The follow-up below evaluates component splitting along a better axis for
+very thin volumes. Optional scratch-retention limits remain a separate
+candidate for engines that alternate large and small images; those need
+measurements that include reallocation costs.
 
 ## Reproduction and validation
 
@@ -174,3 +173,149 @@ three paired large-image comparisons, standard expansion improved
 2.40x to 2.58x, and dense components 2.81x to 2.88x. Those consistent
 relative gains support keeping the changes, while the small timing
 regressions need confirmation on an idle machine.
+
+
+## Follow-up: prepared graphs, thin volumes, byte inputs, and fused contacts
+
+This follow-up compares against local checkpoint `f6d25cb`, not release
+2.2.0. Three separate-process rounds alternate baseline/current order.
+The 64 formatting/coloring workloads and 60 component workloads have exact
+matching output fingerprints in all six process runs. Each timing below
+is the median of the three process medians. Formatting uses 15 samples,
+coloring controls nine, components 11, and prepared calls 15, after warmup.
+Raw measurements and the complete comparison, including controls and
+regressions, are in `bench/audit_results/next_final_*.json`.
+
+### Integrated changes
+
+`ncolor.prepare_labels(...)` creates an owned snapshot of the normalized
+render labels and the hard/soft contact graphs. `prepared.color(...)`
+runs the same coloring picker and soft search, then renders the output.
+It can vary the color count, search depth, and perceptual palette without
+repeating formatting, expansion, contact extraction, or graph construction.
+Source mutation, engine reuse, and buffer release do not affect it. Geometry
+or topology-setting changes require a new snapshot. Separate engines can
+color one snapshot concurrently. This is explicit reuse, with no hidden
+cache keyed by a mutable array.
+
+| Workload | Complete ms | Prepare ms | Recolor ms | Recolor speedup |
+|---|---|---|---|---|
+| 512 x 512, standard | 0.907 | 0.452 | 0.291 | 3.12x |
+| 2048 x 2048, standard | 12.369 | 7.811 | 5.301 | 2.33x |
+| 2048 x 2048, clean | 13.546 | 8.848 | 5.284 | 2.56x |
+| 2048 x 2048, weighted clean | 17.815 | 13.142 | 5.549 | 3.21x |
+| 96 x 96 x 96, standard | 3.010 | 2.892 | 0.250 | 12.05x |
+| 96 x 96 x 96, weighted clean | 5.748 | 5.841 | 0.231 | 24.86x |
+
+Preparation is an additional cost before the first recolor. The large
+three-dimensional gains use only 27 seed labels, so eliminating raster
+scans dominates a very small graph solve; they should not be generalized
+to difficult graphs. The 2048 x 2048 snapshot retains 17,066,040 bytes
+unweighted or 17,195,064 bytes weighted, in addition to engine scratch.
+Array payload is exposed by `prepared.nbytes`; container overhead is not.
+
+Connected-component splitting now uses an inner axis for sufficiently
+large, thin, face-connected volumes when this makes more workers useful.
+Partitions remain contiguous and preserve exact serial component numbering.
+The optimization is deliberately restricted to the measured profitable
+case: the second active axis, at least 32 rows, and at least two partitions
+per leading plane. Diagonal connectivity and thinner inner extents retain
+the earlier partition strategy.
+
+| Workload, four workers | Before ms | After ms | Speedup |
+|---|---|---|---|
+| 2 x 1024 x 1024 components, 10% foreground | 4.948 | 2.605 | 1.90x |
+| 2 x 1024 x 1024 components, 70% foreground | 13.134 | 8.890 | 1.48x |
+| 2 x 1024 x 1024 per-label components | 24.333 | 16.256 | 1.50x |
+| 2048 x 2048 boolean formatting | 1.004 | 0.542 | 1.85x |
+| 2048 x 2048 unsigned-byte formatting, 32 values | 0.720 | 0.543 | 1.32x |
+| 2048 x 2048 signed-byte formatting | 0.869 | 0.562 | 1.55x |
+
+For large byte inputs, formatting builds private presence flags directly
+from source bytes and combines casting with remapping. The input dtype
+provides the domain bound, eliminating the separate int32 range scan.
+This applies only to sorted formatting with multiple workers and at least
+500,000 pixels. First-seen numbering, small arrays, serial calls, and wider
+dtypes retain their existing path. Full-range unsigned bytes were roughly
+unchanged; sparse byte values improved more. Scratch remains bounded at
+one mebibyte. The end-to-end coloring pipeline retains its existing cast
+and background-capture path.
+
+### Rejected variants and the contact-fusion prototype
+
+Unrestricted inner-axis splitting was correct but merging diagonal and
+multiple-prefix seams made some thin cases three to ten times slower.
+Those paths were removed. Extending source-domain presence tables to
+16-bit input also regressed representative workloads. Adding per-element
+min/max tracking did not rescue it, and serial byte formatting regressed.
+Fusing background capture into the coloring pipeline cost roughly 5% to
+11% in initial measurements. None of these broader variants remains in
+the production code. Earlier raw results are retained as
+`next_thin_before.json`, `next_thin_after.json`, `next_narrow_format_*.json`,
+and `next_narrow_adjusted.json`.
+
+`bench/fused_transpose_contacts.cpp` is a standalone experiment using the
+shipped transpose and contact kernels. It transposes tiles with a two-pixel
+halo, writes the final label image, and extracts hard and soft contacts
+while the tile is still in cache. It checks exact images and sorted edge
+sets against the separate passes on every timed call. The first prototype
+incorrectly retained hard edges in the soft set; explicit subtraction
+fixed that before performance results were accepted.
+
+The final sweep includes tiny arrays, partial tiles, regular and jittered
+seeds, standard and cleaned label fields, and periodic/nonperiodic edges:
+56 cases, each with two warmups and 25 alternating paired samples. For
+2048 x 2048, this phase improved 1.09x to 1.20x. These are phase timings,
+not whole-pipeline speedups. Clean fields were already cleaned before the
+experiment's transpose, so it does not establish that contacts may be
+emitted before bridge/spur cleanup. The prototype is not integrated into
+the expansion path. Safe promotion would require cleanup in the retained
+layout, exact tie and contact equivalence, and higher-dimensional and
+weighted implementations whose full-pipeline benefit exceeds their cost.
+
+### Validation and remaining measurement limits
+
+The final suite passed 1,047 tests with four skipped. New contracts cover
+prepared snapshots, palette/constraint parity, independent ownership,
+concurrent readers, output validation, empty/isolated graphs, signed and
+wide labels, thin component seams, and byte-format dispatch boundaries.
+Native contracts passed AddressSanitizer and UndefinedBehaviorSanitizer,
+including the adaptive component path and byte formatter. The contact-fusion
+prototype also passed both sanitizers on all 56 cases.
+
+Repeated recoloring, rebuilding prepared snapshots, and adaptive components
+were checked for retained memory in three processes, with 100 calls per
+workload in each process. Variation over the final 20 samples was at most
+1.13 MiB, below the unchanged 8 MiB limit. Total peak resident memory
+ranged from 126.95 to 150.30 MiB. These peaks include Python, input/output
+arrays, the snapshot, and retained engine buffers. The histories are
+retained so allocator warmup is visible.
+
+An unrelated application was consuming several CPU cores during paired
+runs. Some unchanged controls varied substantially: the three-plane sparse
+component control had per-round speedups of 0.99x, 1.96x, and 0.86x.
+Consequently, these results support the consistent relative gains above,
+but do not establish stable absolute performance on an idle machine.
+Correctness fingerprints remained identical. No unrelated process was
+stopped to improve the measurements.
+
+### Next experiments
+
+The largest remaining opportunity is to keep final feature-transform
+storage in place through cleanup and contact extraction, avoiding an
+entire transfer rather than making one transfer modestly cheaper. Test
+cleanup ordering and tie behavior before changing the layout. A second
+candidate is a compact source-only render map for sparse prepared inputs,
+which could reduce the four-byte-per-pixel snapshot cost; measure its
+output-fill and random-access overhead. For components, parallelizing the
+large prefix-plane merge deserves a separate experiment, with union-find
+contention and exact numbering included in the cost.
+
+Reproduce the follow-up with `bench/thin_components.py`,
+`bench/narrow_format.py`, `bench/prepared_labels.py`, and
+`bench/next_memory.py`, each taking `--output PATH`. Compile the standalone
+contact experiment with C++17, optimization, pthread support, and `-I cpp`.
+When saving a benchmark copy from a quarantined network volume on macOS,
+remove the inherited quarantine attribute from that deliberate local copy
+before importing it. Normal network builds continue to use the backend's
+local-cache loader; compiling on a network mount is still supported.

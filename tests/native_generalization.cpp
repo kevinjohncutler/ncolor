@@ -395,20 +395,37 @@ static void check_feature_transfers() {
 
 static void check_parallel_components() {
     ForkJoinPool pool(4);
-    const std::vector<int64_t> shape{517, 521};
-    const size_t size = 517 * 521;
-    std::vector<int32_t> input(size), serial(size), parallel(size), expected_sources, sources;
-    std::mt19937 rng(9);
-    for (auto& value : input) value = rng() % 5;
-    for (int conn : {1, 2}) {
-        const auto expected = cc_label_nd(input.data(), serial.data(), shape, conn);
-        const auto actual = cc_label_parallel_nd(input.data(), parallel.data(), shape, conn, pool, 4);
-        assert(expected == actual && serial == parallel);
-        const auto expected_per_label = cc_label_per_label_nd(
-            input.data(), serial.data(), shape, conn, expected_sources);
-        const auto actual_per_label = cc_label_parallel_nd<int32_t, true>(
-            input.data(), parallel.data(), shape, conn, pool, 4, &sources);
-        assert(expected_per_label == actual_per_label && serial == parallel && expected_sources == sources);
+    for (const auto& shape : std::vector<std::vector<int64_t>>{
+            {517, 521}, {2, 513, 517}, {2, 2, 257, 263}}) {
+        const size_t size = std::accumulate(shape.begin(), shape.end(), int64_t{1}, std::multiplies<int64_t>());
+        std::vector<int32_t> input(size), serial(size), parallel(size), expected_sources, sources;
+        std::mt19937 rng(9);
+        for (auto& value : input) value = rng() % 5;
+        for (int conn : {1, 2}) {
+            const auto expected = cc_label_nd(input.data(), serial.data(), shape, conn);
+            const auto actual = cc_label_parallel_nd(input.data(), parallel.data(), shape, conn, pool, 4);
+            assert(expected == actual && serial == parallel);
+            const auto expected_per_label = cc_label_per_label_nd(
+                input.data(), serial.data(), shape, conn, expected_sources);
+            const auto actual_per_label = cc_label_parallel_nd<int32_t, true>(
+                input.data(), parallel.data(), shape, conn, pool, 4, &sources);
+            assert(expected_per_label == actual_per_label && serial == parallel && expected_sources == sources);
+        }
+    }
+}
+
+static void check_byte_formatting() {
+    ForkJoinPool pool(4);
+    for (int64_t size : {0, 1, 499999, 500000, 500001}) {
+        std::vector<int8_t> input(static_cast<size_t>(size));
+        std::vector<int32_t> expected(static_cast<size_t>(size)), actual(static_cast<size_t>(size));
+        for (int64_t i = 0; i < size; ++i) {
+            input[i] = static_cast<int8_t>(i % 256 - 128);
+            expected[i] = input[i];
+        }
+        const auto count = format_labels_inplace(expected.data(), size, pool, 4);
+        assert(format_byte_labels(input.data(), actual.data(), size, pool, 4) == count);
+        assert(actual == expected);
     }
 }
 
@@ -467,6 +484,7 @@ static void check_pool_exception_recovery() {
 }
 
 int main() {
+    check_byte_formatting();
     check_feature_transfers();
     check_parallel_components();
     check_dispatch_ranges();

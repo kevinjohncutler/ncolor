@@ -1,27 +1,15 @@
-"""Loader for ``ncolor._backend._impl``, the C++ extension that implements
-the connect / expand / color pipeline.
+"""Load the compiled backend through a local cache on network filesystems.
 
-The wrapper around a direct ``importlib`` load exists for one reason:
-``dlopen()`` of a compiled extension hangs or fails when the file lives
-on a network filesystem.
+Network builds remain supported. On macOS, a network volume's quarantine
+mount flag can block loading a compiled extension even when the file has
+no quarantine attribute. Some network filesystems also stall signature
+validation; Windows network paths can reject library loading.
 
-  * **macOS smbfs** — dyld calls ``fcntl()`` for code-signature validation
-    and SMB hangs on those calls; ``dlopen`` blocks indefinitely in
-    ``JustInTimeLoader::withRegions``.
-  * **Windows UNC** — ``LoadLibrary`` raises *Access is denied* for some
-    server configurations.
-
-When the package source lives on a network mount (the developer-on-NAS
-case — irrelevant for pip-installed wheels, since ``site-packages/`` is
-always local), the loader copies the ``.so``/``.pyd`` to a local-disk
-cache via ``platformdirs.user_cache_dir("ncolor")`` and ``dlopen``s from
-there. Cache key is the source-side ``(mtime_ns, size)`` so a rebuild
-produces a fresh local path — dyld retains stale path-keyed state from
-prior failed loads at the same path, so reusing the same path can still
-hang. On macOS we also strip ``com.apple.quarantine`` (which ``cp`` from
-an SMB mount inherits, even when the user has stripped it from the file).
-
-On non-network mounts we fast-path to a direct ``importlib`` load.
+For detected remote paths, copy the extension to the local user cache and
+remove the quarantine attribute from that deliberate local copy. Cache
+keys include source modification time and size, so rebuilding selects a
+fresh path rather than reusing the dynamic loader's failed-path state.
+Local package installations load directly.
 """
 from __future__ import annotations
 

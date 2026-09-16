@@ -6,6 +6,9 @@ extension load on first attribute access.
 
 Public names:
 
+* ``prepare_labels``: create an owned snapshot for repeated coloring
+* ``PreparedLabels``: snapshot with reusable contacts and output labels
+
 * ``label``                — 4-color graph coloring of a label image
 * ``connect``              — adjacency pairs in a label image
 * ``format_labels``        — normalize labels to contiguous 1..N with bg=0
@@ -34,6 +37,8 @@ __all__ = [
     "geo",
     "release_buffers",
     "Engine",
+    "prepare_labels",
+    "PreparedLabels",
 ]
 
 _LAZY_ATTRS = {
@@ -47,6 +52,8 @@ _LAZY_ATTRS = {
     "color_graph": ".color",
     "release_buffers": "._engines",
     "Engine": "._engines",
+    "prepare_labels": ".prepared",
+    "PreparedLabels": ".prepared",
 }
 
 # Submodules reachable as a plain attribute (``ncolor.geo.label``) after

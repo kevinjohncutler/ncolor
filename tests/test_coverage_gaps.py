@@ -618,7 +618,7 @@ def test_on_remote_mount_darwin_smbfs(monkeypatch, tmp_path):
     inside = fake_mount / "lib.so"
     inside.write_bytes(b"x")
     fake_mount_output = (
-        f"//user@host/share on {fake_mount} (smbfs, nodev, nosuid, mounted by kcutler)\n"
+        f"//user@host/share on {fake_mount} (smbfs, nodev, nosuid, mounted by user)\n"
     )
 
     def fake_check_output(cmd, *a, **kw):

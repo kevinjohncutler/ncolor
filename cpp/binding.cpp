@@ -592,7 +592,7 @@ public:
         {
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> engine_lock(pool_->mu);
-            // Initialise output to +infinity. If a class has no seeds the
+            // Initialize output to +infinity. If a class has no seeds the
             // expansion writes labels=0 and dist=INT_MAX/4; we replace
             // those with +inf for safe min-aggregation downstream.
             const double INF = std::numeric_limits<double>::infinity();
@@ -758,16 +758,25 @@ public:
             py::gil_scoped_release release;
             std::lock_guard<std::mutex> engine_lock(pool_->mu);
             // Cast to int32 in parallel inside the released-GIL block.
-            bool fits = true;
+            bool fits = true, formatted = false;
             dispatch_cast_dtype(buf.format, buf.itemsize,
                 "ExpandEngine.format_labels", [&](auto* tag) {
                     using T = std::remove_pointer_t<decltype(tag)>;
+                    if constexpr (std::is_integral<T>::value && sizeof(T) == 1) {
+                        if (!first_seen && n_threads_ > 1 &&
+                            total >= ncolor_cpp::detail::FORMAT_LABELS_SERIAL_THRESHOLD) {
+                            n_labels = ncolor_cpp::format_byte_labels(
+                                static_cast<const T*>(src_ptr), out_ptr, total, pool_->pool, n_threads_);
+                            formatted = true;
+                            return;
+                        }
+                    }
                     fits = ncolor_cpp::cast_to_int32<T>(
                         static_cast<const T*>(src_ptr), out_ptr, total,
                         pool_->pool, n_threads_);
                 });
             if (!fits) throw_label_overflow("ExpandEngine.format_labels");
-            n_labels = first_seen
+            if (!formatted) n_labels = first_seen
                 ? ncolor_cpp::format_labels_inplace_first_seen(
                     out_ptr, total, pool_->pool, n_threads_)
                 : ncolor_cpp::format_labels_inplace(
@@ -810,6 +819,39 @@ static inline int64_t ipow2_ge(int64_t v) {
 // throughput on tiny graphs; the cost of overshooting is just a few
 // hundred bytes per worker.
 static constexpr int64_t MIN_HT_SIZE = 16;
+
+// Shared perceptual default for ordinary and prepared coloring. Additional
+// colors have zero preference unless the caller provides a complete palette.
+static std::vector<double> default_palette(int n_colors) {
+    std::vector<double> values(static_cast<size_t>(n_colors + 1) * (n_colors + 1), 0.0);
+    constexpr double defaults[5][5] = {
+        {0, 0, 0, 0, 0}, {0, 0, 52, 104.74, 133.36},
+        {0, 52, 0, 56.28, 100.98}, {0, 104.74, 56.28, 0, 62.58},
+        {0, 133.36, 100.98, 62.58, 0}};
+    for (int i = 0; i < std::min(n_colors + 1, 5); ++i)
+        for (int j = 0; j < std::min(n_colors + 1, 5); ++j)
+            values[i * (n_colors + 1) + j] = defaults[i][j];
+    return values;
+}
+
+// An owned snapshot: subsequent engine calls cannot invalidate this data.
+// The Python interface exposes metadata and coloring, never writable arrays.
+struct PreparedRaster {
+    std::vector<int64_t> shape;
+    std::vector<int32_t> render_labels, indptr, indices, src, dst;
+    std::vector<int32_t> soft_indptr, soft_indices;
+    std::vector<double> edge_weights;
+    std::vector<float> soft_weights;
+    int32_t n_vertices = 0;
+    int active_ndim = 0, weight_objective = 0;
+    bool wrap = false, ready = false;
+    size_t nbytes() const {
+        return sizeof(int64_t) * shape.size() + sizeof(int32_t) *
+            (render_labels.size() + indptr.size() + indices.size() + src.size() +
+             dst.size() + soft_indptr.size() + soft_indices.size()) +
+            sizeof(double) * edge_weights.size() + sizeof(float) * soft_weights.size();
+    }
+};
 
 // Solver: end-to-end ncolor.label equivalent in C++. Owns a thread pool +
 // the scratch buffers for cast / format_labels / expand / connect / CSR
@@ -939,7 +981,7 @@ public:
             py::object soft_extra_edges_obj = py::none(),
             int soft_conn = 2,
             int soft_radius = 2,
-            bool clean_mask = false) {
+            bool clean_mask = false, PreparedRaster* prepared = nullptr) {
         ncolor_cpp::validate_coloring_budget(n_colors, max_depth);
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
@@ -968,7 +1010,9 @@ public:
             total *= shape[d];
         }
         const void* src_ptr = buf.ptr;
-        py::array_t<uint8_t> out = prepare_out_buffer_(out_arg, buf, ndim);
+        py::array_t<uint8_t> out = prepared ? py::array_t<uint8_t>(0)
+            : prepare_out_buffer_(out_arg, buf, ndim);
+        PreparedRaster snapshot;
         uint8_t* out_ptr = static_cast<uint8_t*>(out.request().ptr);
 
         int n_used = 0;
@@ -1091,7 +1135,7 @@ public:
                 // Empty / all-bg input: output is all zeros, no
                 // expansion / coloring needed.
                 if (n_labels == 0) {
-                    std::memset(out_ptr, 0,
+                    if (!prepared) std::memset(out_ptr, 0,
                                 static_cast<size_t>(total) * sizeof(uint8_t));
                     early_exit_empty = true;
                 }
@@ -1518,22 +1562,7 @@ public:
                     de_ptr = de_table_vec.data();
                 }
                 if (de_ptr == nullptr) {
-                    de_table_vec.assign(static_cast<size_t>(n_colors + 1) * (n_colors + 1), 0.0);
-                    const double viridis_de4[5][5] = {
-                        {0.0,   0.0,   0.0,   0.0,   0.0},
-                        {0.0,   0.0,  52.0, 104.74, 133.36},
-                        {0.0,  52.0,   0.0,  56.28, 100.98},
-                        {0.0, 104.74, 56.28,  0.0,  62.58},
-                        {0.0, 133.36,100.98, 62.58,  0.0},
-                    };
-                    const int K = std::min(n_colors + 1, 5);
-                    for (int i = 0; i < K; ++i)
-                        for (int j = 0; j < K; ++j)
-                            de_table_vec[i * (n_colors + 1) + j] = viridis_de4[i][j];
-                    // For n_colors > 4 (3D fallback), entries beyond 4 stay 0:
-                    // those colors then contribute no contrast preference,
-                    // which is acceptable — the weight_obj only matters when
-                    // a perceptual palette is provided explicitly.
+                    de_table_vec = default_palette(n_colors);
                     de_ptr = de_table_vec.data();
                 }
             }
@@ -1542,7 +1571,7 @@ public:
             // offsets, retrying with cur_n+1 if all attempts fail. See
             // ``solve_coloring_`` for full algorithm + parallel-attempt
             // dispatch.
-            n_used = solve_coloring_(N, M, n_colors, max_depth, rand_period,
+            n_used = prepared ? (N > 0 ? 1 : 0) : solve_coloring_(N, M, n_colors, max_depth, rand_period,
                                      color_mode,
                                      static_cast<int>(std::count_if(shape.begin(), shape.end(),
                                          [](int64_t extent) { return extent > 1; })), wrap,
@@ -1592,7 +1621,7 @@ public:
                     N, soft_indptr_.data(), soft_indices_.data(),
                     soft_weights_);
                 stage("soft_weights");
-                n_soft_violations_last_ = ncolor_cpp::soft_local_search(
+                if (!prepared) n_soft_violations_last_ = ncolor_cpp::soft_local_search(
                     colors_.data(), N,
                     indptr_.data(), indices_.data(),
                     soft_indptr_.data(), soft_indices_.data(),
@@ -1601,7 +1630,7 @@ public:
                 stage("soft_search");
                 // The soft search may have vacated a color; keep the
                 // reported count and the pixel values in step.
-                n_used = ncolor_cpp::densify_colors(colors_, N);
+                if (!prepared) n_used = ncolor_cpp::densify_colors(colors_, N);
             }
 
             // 5. Build LUT (expanded[i] is in 1..N, so lut size = N+1) and
@@ -1611,15 +1640,106 @@ public:
             // them as barriers for graph cleanup. With clean_mask=true,
             // the post-expand buffer (lut_lbl_ptr) is used and the clean expand
             // barriers surface as 0 in the output.
-            lut_.assign(static_cast<size_t>(N) + 1, 0);
-            for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
             const int32_t* lut_src =
                 (need_orig_snapshot ? orig_labels_.data() : lut_lbl_ptr);
-            apply_color_lut_(lut_src, out_ptr, total);
+            if (prepared) {
+                snapshot.n_vertices = N;
+                snapshot.indptr = indptr_;
+                snapshot.indices = indices_;
+                snapshot.src = src_idx_;
+                snapshot.dst = dst_idx_;
+                if (wobj != 0 && M > 0) snapshot.edge_weights = edge_weights_;
+                if (n_soft_eff > 0 && N > 0) {
+                    snapshot.soft_indptr = soft_indptr_;
+                    snapshot.soft_indices = soft_indices_;
+                    snapshot.soft_weights = soft_weights_;
+                }
+                snapshot.render_labels.resize(static_cast<size_t>(total));
+                ncolor_cpp::dispatch_parallel(pool_->pool, static_cast<size_t>(total),
+                    static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
+                    [&](size_t begin, size_t end) {
+                        for (size_t i = begin; i < end; ++i)
+                            snapshot.render_labels[i] = bg_mask_[i] ? 0 : lut_src[i];
+                    });
+            } else {
+                lut_.assign(static_cast<size_t>(N) + 1, 0);
+                for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
+                apply_color_lut_(lut_src, out_ptr, total);
+            }
             stage("apply_lut");
         }  // close: if (!early_exit_empty)
+        if (prepared) {
+            snapshot.shape = shape;
+            snapshot.active_ndim = static_cast<int>(std::count_if(shape.begin(), shape.end(),
+                [](int64_t extent) { return extent > 1; }));
+            snapshot.wrap = wrap;
+            snapshot.weight_objective = weight_objective;
+            if (early_exit_empty) snapshot.render_labels.assign(static_cast<size_t>(total), 0);
+            snapshot.ready = true;
+            *prepared = std::move(snapshot);
+        }
         }  // close: gil_scoped_release scope
         return {std::move(out), n_used};
+    }
+
+    std::pair<py::array_t<uint8_t>, int> color_prepared(
+            const PreparedRaster& prepared, int n_colors = 4, int max_depth = 30,
+            py::object de_table_obj = py::none(), py::object out_arg = py::none()) {
+        if (!prepared.ready) throw std::invalid_argument("prepared labels are not initialized");
+        ncolor_cpp::validate_coloring_budget(n_colors, max_depth);
+        std::vector<double> palette;
+        if (!de_table_obj.is_none()) {
+            auto values = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(de_table_obj);
+            if (!values || values.ndim() != 2 || values.shape(0) != n_colors + 1 ||
+                values.shape(1) != n_colors + 1)
+                throw std::invalid_argument("de_table must have shape (n+1, n+1)");
+            for (py::ssize_t i = 0; i < values.size(); ++i)
+                if (!std::isfinite(values.data()[i]))
+                    throw std::invalid_argument("de_table must contain finite values");
+            palette.assign(values.data(), values.data() + values.size());
+        } else if (prepared.weight_objective != 0) {
+            palette = default_palette(n_colors);
+        }
+        py::buffer_info info;
+        info.shape.assign(prepared.shape.begin(), prepared.shape.end());
+        auto out = prepare_out_buffer_(out_arg, info, static_cast<int>(prepared.shape.size()));
+        auto* output = out.mutable_data();
+        int used = 0;
+        {
+            py::gil_scoped_release release;
+            std::lock_guard<std::mutex> lock(pool_->mu);
+            last_stages_.clear();
+            last_n_conflicts_ = 0;
+            n_soft_violations_last_ = 0;
+            fused_soft_pairs_.clear();
+            const int32_t N = prepared.n_vertices;
+            if (N > 0) {
+                // Keep topology in the snapshot. Only the coloring and picker
+                // scratch belong to the engine, allowing concurrent readers.
+                used = ncolor_cpp::pick_coloring(N, static_cast<int32_t>(prepared.src.size()),
+                    n_colors, max_depth, 10, -1, prepared.active_ndim, prepared.wrap,
+                    prepared.edge_weights.empty() ? nullptr : prepared.edge_weights.data(),
+                    palette.empty() ? nullptr : palette.data(), prepared.weight_objective,
+                    prepared.indptr, prepared.indices, prepared.src, prepared.dst,
+                    colors_, last_n_conflicts_, picker_scratch_, &pool_->pool, n_threads_);
+                if (!prepared.soft_indices.empty()) {
+                    n_soft_violations_last_ = ncolor_cpp::soft_local_search(colors_.data(), N,
+                        prepared.indptr.data(), prepared.indices.data(),
+                        prepared.soft_indptr.data(), prepared.soft_indices.data(),
+                        prepared.soft_weights.data(), used);
+                    used = ncolor_cpp::densify_colors(colors_, N);
+                }
+            }
+            lut_.assign(static_cast<size_t>(N) + 1, 0);
+            for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
+            ncolor_cpp::dispatch_parallel(pool_->pool, prepared.render_labels.size(),
+                static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
+                [&](size_t begin, size_t end) {
+                    for (size_t i = begin; i < end; ++i)
+                        output[i] = lut_[prepared.render_labels[i]];
+                });
+        }
+        return {std::move(out), used};
     }
 
     // Color an arbitrary graph from an edge list, running the same
@@ -2213,6 +2333,12 @@ PYBIND11_MODULE(_impl, m) {
         .def("release", &ExpandEngine::release,
              "Free the persistent scratch buffers; the next call reallocates.");
 
+    py::class_<PreparedRaster>(m, "PreparedRaster")
+        .def(py::init<>())
+        .def_property_readonly("shape", [](const PreparedRaster& p) { return p.shape; })
+        .def_property_readonly("n_labels", [](const PreparedRaster& p) { return p.n_vertices; })
+        .def_property_readonly("nbytes", &PreparedRaster::nbytes);
+
     py::class_<Solver>(m, "Solver",
         "End-to-end ncolor.label() equivalent. Wraps a single ThreadPool\n"
         "and re-uses all intermediate buffers, so the per-call cost is just\n"
@@ -2252,7 +2378,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("soft_extra_edges") = py::none(),
              py::arg("soft_conn") = 2,
              py::arg("soft_radius") = 2,
-             py::arg("clean_mask") = false,
+             py::arg("clean_mask") = false, py::arg("_prepared") = nullptr,
              "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
              "Any ndim ≥ 2; conn ∈ [1, ndim].\n"
              "p selects the expand metric: p=1 (Saito-Toriwaki sweep,\n"
@@ -2274,6 +2400,9 @@ PYBIND11_MODULE(_impl, m) {
              "land on opposite image edges. Useful for tile-equivalent or\n"
              "periodic-imaging assumptions; balances color frequencies on\n"
              "tightly-cropped microcolony images at ~zero runtime cost.")
+        .def("color_prepared", &Solver::color_prepared,
+             py::arg("prepared"), py::arg("n_colors") = 4, py::arg("max_depth") = 30,
+             py::arg("de_table") = py::none(), py::arg("out") = py::none())
         .def("connect", &Solver::connect,
              py::arg("mask"), py::arg("conn") = 1, py::arg("wrap") = false,
              "Adjacency pairs for a label image. Returns an (M, 2) int32\n"

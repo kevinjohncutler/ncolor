@@ -485,23 +485,45 @@ inline int32_t cc_label_parallel_nd(
         if constexpr (PerLabel) return cc_label_per_label_nd(src, dst, dims, conn, values);
         else return cc_label_nd(src, dst, dims, conn);
     };
-    const int slabs = static_cast<int>(std::min<int64_t>(
-        std::min<int64_t>(std::max(1, n_threads), shape[0]), total / 131072));
-    if (total < 262144 || shape.size() < 2 || slabs < 2) {
+    const int target = static_cast<int>(std::min<int64_t>(
+        std::max(1, n_threads), total / 131072));
+    if (total < 262144 || shape.size() < 2 || target < 2) {
         std::vector<T> unused;
         return serial(input, output, shape, sources ? *sources : unused);
     }
-    const int64_t plane = total / shape[0];
+    // Partition contiguous subvolumes within thin leading dimensions.
+    // This uses all workers without transposing the input or changing its
+    // raster order. Prefix coordinates belong to separate subvolumes.
+    int axis = 0;
+    int64_t prefixes = 1;
+    while (axis + 1 < static_cast<int>(shape.size()) &&
+           prefixes * shape[axis] < target) {
+        prefixes *= shape[axis++];
+    }
+    // Extra cuts help face-connected, thin volumes only when each slab
+    // still contains many rows. Dense diagonal seams cost more to merge
+    // than the additional workers save; retain their original partition.
+    if (axis != 1 || conn != 1 || shape[axis] < 32 || target / prefixes < 2) {
+        axis = 0;
+        prefixes = 1;
+    }
+    const int parts = static_cast<int>(std::min<int64_t>(shape[axis],
+        std::max<int64_t>(1, target / prefixes)));
+    const int slabs = static_cast<int>(prefixes) * parts;
+    const int64_t plane = total / (prefixes * shape[axis]);
     std::vector<int64_t> starts(slabs + 1);
     std::vector<int32_t> counts(slabs), bases(slabs + 1, 0);
     std::vector<std::vector<T>> local_sources(slabs);
-    for (int s = 0; s <= slabs; ++s) starts[s] = shape[0] * s / slabs;
+    for (int s = 0; s < slabs; ++s)
+        starts[s] = ((s / parts) * shape[axis] +
+            shape[axis] * (s % parts) / parts) * plane;
+    starts[slabs] = total;
     dispatch_parallel(pool, slabs, slabs, [&](size_t lo, size_t hi) {
         for (size_t s = lo; s < hi; ++s) {
-            auto dims = shape;
-            dims[0] = starts[s + 1] - starts[s];
-            counts[s] = serial(input + starts[s] * plane,
-                output + starts[s] * plane, dims, local_sources[s]);
+            std::vector<int64_t> dims(shape.begin() + axis, shape.end());
+            dims[0] = (starts[s + 1] - starts[s]) / plane;
+            counts[s] = serial(input + starts[s], output + starts[s],
+                               dims, local_sources[s]);
         }
     });
     int64_t provisional = 0;
@@ -516,39 +538,71 @@ inline int32_t cc_label_parallel_nd(
     std::vector<int64_t> strides, flat;
     std::vector<int8_t> offsets;
     detail::build_forward_neighbors(shape, conn, strides, flat, offsets);
-    std::vector<int> crossing;
     const int ndim = static_cast<int>(shape.size());
-    for (size_t k = 0; k < flat.size(); ++k)
-        if (offsets[k * ndim] == 1) crossing.push_back(static_cast<int>(k));
-    std::vector<int64_t> point(ndim, 0);
-    for (int s = 1; s < slabs; ++s) {
-        std::fill(point.begin(), point.end(), 0);
-        const int64_t first = starts[s] * plane - plane;
-        for (int64_t i = 0; i < plane; ++i) {
-            const int64_t at = first + i;
-            const int32_t a = output[at];
-            if (a) for (int k : crossing) {
-                bool valid = true;
-                for (int d = 1; d < ndim; ++d) {
-                    const int64_t q = point[d] + offsets[k * ndim + d];
-                    if (q < 0 || q >= shape[d]) { valid = false; break; }
+    if (axis == 0) {
+        std::vector<int> crossing;
+        for (size_t k = 0; k < flat.size(); ++k)
+            if (offsets[k * ndim] == 1) crossing.push_back(static_cast<int>(k));
+        std::vector<int64_t> point(ndim, 0);
+        for (int s = 1; s < slabs; ++s) {
+            std::fill(point.begin(), point.end(), 0);
+            const int64_t first = starts[s] - plane;
+            for (int64_t i = 0; i < plane; ++i) {
+                const int64_t at = first + i;
+                const int32_t a = output[at];
+                if (a) for (int k : crossing) {
+                    bool valid = true;
+                    for (int d = 1; d < ndim; ++d) {
+                        const int64_t q = point[d] + offsets[k * ndim + d];
+                        if (q < 0 || q >= shape[d]) { valid = false; break; }
+                    }
+                    if (!valid) continue;
+                    const int64_t neighbor = at + flat[k];
+                    const int32_t b = output[neighbor];
+                    if (!b) continue;
+                    if constexpr (PerLabel) if (input[at] != input[neighbor]) continue;
+                    if (uf.parent.empty()) {
+                        uf.parent.resize(static_cast<size_t>(provisional) + 1);
+                        uf.rank_.assign(uf.parent.size(), 0);
+                        for (size_t id = 0; id < uf.parent.size(); ++id)
+                            uf.parent[id] = static_cast<int32_t>(id);
+                    }
+                    uf.unite(bases[s - 1] + a, bases[s] + b);
                 }
-                if (!valid) continue;
-                const int64_t neighbor = at + flat[k];
-                const int32_t b = output[neighbor];
-                if (!b) continue;
-                if constexpr (PerLabel) if (input[at] != input[neighbor]) continue;
-                if (uf.parent.empty()) {
-                    uf.parent.resize(static_cast<size_t>(provisional) + 1);
-                    uf.rank_.assign(uf.parent.size(), 0);
-                    for (size_t id = 0; id < uf.parent.size(); ++id)
-                        uf.parent[id] = static_cast<int32_t>(id);
+                for (int d = ndim - 1; d > 0; --d) {
+                    if (++point[d] < shape[d]) break;
+                    point[d] = 0;
                 }
-                uf.unite(bases[s - 1] + a, bases[s] + b);
             }
-            for (int d = ndim - 1; d > 0; --d) {
-                if (++point[d] < shape[d]) break;
-                point[d] = 0;
+        }
+    } else {
+        auto merge = [&](int64_t at, int64_t neighbor, int sa, int sb) {
+            const int32_t a = output[at], b = output[neighbor];
+            if (!a || !b) return;
+            if constexpr (PerLabel) if (input[at] != input[neighbor]) return;
+            if (uf.parent.empty()) {
+                uf.parent.resize(static_cast<size_t>(provisional) + 1);
+                uf.rank_.assign(uf.parent.size(), 0);
+                for (size_t id = 0; id < uf.parent.size(); ++id)
+                    uf.parent[id] = static_cast<int32_t>(id);
+            }
+            uf.unite(bases[sa] + a, bases[sb] + b);
+        };
+        // This adaptive path uses face connectivity. Across a prefix plane,
+        // both endpoints have the same inner partition; across an inner cut,
+        // they belong to consecutive partitions in the same prefix plane.
+        for (int prefix = 1; prefix < static_cast<int>(prefixes); ++prefix) {
+            for (int part = 0; part < parts; ++part) {
+                const int lower = (prefix - 1) * parts + part;
+                for (int64_t at = starts[lower]; at < starts[lower + 1]; ++at)
+                    merge(at, at + shape[1] * plane, lower, lower + parts);
+            }
+        }
+        for (int prefix = 0; prefix < static_cast<int>(prefixes); ++prefix) {
+            for (int part = 1; part < parts; ++part) {
+                const int upper = prefix * parts + part;
+                for (int64_t i = 0; i < plane; ++i)
+                    merge(starts[upper] - plane + i, starts[upper] + i, upper - 1, upper);
             }
         }
     }
@@ -562,7 +616,7 @@ inline int32_t cc_label_parallel_nd(
         }
         dispatch_parallel(pool, slabs, slabs, [&](size_t lo, size_t hi) {
             for (size_t s = lo; s < hi; ++s)
-                for (int64_t i = starts[s] * plane; i < starts[s + 1] * plane; ++i)
+                for (int64_t i = starts[s]; i < starts[s + 1]; ++i)
                     if (output[i]) output[i] += bases[s];
         });
         return static_cast<int32_t>(provisional);
@@ -590,7 +644,7 @@ inline int32_t cc_label_parallel_nd(
     dispatch_parallel(pool, slabs, slabs, [&](size_t lo, size_t hi) {
         for (size_t s = lo; s < hi; ++s) {
             const int32_t* table = remap.data() + bases[s];
-            for (int64_t i = starts[s] * plane; i < starts[s + 1] * plane; ++i)
+            for (int64_t i = starts[s]; i < starts[s + 1]; ++i)
                 if (output[i]) output[i] = table[output[i]];
         }
     });

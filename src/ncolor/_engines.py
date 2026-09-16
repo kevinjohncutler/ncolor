@@ -329,6 +329,11 @@ class Engine:
         from .expand import expand_labels as _expand_labels
         return _expand_labels(label_image, _engine=self, **kwargs)
 
+    def prepare_labels(self, lab, **kwargs):
+        """As :func:`ncolor.prepare_labels`, using this engine's workers."""
+        from .prepared import prepare_labels
+        return prepare_labels(lab, _engine=self, **kwargs)
+
     def connected_components(self, mask, conn=None):
         """As :func:`ncolor.connected_components`, using this engine's pool."""
         from .color import connected_components

@@ -41,6 +41,26 @@ Nothing is measured or configured for this. Whether spreading calls out beats ta
 
 Any integer, bool or float label array is accepted; the cast to the engine's int32 runs in parallel inside the call. Labels beyond the int32 range are compacted automatically by `label` and `format_labels`. The engine keeps the scratch memory of the largest image it has processed until `release_buffers()` is called.
 
+## Repeated coloring
+
+For an unchanged label image, prepare its expansion and contact graphs once:
+
+```python
+prepared = ncolor.prepare_labels(masks, expand_mode="clean")
+colored = prepared.color(n=4)
+colored_again = prepared.color(n=5)
+print(prepared.nbytes)  # owned array bytes
+```
+
+Preparation owns a snapshot, so later edits to `masks` do not affect it.
+Create a new snapshot when the geometry, expansion, connectivity, or weight
+settings change. Each coloring call can change the color target, search
+depth, and perceptual palette. `Engine.prepare_labels(...)` and
+`prepared.color(engine=engine)` provide explicit worker control. A snapshot
+retains four bytes per pixel plus its graph arrays; release it when done.
+See [performance exploration](PERFORMANCE_EXPLORATION.md) for measured
+tradeoffs and experiments that were not promoted into the library.
+
 ## Vector geometry (GeoDataFrames, GeoJSON)
 
 Data that starts out as polygons does not have to be rasterized to be colored. `ncolor.geo.label` reads the adjacency straight off the geometry, so nothing is lost on the way in:
@@ -79,13 +99,13 @@ colors = ncolor.color_graph(edges, n_vertices=len(nodes))   # 0-indexed pairs
 
 v2 is a complete C++ rewrite. Every stage of the pipeline including label expansion has been optimized, resulting in 7–12× speedups end-to-end. The new default expand removes 1-pixel bridges and spurs before the picker sees them, and an auto-soft constraint refines the hard 4-coloring via local search to differentiate near-adjacent cells. Together these break the K₅-shaped convergence clusters that forced the v1 numba pipeline up to `N = 5`. See [CHANGELOG.md](CHANGELOG.md) for the full list of changes and the migration table from v1.
 
-The rewrite also brings drop-in C++ replacements for the scikit-image and `scipy.ndimage` / `edt` calls the old pipeline relied on, with no extra install:
+The rewrite also brings drop-in C++ replacements for the image-analysis and distance-transform calls the old pipeline relied on, with no extra install:
 
 | ncolor | replaces | typical speedup |
 |---|---|---|
 | `ncolor.connected_components` | `skimage.measure.label` | 1.5–3× |
 | `ncolor.regionprops` | `skimage.measure.regionprops` (vectorized subset: area / bbox / centroid) | 1.5–3× |
-| `ncolor.expand_labels` | `skimage.segmentation.expand_labels` + `scipy.ndimage.distance_transform_edt` | ND-parallel L1 / L2 in-engine; no scipy or `edt` dependency |
+| `ncolor.expand_labels` | `skimage.segmentation.expand_labels` + `scipy.ndimage.distance_transform_edt` | Parallel L1 / L2 expansion in any dimension; no extra dependency |
 | `ncolor.delete_spurs` | hand-rolled morphology / not in scikit-image | ND, parallel |
 
 

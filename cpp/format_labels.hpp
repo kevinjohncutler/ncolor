@@ -256,6 +256,54 @@ inline int32_t format_labels_inplace(int32_t* lbl, int64_t total,
     return next_lbl;
 }
 
+// Narrow integer dtypes provide an exact domain bound before reading pixels.
+// Build presence from the source, then cast and remap together. This avoids
+// an int32 copy, range scan, and another scan of the larger converted image.
+template <typename T>
+inline int32_t format_byte_labels(const T* input, int32_t* output, int64_t total,
+                                  ForkJoinPool& pool, int n_threads) {
+    static_assert(std::is_integral<T>::value && sizeof(T) == 1,
+                  "format_byte_labels requires a one-byte integer dtype");
+    constexpr int minimum = static_cast<int>(std::numeric_limits<T>::min());
+    constexpr size_t width = static_cast<size_t>(static_cast<int>(std::numeric_limits<T>::max()) - minimum + 1);
+    const size_t chunks = (n_threads > 1 && total >= detail::FORMAT_LABELS_SERIAL_THRESHOLD)
+        ? std::min(static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD,
+                   size_t{1048576} / width) : 1;
+    std::vector<uint8_t> present(chunks * width, 0);
+    auto collect = [&](size_t lo, size_t hi) {
+        for (size_t c = lo; c < hi; ++c) {
+            const size_t size = static_cast<size_t>(total);
+            const size_t begin = size / chunks * c + std::min(size % chunks, c);
+            const size_t end = size / chunks * (c + 1) + std::min(size % chunks, c + 1);
+            uint8_t* local = present.data() + c * width;
+            for (size_t i = begin; i < end; ++i)
+                local[static_cast<int>(input[i]) - minimum] = 1;
+        }
+    };
+    if (chunks == 1) collect(0, 1);
+    else dispatch_parallel(pool, chunks, chunks, collect);
+    std::vector<int32_t> mapping(width, 0);
+    int32_t count = 0;
+    bool first = true;
+    for (size_t v = 0; v < width; ++v) {
+        uint8_t found = 0;
+        for (size_t c = 0; c < chunks; ++c) found |= present[c * width + v];
+        if (found) {
+            if (!(first && static_cast<int>(v) + minimum <= 0)) mapping[v] = ++count;
+            first = false;
+        }
+    }
+    auto apply = [&](size_t lo, size_t hi) {
+        for (size_t i = lo; i < hi; ++i) {
+            const int32_t value = mapping[static_cast<int>(input[i]) - minimum];
+            output[i] = value;
+        }
+    };
+    if (chunks == 1) apply(0, static_cast<size_t>(total));
+    else dispatch_parallel(pool, static_cast<size_t>(total), chunks, apply);
+    return count;
+}
+
 // ---- Range-checked casts to int32 -----------------------------------------
 //
 // Every engine entry point works on int32 labels internally. Inputs that

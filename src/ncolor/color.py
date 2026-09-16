@@ -38,7 +38,7 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
           extra_edges=None, connect_radius=1,
           min_contact=1, expand_mode="clean",
           soft_extra_edges=None, soft_conn=2, soft_radius=2,
-          clean_mask=False, _engine=None):
+          clean_mask=False, _engine=None, _prepared=None):
     """4-color graph coloring of a label image.
 
     Returns a uint8 image where every foreground pixel of ``lab`` has
@@ -249,6 +249,8 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
         soft_radius=int(soft_radius),
         clean_mask=bool(clean_mask),
         capture_stages=bool(verbose))
+    if _prepared is not None:
+        call_kwargs["_prepared"] = _prepared
     # The engine is held for the call and the accessor reads that follow,
     # since those report on its most recent call.
     with _use(_engine) as engine:
@@ -261,6 +263,8 @@ def label(lab, n=4, conn=1, max_depth=30, expand=True,
             # the fast path: compact the labels in numpy and go again.
             lab_arr = _compact_wide_labels(lab_arr)
             out_array, n_used = solver.label(lab_arr, **call_kwargs)
+        if _prepared is not None:
+            return _prepared
         stages = solver.get_last_stages() if verbose else ()
         sv = solver.get_last_n_soft_violations() if verbose else 0.0
         lut = solver.get_last_lut() if return_lut else None
