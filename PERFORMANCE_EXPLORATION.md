@@ -3,8 +3,9 @@
 Measured September 16, 2026. The baseline is the saved build from the start
 of this exploration, after the previous correctness audit. It is not the
 published 2.2.0 build. Measurements use macOS, Apple M5 Max, Python 3.13,
-and four workers unless specified. These are synthetic workloads on one
-machine, not portable speedup guarantees.
+and four workers unless specified. The completion round below adds a
+second Apple Silicon machine. These synthetic measurements are not
+portable speedup guarantees.
 
 ## What changed
 
@@ -299,7 +300,7 @@ but do not establish stable absolute performance on an idle machine.
 Correctness fingerprints remained identical. No unrelated process was
 stopped to improve the measurements.
 
-### Next experiments
+### Candidates selected for the completion round
 
 The largest remaining opportunity is to keep final feature-transform
 storage in place through cleanup and contact extraction, avoiding an
@@ -315,7 +316,148 @@ Reproduce the follow-up with `bench/thin_components.py`,
 `bench/narrow_format.py`, `bench/prepared_labels.py`, and
 `bench/next_memory.py`, each taking `--output PATH`. Compile the standalone
 contact experiment with C++17, optimization, pthread support, and `-I cpp`.
-When saving a benchmark copy from a quarantined network volume on macOS,
-remove the inherited quarantine attribute from that deliberate local copy
-before importing it. Normal network builds continue to use the backend's
-local-cache loader; compiling on a network mount is still supported.
+Normal network builds continue to use the backend's local-cache loader
+when required by the mount. Compiling and keeping benchmark working copies
+on network storage remains supported.
+
+
+## Completion round: integrated layout and compact prepared rendering
+
+This round compares with local checkpoint `f644da0`. All production changes
+below are integrated; the benchmark-only contact-fusion prototype remains
+an experiment. Builds and working copies stayed on shared storage, including
+the provider-backed view used for native execution.
+
+### Retain the feature-transform layout through contact extraction
+
+The standard and clean Euclidean expansion drivers can now leave their final
+labels and distances in transposed storage. Cleanup and contact extraction
+consume that storage directly, avoiding the last label transpose. Public
+expansion still returns the original layout, with unchanged tie behavior.
+The coloring renderer uses the original foreground labels, so this remains
+a feature transform that propagates labels throughout expansion.
+
+Production dispatch is deliberately bounded by measurements: two active
+axes, at least 262,144 pixels, both active extents at least 128, narrow
+distances, no weighting, no altered output mask, and no additional despur
+iterations. Singleton axes are supported, including connectivity requested
+using the original rank. Weighted and higher-dimensional calls keep their
+previous path. The broader retained-layout experiment was correct in three
+and four dimensions, but thin three-dimensional cleanup could be about
+three times slower. That variant was not enabled.
+
+Three paired runs on each of two Apple Silicon machines checked exact output
+fingerprints on every timed call. For 2048 x 2048 inputs, whole-pipeline
+speedups were 1.011x to 1.088x on M5 Max and 1.026x to 1.058x on M1 Ultra.
+Rectangular two-dimensional cases measured 1.017x to 1.202x with one worker
+and 0.970x to 1.212x with four. These are modest, workload-dependent gains.
+Unchanged three-dimensional controls had one 0.900x outlier on the primary
+machine; the second machine's controls were 0.973x to 1.013x. Background
+activity still prevents a claim of stable absolute timings on an idle host.
+
+`bench/deferred_layout.cpp` now calls the shipped expansion drivers rather
+than duplicating their internals. All 36 combinations of shape, cleanup,
+and periodic boundaries compare restored labels and hard/soft contacts.
+`bench/completion_performance.py` measures the complete production path
+with alternating paired calls, including rectangular and fallback controls.
+
+### Smaller prepared snapshots and lookup-only recoloring
+
+Prepared render identifiers now use one, two, or four bytes according to
+the maximum label identifier. Hard and soft graph storage is unchanged.
+Lookup-table-only recoloring skips image allocation and rendering; an
+explicit output array still receives the rendered image and is validated.
+
+| Snapshot workload | Before bytes | After bytes | Reduction |
+|---|---|---|---|
+| 2048 x 2048, unweighted | 17066040 | 8677432 | 49.2% |
+| 2048 x 2048, weighted | 17195064 | 8806456 | 48.8% |
+| 96 x 96 x 96, unweighted | 3541208 | 887000 | 75.0% |
+| 96 x 96 x 96, weighted | 3542072 | 887864 | 74.9% |
+
+Across the prepared benchmarks, lookup-only recoloring improved 1.14x to
+6.11x. Ordinary recoloring ranged from 0.95x to 1.12x. Unweighted 2048 x
+2048 preparation improved 1.13x to 1.14x, while weighted 512 x 512 clean
+preparation measured 0.94x in the aggregate. The memory reduction and
+lookup-only savings are the robust benefits; preparation is not uniformly
+faster. Complete images and lookup tables matched the checkpoint exactly.
+
+### Correctness and cleanup
+
+Unformatted negative label identifiers now raise a clear exception before
+they can index a lookup table. Normal formatting continues to support
+negative source labels, and fractional floating values retain their existing
+integer truncation behavior. Tests cover serial and parallel cast boundaries
+and engine reuse after rejection.
+
+Extension cache publication now verifies complete winner contents after a
+rename collision, tolerates a bounded visibility delay, and serializes
+competing writers within a process. Network filesystem tests exposed empty
+cached reads immediately after concurrent renames and permissions that did
+not follow local filesystem assumptions. Tests now exercise those behaviors
+without assuming the temporary directory is local. The cache destination
+and the existing network-loading policy are unchanged.
+
+Unused duplicate experiment logic was removed when the retained-layout
+benchmark switched to the shipped drivers. Broader variants that regressed
+performance remain disabled rather than expanding production dispatch.
+
+### Final validation and stopping evidence
+
+The complete primary suite passed 1,087 tests with four skipped. The second
+Mac passed 1,044 with 13 skipped; its native compiler harness was excluded
+and optional geometry dependencies were unavailable. Geometry was covered
+on the primary machine. Both native contract tests and the 36-case layout
+experiment passed AddressSanitizer and UndefinedBehaviorSanitizer after
+the final native changes. After the last loader adjustment, all 44 resource
+tests passed in three consecutive runs on the second machine. The primary
+resource and coverage suites then passed all 130 tests.
+
+The final three broad primary rounds each checked 816 correctness cases
+and 13 resource workloads over 300 blocks, or 1,200 calls per workload.
+All three had zero resident-memory variation over the final ten blocks,
+and worker counts stayed constant. Three secondary rounds checked 810
+cases and 12 workloads over 100 blocks, explicitly omitting geometry;
+final-window variation was 901,120 bytes, 278,528 bytes, and zero.
+The existing eight-mebibyte limit was not relaxed.
+
+One earlier 100-block run exceeded that limit with a 12,533,760-byte final
+window range. Its resident memory had first fallen by 88 mebibytes and
+then partially refilled; its final usage remained below its initial usage.
+That pattern is consistent with allocator/page reclamation rather than
+unbounded retained growth, but it remains recorded as a failed run.
+The three longer runs above were added to investigate it, not substituted
+for it in the raw history. Earlier rounds and all final histories are
+retained in `bench/audit_results/completion_*`.
+
+Repeated broad review now yields no further material correctness findings.
+Valid-input output fingerprints remain identical, memory reaches a plateau
+in the longer runs, and paired performance establishes the bounded gains
+above. Absolute timing noise and small regressions are disclosed rather
+than described as universal improvements. This is the stopping point for
+this round; the experiments below are future scope.
+
+Reproduction entry points are `bench/audit_round.py` (including explicit
+`--skip-geometry` for hosts without that extra), `bench/prepared_labels.py`,
+`bench/completion_performance.py`, and `bench/deferred_layout.cpp`.
+Prepared before/after summaries are in `completion_prepared_summary.json`;
+layout raw results use `completion_layout_*`, `completion_second_host_layout_*`,
+`completion_rectangular_*`, and `deferred_layout_final.csv` under
+`bench/audit_results/`.
+
+### Future work beyond this completed round
+
+- Measure retained-layout weighted contact extraction with matching distance
+  storage and all reduction modes. Contact-count weighting is a useful first
+  case because it does not need distance magnitudes.
+- Investigate cleanup locality for higher-dimensional retained layouts before
+  enabling them. Exact equivalence alone did not justify their measured cost.
+- Compare sparse source-only prepared render maps against the new compact
+  dense representation, including output clearing and irregular writes.
+- Explore parallel prefix-plane component merging only with deterministic
+  numbering, contention, and seam overhead included in whole-operation timing.
+
+The earlier thin-component and private byte-presence improvements remain
+integrated. Connected components support cleanup and per-label processing
+as well as the public convenience operation; they are not an extra pass
+required by every coloring call.

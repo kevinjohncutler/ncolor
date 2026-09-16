@@ -26,6 +26,7 @@
 #include <utility>
 #include <type_traits>
 #include <vector>
+#include <variant>
 
 #include "cc_label.hpp"
 #include "chamfer.hpp"
@@ -838,16 +839,27 @@ static std::vector<double> default_palette(int n_colors) {
 // The Python interface exposes metadata and coloring, never writable arrays.
 struct PreparedRaster {
     std::vector<int64_t> shape;
-    std::vector<int32_t> render_labels, indptr, indices, src, dst;
+    using RenderLabels = std::variant<std::vector<uint8_t>, std::vector<uint16_t>,
+                                      std::vector<int32_t>>;
+    RenderLabels render_labels;
+    std::vector<int32_t> indptr, indices, src, dst;
     std::vector<int32_t> soft_indptr, soft_indices;
     std::vector<double> edge_weights;
     std::vector<float> soft_weights;
     int32_t n_vertices = 0;
     int active_ndim = 0, weight_objective = 0;
     bool wrap = false, ready = false;
+    void allocate_render(size_t total, int32_t labels) {
+        if (labels <= UINT8_MAX) render_labels.emplace<std::vector<uint8_t>>(total, 0);
+        else if (labels <= UINT16_MAX) render_labels.emplace<std::vector<uint16_t>>(total, 0);
+        else render_labels.emplace<std::vector<int32_t>>(total, 0);
+    }
     size_t nbytes() const {
-        return sizeof(int64_t) * shape.size() + sizeof(int32_t) *
-            (render_labels.size() + indptr.size() + indices.size() + src.size() +
+        const size_t raster_bytes = std::visit([](const auto& values) {
+            return values.size() * sizeof(typename std::decay_t<decltype(values)>::value_type);
+        }, render_labels);
+        return raster_bytes + sizeof(int64_t) * shape.size() + sizeof(int32_t) *
+            (indptr.size() + indices.size() + src.size() +
              dst.size() + soft_indptr.size() + soft_indices.size()) +
             sizeof(double) * edge_weights.size() + sizeof(float) * soft_weights.size();
     }
@@ -981,7 +993,8 @@ public:
             py::object soft_extra_edges_obj = py::none(),
             int soft_conn = 2,
             int soft_radius = 2,
-            bool clean_mask = false, PreparedRaster* prepared = nullptr) {
+            bool clean_mask = false, PreparedRaster* prepared = nullptr,
+            bool retain_layout = true) {
         ncolor_cpp::validate_coloring_budget(n_colors, max_depth);
         // color_mode: -1 = auto (default; threshold-based), 0 = force serial,
         // 1 = force parallel. Used by benchmarks to A/B test the parallel
@@ -1097,15 +1110,20 @@ public:
             bg_mask_.resize(static_cast<size_t>(total));
             int32_t* expanded = expand_bufs_.lbl();
             uint8_t* bg = bg_mask_.data();
-            bool fits = true;
+            bool fits = true, has_negative = false;
             dispatch_cast_dtype(buf.format, buf.itemsize, "Solver.label",
                 [&](auto* tag) {
                     using T = std::remove_pointer_t<decltype(tag)>;
-                    fits = ncolor_cpp::cast_with_bg<T>(
+                    if (format_input) fits = ncolor_cpp::cast_with_bg<T>(
                         static_cast<const T*>(src_ptr), expanded, bg, total,
                         pool_->pool, n_threads_);
+                    else fits = ncolor_cpp::cast_with_bg<T, true>(
+                        static_cast<const T*>(src_ptr), expanded, bg, total,
+                        pool_->pool, n_threads_, &has_negative);
                 });
             if (!fits) throw_label_overflow("Solver.label");
+            if (has_negative) throw std::invalid_argument(
+                "format_input=False requires nonnegative labels");
             stage("cast");
 
             // 0b. Optional format_labels: compact nonzero labels to 1..N
@@ -1179,6 +1197,18 @@ public:
             // Labels are still propagated exactly. Only the final distance
             // transpose is optional once no later stage consumes distances.
             const bool keep_distances = weight_objective != 0 && weight_mode != 4;
+            std::vector<int64_t> graph_shape = shape;
+            const int active_axes = static_cast<int>(std::count_if(shape.begin(), shape.end(),
+                [](int64_t extent) { return extent > 1; }));
+            // Retaining the final layout saves a full label transpose for
+            // large 2D fields. Thin higher-dimensional cleanup loses locality
+            // in this layout; weighted and altered-mask calls keep their path.
+            const bool retained = retain_layout && expand && p == 2 && active_axes == 2
+                && total >= 262144 && !clean_mask && despur_iters == 0 && weight_objective == 0
+                && std::all_of(shape.begin(), shape.end(), [](int64_t extent) {
+                    return extent == 1 || extent >= 128;
+                }) && !ncolor_cpp::l2_needs_wide_distance(shape);
+
             if (expand) {
                 if (em == "clean") {
                     // Voronoi expand + antipodal-bridge test + despur
@@ -1188,10 +1218,13 @@ public:
                     // already points to.
                     ncolor_cpp::expand_labels_clean_inplace(
                         expand_input, expand_bufs_, shape,
-                        pool_->pool, n_threads_, p, wrap, keep_distances);
+                        pool_->pool, n_threads_, p, wrap, keep_distances, retained ? &graph_shape : nullptr);
                 } else if (em == "standard") {
                     if (p == 2) {
-                        ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_, shape, pool_->pool, n_threads_, wrap, keep_distances);
+                        if (retained) ncolor_cpp::expand_labels_inplace(expand_input, expand_bufs_,
+                            shape, pool_->pool, n_threads_, wrap, keep_distances, &graph_shape);
+                        else ncolor_cpp::expand_labels_lp<2>(expand_input, expanded, expand_bufs_,
+                            shape, pool_->pool, n_threads_, wrap, keep_distances);
                     } else {
                         ncolor_cpp::expand_labels_lp<1>(expand_input, expanded, expand_bufs_, shape, pool_->pool, n_threads_, wrap);
                     }
@@ -1204,6 +1237,13 @@ public:
             // (Suppress unused-var warning when expand=false — expanded
             // already equals expand_input == expand_bufs_.lbl().)
             (void)expand_input;
+            if (retained) {
+                expanded = expand_bufs_.lbl_T();
+                // Expansion removes singleton axes. Preserve the effective
+                // neighborhood when callers requested connectivity by rank.
+                conn = std::min(conn, static_cast<int>(graph_shape.size()));
+                soft_conn = std::min(soft_conn, static_cast<int>(graph_shape.size()));
+            }
             stage("expand");
 
             // 1b. Optional label-aware despur. After expand_labels
@@ -1240,7 +1280,9 @@ public:
             // and use that for the final LUT application. Despur still
             // modifies ``expanded`` in place so find_pairs / coloring
             // operate on the despurred graph.
-            const int32_t* lut_lbl_ptr = expanded;
+            // Original foreground seeds retain their own label before the
+            // final sweep. Clean output uses the pre-expansion snapshot.
+            const int32_t* lut_lbl_ptr = retained ? expand_bufs_.lbl() : expanded;
             if (despur_iters > 0 && expand) {
                 lut_lbl_.assign(expanded, expanded + total);
                 lut_lbl_ptr = lut_lbl_.data();
@@ -1281,28 +1323,28 @@ public:
                     switch (static_cast<ReduceMode>(wmode)) {
                         case ReduceMode::Max:
                             pairs = find_pairs_weighted_<ReduceMode::Max>(
-                                expanded, distances, shape, conn, wrap,
+                                expanded, distances, graph_shape, conn, wrap,
                                 n_labels, pair_primary, pair_counts, connect_radius); break;
                         case ReduceMode::Mean:
                             pairs = find_pairs_weighted_<ReduceMode::Mean>(
-                                expanded, distances, shape, conn, wrap,
+                                expanded, distances, graph_shape, conn, wrap,
                                 n_labels, pair_primary, pair_counts, connect_radius); break;
                         case ReduceMode::Count:
                             pairs = find_pairs_weighted_<ReduceMode::Count>(
-                                expanded, distances, shape, conn, wrap,
+                                expanded, distances, graph_shape, conn, wrap,
                                 n_labels, pair_primary, pair_counts, connect_radius); break;
                         case ReduceMode::Harmonic:
                             pairs = find_pairs_weighted_<ReduceMode::Harmonic>(
-                                expanded, distances, shape, conn, wrap,
+                                expanded, distances, graph_shape, conn, wrap,
                                 n_labels, pair_primary, pair_counts, connect_radius); break;
                         case ReduceMode::MeanInv:
                             pairs = find_pairs_weighted_<ReduceMode::MeanInv>(
-                                expanded, distances, shape, conn, wrap,
+                                expanded, distances, graph_shape, conn, wrap,
                                 n_labels, pair_primary, pair_counts, connect_radius); break;
                         case ReduceMode::Min:
                         default:
                             pairs = find_pairs_weighted_<ReduceMode::Min>(
-                                expanded, distances, shape, conn, wrap,
+                                expanded, distances, graph_shape, conn, wrap,
                                 n_labels, pair_primary, pair_counts, connect_radius); break;
                     }
                 };
@@ -1340,7 +1382,7 @@ public:
                 std::vector<double> primary_unused;
                 pair_counts.clear();
                 pairs = find_pairs_weighted_<ReduceMode::Count>(
-                    expanded, static_cast<const int32_t*>(nullptr), shape, conn, wrap,
+                    expanded, static_cast<const int32_t*>(nullptr), graph_shape, conn, wrap,
                     n_labels, primary_unused, pair_counts,
                     connect_radius);
                 // Filter pairs by count.
@@ -1366,16 +1408,16 @@ public:
                 // emit path when no soft kernel is requested or when it
                 // would be a subset of the base.
                 const int64_t n_fwd_base = ncolor_cpp::detail::
-                    count_forward_neighbors(shape, conn, connect_radius);
+                    count_forward_neighbors(graph_shape, conn, connect_radius);
                 const int64_t n_fwd_soft = ncolor_cpp::detail::
-                    count_forward_neighbors(shape, soft_conn, soft_radius);
+                    count_forward_neighbors(graph_shape, soft_conn, soft_radius);
                 const int64_t n_fwd_delta = std::max<int64_t>(1, n_fwd_soft - n_fwd_base);
                 uint64_t base_ht_size = initial_ht_size_(0, n_fwd_base, n_labels);
                 uint64_t soft_ht_size = initial_ht_size_(0, n_fwd_delta, n_labels);
                 for (;;) {
                     const int full =
                         ncolor_cpp::find_pairs_dual_nd_unpadded<int32_t>(
-                            expanded, shape, conn, connect_radius,
+                            expanded, graph_shape, conn, connect_radius,
                             soft_conn, soft_radius,
                             base_ht_size, soft_ht_size,
                             n_threads_, pool_->pool, wrap,
@@ -1404,9 +1446,9 @@ public:
                 // The dual builder enumerates a containing soft kernel, so it
                 // cannot represent this union. Scan each kernel independently
                 // and remove hard pairs from the soft preference set.
-                pairs = find_pairs_(expanded, shape, conn, wrap,
+                pairs = find_pairs_(expanded, graph_shape, conn, wrap,
                                     max_label, connect_radius);
-                auto soft_all = find_pairs_(expanded, shape, soft_conn, wrap,
+                auto soft_all = find_pairs_(expanded, graph_shape, soft_conn, wrap,
                                             max_label, soft_radius);
                 std::sort(pairs.begin(), pairs.end());
                 std::sort(soft_all.begin(), soft_all.end());
@@ -1423,7 +1465,7 @@ public:
                 // separated by a thin gap of another cell's
                 // territory. Same parallel + offset-precomputed
                 // kernel regardless of radius.
-                pairs = find_pairs_(expanded, shape, conn, wrap,
+                pairs = find_pairs_(expanded, graph_shape, conn, wrap,
                                      max_label, connect_radius);
                 fused_soft_pairs_.clear();
             }
@@ -1455,7 +1497,7 @@ public:
             if ((wobj != 0 || min_contact > 1) &&
                 soft_conn > 0 && soft_radius > 0 &&
                 (min_contact > 1 || soft_conn > conn || soft_radius > connect_radius)) {
-                auto soft_all = find_pairs_(expanded, shape, soft_conn, wrap,
+                auto soft_all = find_pairs_(expanded, graph_shape, soft_conn, wrap,
                                             max_label, soft_radius);
                 std::sort(soft_all.begin(), soft_all.end());
                 std::set_difference(soft_all.begin(), soft_all.end(),
@@ -1468,7 +1510,7 @@ public:
                 std::fprintf(stderr, "[ncolor] find_pairs: %zu pairs "
                               "(conn=%d, radius=%d, ndim=%d)\n",
                               pairs.size(), conn, connect_radius,
-                              (int)shape.size());
+                              (int)graph_shape.size());
             }
 
             // 3. Build CSR (labels are 1..max_label after expand → node = label-1).
@@ -1654,13 +1696,16 @@ public:
                     snapshot.soft_indices = soft_indices_;
                     snapshot.soft_weights = soft_weights_;
                 }
-                snapshot.render_labels.resize(static_cast<size_t>(total));
-                ncolor_cpp::dispatch_parallel(pool_->pool, static_cast<size_t>(total),
-                    static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
-                    [&](size_t begin, size_t end) {
-                        for (size_t i = begin; i < end; ++i)
-                            snapshot.render_labels[i] = bg_mask_[i] ? 0 : lut_src[i];
-                    });
+                snapshot.allocate_render(static_cast<size_t>(total), N);
+                std::visit([&](auto& render_labels) {
+                    using Label = typename std::decay_t<decltype(render_labels)>::value_type;
+                    ncolor_cpp::dispatch_parallel(pool_->pool, static_cast<size_t>(total),
+                        static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
+                        [&](size_t begin, size_t end) {
+                            for (size_t i = begin; i < end; ++i)
+                                render_labels[i] = bg_mask_[i] ? 0 : static_cast<Label>(lut_src[i]);
+                        });
+                }, snapshot.render_labels);
             } else {
                 lut_.assign(static_cast<size_t>(N) + 1, 0);
                 for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
@@ -1674,7 +1719,7 @@ public:
                 [](int64_t extent) { return extent > 1; }));
             snapshot.wrap = wrap;
             snapshot.weight_objective = weight_objective;
-            if (early_exit_empty) snapshot.render_labels.assign(static_cast<size_t>(total), 0);
+            if (early_exit_empty) snapshot.allocate_render(static_cast<size_t>(total), 0);
             snapshot.ready = true;
             *prepared = std::move(snapshot);
         }
@@ -1684,7 +1729,8 @@ public:
 
     std::pair<py::array_t<uint8_t>, int> color_prepared(
             const PreparedRaster& prepared, int n_colors = 4, int max_depth = 30,
-            py::object de_table_obj = py::none(), py::object out_arg = py::none()) {
+            py::object de_table_obj = py::none(), py::object out_arg = py::none(),
+            bool render = true) {
         if (!prepared.ready) throw std::invalid_argument("prepared labels are not initialized");
         ncolor_cpp::validate_coloring_budget(n_colors, max_depth);
         std::vector<double> palette;
@@ -1702,7 +1748,11 @@ public:
         }
         py::buffer_info info;
         info.shape.assign(prepared.shape.begin(), prepared.shape.end());
-        auto out = prepare_out_buffer_(out_arg, info, static_cast<int>(prepared.shape.size()));
+        // Explicit output buffers are still filled for lookup-table callers.
+        const bool render_output = render || !out_arg.is_none();
+        auto out = render_output
+            ? prepare_out_buffer_(out_arg, info, static_cast<int>(prepared.shape.size()))
+            : py::array_t<uint8_t>(0);
         auto* output = out.mutable_data();
         int used = 0;
         {
@@ -1732,12 +1782,14 @@ public:
             }
             lut_.assign(static_cast<size_t>(N) + 1, 0);
             for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
-            ncolor_cpp::dispatch_parallel(pool_->pool, prepared.render_labels.size(),
-                static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
-                [&](size_t begin, size_t end) {
-                    for (size_t i = begin; i < end; ++i)
-                        output[i] = lut_[prepared.render_labels[i]];
-                });
+            if (render_output) std::visit([&](const auto& render_labels) {
+                ncolor_cpp::dispatch_parallel(pool_->pool, render_labels.size(),
+                    static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
+                    [&](size_t begin, size_t end) {
+                        for (size_t i = begin; i < end; ++i)
+                            output[i] = lut_[render_labels[i]];
+                    });
+            }, prepared.render_labels);
         }
         return {std::move(out), used};
     }
@@ -2379,6 +2431,7 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("soft_conn") = 2,
              py::arg("soft_radius") = 2,
              py::arg("clean_mask") = false, py::arg("_prepared") = nullptr,
+             py::arg("_retain_layout") = true,
              "Run [format_labels →] [expand →] connect → CSR → color → apply LUT.\n"
              "Any ndim ≥ 2; conn ∈ [1, ndim].\n"
              "p selects the expand metric: p=1 (Saito-Toriwaki sweep,\n"
@@ -2402,7 +2455,7 @@ PYBIND11_MODULE(_impl, m) {
              "tightly-cropped microcolony images at ~zero runtime cost.")
         .def("color_prepared", &Solver::color_prepared,
              py::arg("prepared"), py::arg("n_colors") = 4, py::arg("max_depth") = 30,
-             py::arg("de_table") = py::none(), py::arg("out") = py::none())
+             py::arg("de_table") = py::none(), py::arg("out") = py::none(), py::arg("render") = true)
         .def("connect", &Solver::connect,
              py::arg("mask"), py::arg("conn") = 1, py::arg("wrap") = false,
              "Adjacency pairs for a label image. Returns an (M, 2) int32\n"

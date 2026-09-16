@@ -76,7 +76,7 @@ def test_prepared_owns_input_and_survives_engine_reuse(image):
     engine = ncolor.Engine(n_threads=2)
     expected = engine.label(image)
     prepared = engine.prepare_labels(image)
-    assert prepared.nbytes >= image.size * 4
+    assert prepared.nbytes >= image.size
     image[:] = 0
     engine.label(np.ones((71, 73), np.int32))
     engine.release_buffers()
@@ -166,3 +166,84 @@ def test_prepared_weighted_isolates_after_weighted_graph():
     options = dict(expand=False, weight_objective=1, soft_extra_edges=np.empty((0, 2), np.int32))
     prepared = engine.prepare_labels(image, **options)
     np.testing.assert_array_equal(prepared.color(engine=engine), engine.label(image, **options))
+
+
+@pytest.mark.parametrize('count', [1, 255, 256, 65535, 65536])
+def test_prepared_compact_render_boundaries(count):
+    image = np.arange(count + 1, dtype=np.int32).reshape(1, -1)
+    engine = ncolor.Engine(n_threads=2)
+    options = dict(expand=False, soft_conn=0, soft_radius=0)
+    prepared = engine.prepare_labels(image, **options)
+    expected, lut = engine.label(image, **options), engine.label(image, return_lut=True, **options)
+    np.testing.assert_array_equal(prepared.color(engine=engine), expected)
+    np.testing.assert_array_equal(prepared.color(return_lut=True, engine=engine), lut)
+    out = np.full(image.shape, 255, dtype=np.uint8)
+    np.testing.assert_array_equal(prepared.color(return_lut=True, out=out, engine=engine), lut)
+    np.testing.assert_array_equal(out, expected)
+    # Account for all array payload: shape, labels, row offsets, adjacency,
+    # and source/destination edge lists of this simple chain.
+    width = 1 if count <= 255 else 2 if count <= 65535 else 4
+    assert prepared.nbytes == 16 + image.size * width + (count + 1) * 4 + (count - 1) * 16
+
+
+def test_prepared_lookup_skips_native_raster_and_still_validates_out():
+    prepared = ncolor.prepare_labels(np.ones((513, 517), np.int32))
+    data = prepared._PreparedLabels__data
+    solver = _impl.Solver(1)
+    image, count = solver.color_prepared(data, render=False)
+    assert image.shape == (0,) and count == 1
+    with pytest.raises(ValueError):
+        prepared.color(return_lut=True, out=np.zeros((1,), np.uint8))
+
+
+@pytest.mark.parametrize('shape', [(513, 517), (1, 513, 1, 517), (2, 257, 263)])
+@pytest.mark.parametrize('mode', ['standard', 'clean'])
+@pytest.mark.parametrize('wrap', [False, True])
+def test_retained_layout_matches_original_pipeline(shape, mode, wrap):
+    rng = np.random.default_rng(524)
+    image = np.zeros(shape, np.int32)
+    selected = rng.choice(image.size, 101, replace=False)
+    image.flat[selected] = np.arange(1, 102)
+    engine = ncolor.Engine(n_threads=4)
+    solver = engine._solver
+    for options in [dict(), dict(conn=2, connect_radius=2, min_contact=3),
+                    dict(conn=len(shape), soft_conn=1, soft_radius=3),
+                    dict(clean_mask=True), dict(weight_objective=1),
+                    dict(extra_edges=np.array([[1, 4]], np.int32),
+                         soft_extra_edges=np.array([[3, 6]], np.int32))]:
+        common = dict(p=2, expand_mode=mode, wrap=wrap, **options)
+        expected, count = solver.label(image, _retain_layout=False, **common)
+        lut = solver.get_last_lut().copy()
+        soft = solver.get_last_soft_pairs().copy()
+        actual, actual_count = solver.label(image, **common)
+        np.testing.assert_array_equal(actual, expected)
+        assert actual_count == count
+        np.testing.assert_array_equal(solver.get_last_lut(), lut)
+        np.testing.assert_array_equal(solver.get_last_soft_pairs(), soft)
+        data = _impl.PreparedRaster()
+        solver.label(image, _prepared=data, **common)
+        prepared, prepared_count = solver.color_prepared(data)
+        np.testing.assert_array_equal(prepared, expected)
+        assert prepared_count == count
+
+
+@pytest.mark.parametrize('dtype', [np.int8, np.int16, np.int32, np.int64, np.float64])
+@pytest.mark.parametrize('shape', [(3, 4), (513, 1024)])
+def test_unformatted_negative_labels_raise_before_expansion(dtype, shape):
+    image = np.ones(shape, dtype=dtype)
+    image.flat[-1] = -3
+    engine = ncolor.Engine(n_threads=4)
+    for call in (engine.label, engine.prepare_labels):
+        with pytest.raises(ValueError, match='nonnegative'):
+            call(image, format_input=False)
+    # A failed call must leave the engine reusable, including the direct
+    # path for fractions that legitimately truncate to background.
+    image.flat[-1] = 0
+    np.testing.assert_array_equal(engine.label(image, format_input=False), engine.label(image))
+
+
+def test_unformatted_float_truncation_to_background():
+    image = np.array([[-0.9, 1.2], [2.8, 0.9]])
+    expected = ncolor.label(image.astype(np.int32), format_input=False)
+    np.testing.assert_array_equal(ncolor.label(image, format_input=False), expected)
+    np.testing.assert_array_equal(ncolor.prepare_labels(image, format_input=False).color(), expected)

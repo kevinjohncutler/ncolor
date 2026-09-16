@@ -19,6 +19,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+from threading import Lock
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
@@ -86,7 +88,17 @@ def _local_cache_path(src: Path) -> Path:
     return _CACHE_ROOT / f"{st.st_mtime_ns}_{st.st_size}" / src.name
 
 
+_COPY_LOCK = Lock()
+
+
 def _copy_off_remote(src: Path, dst: Path) -> None:
+    # Serialize writers in this process. Some remote filesystems expose a
+    # transient empty view when several renames replace the same destination.
+    with _COPY_LOCK:
+        _publish_extension(src, dst)
+
+
+def _publish_extension(src: Path, dst: Path) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     # Publish only complete binaries. Concurrent imports must never load a
     # destination while another process is still writing its contents.
@@ -103,9 +115,31 @@ def _copy_off_remote(src: Path, dst: Path) -> None:
             )
         try:
             os.replace(temporary, dst)
-        except PermissionError:
-            # Windows can lock a binary already published by another importer.
-            if not dst.is_file() or dst.stat().st_size != temporary.stat().st_size:
+        except (PermissionError, FileExistsError):
+            # Another importer may have published first. Windows can lock
+            # that file; some network filesystems reject replacing it.
+            # Network metadata can lag the completed writes. Read through
+            # file handles and compare contents instead of trusting stat sizes.
+            identical = False
+            for attempt in range(6):
+                try:
+                    with temporary.open("rb") as candidate, dst.open("rb") as published:
+                        while True:
+                            chunk = candidate.read(1024 * 1024)
+                            if published.read(len(chunk) or 1) != chunk:
+                                break
+                            if not chunk:
+                                identical = True
+                                break
+                except OSError:
+                    pass
+                if identical:
+                    break
+                # A concurrent network rename can briefly expose an empty
+                # cached view. Wait for that publication, without replacing it.
+                if attempt < 5:
+                    time.sleep(0.05 * (2 ** attempt))
+            if not identical:
                 raise
     finally:
         temporary.unlink(missing_ok=True)

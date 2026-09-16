@@ -841,24 +841,30 @@ inline void l2_sweep_axis_wide(int32_t* lbl, int64_t* dist,
 // Run expand_labels on a row-major label image of arbitrary ndim.
 // `shape` is the image shape; total = product of shape entries; the output
 // is written into `bufs.lbl()` which is also the working scratch.
+// Internal contact consumers may request final_shape: narrow transforms with
+// two or more active axes then leave labels/distances in lbl_T()/dist_T()
+// and return the cyclically rotated active shape. Wide or 1D transforms
+// retain the original storage. Public expansion callers omit this request.
 inline void expand_labels_inplace(
         const int32_t* input, ExpandBuffers& bufs,
         const std::vector<int64_t>& shape,
         ForkJoinPool& pool, int n_threads, bool wrap = false,
-        bool keep_distances = true) {
+        bool keep_distances = true,
+        std::vector<int64_t>* final_shape = nullptr) {
     // Singleton axes contribute no distance. Removing them preserves axis
     // order and lets the first active axis use the sparse-seed fast pass.
     if (shape.empty()) {
-        expand_labels_inplace(input, bufs, {1}, pool, n_threads, wrap, keep_distances);
+        expand_labels_inplace(input, bufs, {1}, pool, n_threads, wrap, keep_distances, final_shape);
         return;
     }
     if (shape.size() > 1 && std::find(shape.begin(), shape.end(), 1) != shape.end()) {
         std::vector<int64_t> active;
         for (int64_t n : shape) if (n != 1) active.push_back(n);
         if (active.empty()) active.push_back(1);
-        expand_labels_inplace(input, bufs, active, pool, n_threads, wrap, keep_distances);
+        expand_labels_inplace(input, bufs, active, pool, n_threads, wrap, keep_distances, final_shape);
         return;
     }
+    if (final_shape) *final_shape = shape;
     const int ndim = static_cast<int>(shape.size());
     int64_t total = 1;
     for (int64_t d : shape) total *= d;
@@ -929,8 +935,14 @@ inline void expand_labels_inplace(
             int32_t* t_dist = bufs.dist_T();
             batch_transpose<int32_t>(h_lbl, h_dist, t_lbl, t_dist, A, B, C, pool, n_threads);
             envelope_pass(t_lbl, t_dist, A * C, B, pool, n_threads, bufs.scratch(), wrap);
-            batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads,
-                                      keep_distances || ax != 0);
+            if (final_shape && ax == 0) {
+                // Contacts can consume this layout directly. Public expansion
+                // callers omit final_shape and receive the original layout.
+                std::rotate(final_shape->begin(), final_shape->begin() + 1, final_shape->end());
+            } else {
+                batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads,
+                                          keep_distances || ax != 0);
+            }
         }
     }
 }

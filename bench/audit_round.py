@@ -2,7 +2,8 @@
 
 Run with PYTHONPATH=src NCOLOR_NO_CALIBRATE=1 python bench/audit_round.py
 --seed 101 --output bench/audit_results/round_1.json. Requires psutil and
-Shapely in addition to ncolor. Seeds vary correctness cases only; all timed
+Shapely in addition to ncolor, unless --skip-geometry is explicit.
+Seeds vary correctness cases only; all timed
 and memory workloads stay identical across rounds. Run without other jobs
 competing for CPU time. This supplements, rather than replaces, pytest.
 """
@@ -19,7 +20,10 @@ import time
 
 import numpy as np
 import psutil
-import shapely
+try:
+    import shapely
+except ImportError:
+    shapely = None
 
 import ncolor
 from ncolor import geo
@@ -75,7 +79,7 @@ def components_reference(image, conn):
     return result, sources
 
 
-def correctness(seed):
+def correctness(seed, include_geometry=True):
     rng = np.random.default_rng(seed)
     engine = ncolor.Engine(n_threads=4)
     expand = _impl.ExpandEngine(2)
@@ -193,6 +197,25 @@ def correctness(seed):
             engine.release_buffers()
         counts['raster_coloring'] += 1
 
+    for iteration in range(90):
+        shape = tuple(map(int, rng.integers(2, 7, size=int(rng.integers(2, 5)))))
+        image = rng.integers(0, 7, shape, dtype=np.int32)
+        options = dict(expand=iteration % 3 != 0, p=1 + iteration % 2,
+                       expand_mode=('standard', 'clean')[iteration % 2],
+                       wrap=bool(iteration % 2), conn=int(rng.integers(1, len(shape) + 1)),
+                       clean_mask=iteration % 4 == 0, first_seen=iteration % 5 == 0,
+                       weight_objective=(-1, 0, 1)[iteration % 3],
+                       weight_mode=('min', 'max', 'mean', 'count', 'harmonic', 'mean_inv')[iteration % 6],
+                       min_contact=1 + iteration % 3)
+        snapshot = engine.prepare_labels(image, **options)
+        expected = engine.label(image, n=8, max_depth=1, return_n=True, return_conflicts=True, **options)
+        actual = snapshot.color(n=8, max_depth=1, return_n=True, return_conflicts=True, engine=engine)
+        for got, want in zip(actual, expected):
+            np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(snapshot.color(n=8, max_depth=1, return_lut=True, engine=engine),
+                                      engine.label(image, n=8, max_depth=1, return_lut=True, **options))
+        counts['prepared_coloring'] += 1
+
     for _ in range(100):
         n = int(rng.integers(1, 22))
         edges = np.argwhere(np.triu(rng.random((n, n)) < rng.uniform(.05, .6), 1)).astype(np.int32)
@@ -202,24 +225,25 @@ def correctness(seed):
         assert used == len(np.unique(colors)) and colors.min() > 0
         counts['graph_coloring'] += 1
 
-    geoms = [shapely.box(i + rng.uniform(0, .03), j, i + 1, j + 1)
-             for i in range(6) for j in range(5)]
-    for tolerance in (0, .05):
-        for threshold in (None, 0, .2):
-            expected = set()
-            for a in range(len(geoms)):
-                for b in range(a + 1, len(geoms)):
-                    x, y = geoms[a], geoms[b]
-                    if x.distance(y) > tolerance:
-                        continue
-                    if threshold is not None and (tolerance == 0 or threshold > 0):
-                        length = (shapely.buffer(x, tolerance / 2).intersection(
-                            shapely.buffer(y, tolerance / 2)).length / 2 if tolerance else x.intersection(y).length)
-                        if length <= threshold:
+    if include_geometry:
+        geoms = [shapely.box(i + rng.uniform(0, .03), j, i + 1, j + 1)
+                 for i in range(6) for j in range(5)]
+        for tolerance in (0, .05):
+            for threshold in (None, 0, .2):
+                expected = set()
+                for a in range(len(geoms)):
+                    for b in range(a + 1, len(geoms)):
+                        x, y = geoms[a], geoms[b]
+                        if x.distance(y) > tolerance:
                             continue
-                    expected.add((a, b))
-            assert pairs_of(geo.connect(geoms, tolerance=tolerance, min_shared_length=threshold)) == expected
-            counts['geometry'] += 1
+                        if threshold is not None and (tolerance == 0 or threshold > 0):
+                            length = (shapely.buffer(x, tolerance / 2).intersection(
+                                shapely.buffer(y, tolerance / 2)).length / 2 if tolerance else x.intersection(y).length)
+                            if length <= threshold:
+                                continue
+                        expected.add((a, b))
+                assert pairs_of(geo.connect(geoms, tolerance=tolerance, min_shared_length=threshold)) == expected
+                counts['geometry'] += 1
 
     jobs = [rng.integers(0, 5, (12, 13), dtype=np.int32) for _ in range(30)]
     def concurrent_check(image):
@@ -233,7 +257,7 @@ def correctness(seed):
     return dict(counts)
 
 
-def fixed_workloads():
+def fixed_workloads(include_geometry=True):
     rng = np.random.default_rng(21)
     engine = ncolor.Engine(n_threads=4)
     binary = (rng.random((512, 512)) < .7).astype(np.uint8)
@@ -242,9 +266,16 @@ def fixed_workloads():
     sparse = np.zeros((512, 512), np.int32)
     sparse[8::32, 8::32] = np.arange(1, 257).reshape(16, 16)
     labels = rng.choice(np.array([0, 2, 11, 100, 3000], np.int32), (1024, 1024))
-    geoms = [shapely.box(i * 1.01, j * 1.01, i * 1.01 + 1, j * 1.01 + 1)
-             for i in range(35) for j in range(35)]
-    return engine, {
+    geoms = ([shapely.box(i * 1.01, j * 1.01, i * 1.01 + 1, j * 1.01 + 1)
+              for i in range(35) for j in range(35)] if include_geometry else None)
+    prepared = engine.prepare_labels(sparse)
+    thin = (rng.random((2, 513, 517)) < .2).astype(np.uint8)
+    byte_labels = labels.astype(np.uint8)
+    workloads = {
+        'prepared_color': lambda: prepared.color(engine=engine),
+        'prepared_lookup': lambda: prepared.color(return_lut=True, engine=engine),
+        'thin_components': lambda: engine.connected_components(thin, conn=1),
+        'byte_format': lambda: engine.format_labels(byte_labels),
         'components': lambda: ncolor.connected_components(binary, conn=2),
         'components_singletons': lambda: ncolor.connected_components(binary.reshape((1,) * 8 + binary.shape), conn=2),
         'connect': lambda: engine.connect(cells),
@@ -253,12 +284,14 @@ def fixed_workloads():
         'expand_l2': lambda: engine.expand_labels(sparse, p=2),
         'label_standard': lambda: engine.label(sparse, expand_mode='standard'),
         'label_clean': lambda: engine.label(sparse, expand_mode='clean'),
-        'geometry': lambda: geo.connect(geoms, tolerance=.02, min_shared_length=.2),
     }
+    if include_geometry:
+        workloads['geometry'] = lambda: geo.connect(geoms, tolerance=.02, min_shared_length=.2)
+    return engine, workloads
 
 
-def resources(memory_blocks=50):
-    engine, workloads = fixed_workloads()
+def resources(memory_blocks=50, include_geometry=True):
+    engine, workloads = fixed_workloads(include_geometry)
     for _ in range(4):
         for call in workloads.values():
             call()
@@ -295,14 +328,19 @@ def main():
     parser.add_argument('--seed', type=int, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--memory-blocks', type=int, default=50)
+    parser.add_argument('--skip-geometry', action='store_true',
+                        help='omit optional geometry checks on hosts without that extra')
     args = parser.parse_args()
+    if shapely is None and not args.skip_geometry:
+        parser.error('Shapely is required unless --skip-geometry is explicit')
     if args.memory_blocks < 20:
         parser.error('--memory-blocks must be at least 20')
     result = {'seed': args.seed, 'platform': platform.system(),
               'architecture': platform.machine(), 'python': platform.python_version(),
-              'numpy': np.__version__, 'correctness': correctness(args.seed)}
+              'numpy': np.__version__, 'geometry_included': not args.skip_geometry,
+              'correctness': correctness(args.seed, not args.skip_geometry)}
     print('Correctness checks passed:', result['correctness'], flush=True)
-    result.update(resources(args.memory_blocks))
+    result.update(resources(args.memory_blocks, not args.skip_geometry))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + '\n')
     print('Memory range:', result['memory']['post_warm_range_bytes'], 'bytes', flush=True)

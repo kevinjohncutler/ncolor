@@ -758,7 +758,7 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
                                    ForkJoinPool& pool, int n_threads,
                                    std::vector<EnvelopeScratch>& scratch,
                                    bool barriers_present, bool wrap = false,
-                                   bool keep_distances = true)
+                                   bool keep_distances = true, bool retain_layout = false)
 {
     const int ndim = (int)shape.size();
     const int64_t n = shape[ax];
@@ -805,7 +805,7 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
     } else {
         envelope_pass(t_lbl, t_dist, A * C, B, pool, n_threads, scratch, wrap);
     }
-    batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads,
+    if (!retain_layout) batch_transpose<int32_t>(t_lbl, t_dist, h_lbl, h_dist, A, C, B, pool, n_threads,
                              keep_distances || ax != 0);
 }
 
@@ -821,15 +821,18 @@ inline void l2_sweep_axis_barrier(int32_t* h_lbl, int32_t* h_dist,
 // keep_distances=false skips the last distance transpose where possible.
 // Final cleanup reads labels and only writes barrier marks into distances;
 // it does not need the final distances when there is no subsequent sweep.
+// final_shape requests the same retained-layout contract as expand.hpp for
+// narrow L2 transforms. Final cleanup runs in that layout before returning.
 inline void expand_labels_clean_nd_inplace(
     const int32_t* input, ExpandBuffers& bufs,
     const std::vector<int64_t>& input_shape,
     ForkJoinPool& pool, int n_threads, int p = 2, bool wrap = false,
-    bool keep_distances = true)
+    bool keep_distances = true, std::vector<int64_t>* final_shape = nullptr)
 {
     std::vector<int64_t> shape;
     for (int64_t n : input_shape) if (n != 1) shape.push_back(n);
     if (shape.empty()) shape.push_back(1);
+    if (final_shape) *final_shape = shape;
     const int ndim = (int)shape.size();
     int64_t total = 1;
     for (auto s : shape) total *= s;
@@ -862,7 +865,14 @@ inline void expand_labels_clean_nd_inplace(
         } else {
             l2_sweep_axis_barrier(h_lbl, h_dist, bufs, shape, ax,
                                    pool, n_threads, bufs.scratch(),
-                                   barriers_present, wrap, keep_distances);
+                                   barriers_present, wrap, keep_distances,
+                                   final_shape && ax == 0 && ndim > 1);
+            if (final_shape && ax == 0 && ndim > 1) {
+                h_lbl = bufs.lbl_T();
+                h_dist = bufs.dist_T();
+                std::rotate(shape.begin(), shape.begin() + 1, shape.end());
+                *final_shape = shape;
+            }
         }
         // After this axis, the swept subspace is {ax, ax+1, ..., ndim-1}.
         // Skip the innermost (subspace size 1 false-positives); for any
@@ -902,10 +912,10 @@ inline void expand_labels_clean_inplace(
     const int32_t* input, ExpandBuffers& bufs,
     const std::vector<int64_t>& shape,
     ForkJoinPool& pool, int n_threads, int p, bool wrap = false,
-    bool keep_distances = true)
+    bool keep_distances = true, std::vector<int64_t>* final_shape = nullptr)
 {
     expand_labels_clean_nd_inplace(
-        input, bufs, shape, pool, n_threads, p, wrap, keep_distances);
+        input, bufs, shape, pool, n_threads, p, wrap, keep_distances, final_shape);
 }
 
 }  // namespace ncolor_cpp

@@ -57,7 +57,9 @@ Create a new snapshot when the geometry, expansion, connectivity, or weight
 settings change. Each coloring call can change the color target, search
 depth, and perceptual palette. `Engine.prepare_labels(...)` and
 `prepared.color(engine=engine)` provide explicit worker control. A snapshot
-retains four bytes per pixel plus its graph arrays; release it when done.
+retains one, two, or four bytes per pixel according to label count, plus its
+graph arrays. Release it when done. `prepared.color(return_lut=True)` skips
+image rendering when no output buffer is supplied.
 See [performance exploration](PERFORMANCE_EXPLORATION.md) for measured
 tradeoffs and experiments that were not promoted into the library.
 

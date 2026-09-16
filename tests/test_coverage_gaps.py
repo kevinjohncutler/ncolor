@@ -444,9 +444,11 @@ def test_local_cache_path_keys_on_mtime_and_size(tmp_path):
     assert pa != pb
 
 
-def test_on_remote_mount_false_for_local_tmp(tmp_path):
-    """A path on a regular local filesystem is not flagged as remote."""
-    assert _backend._on_remote_mount(tmp_path) is False
+def test_on_remote_mount_false_for_local_filesystem(monkeypatch):
+    """The temporary directory itself may live on a network filesystem."""
+    monkeypatch.setattr(_backend.subprocess, "check_output",
+                        lambda *args, **kwargs: "/dev/disk on / (apfs, rw)")
+    assert _backend._on_remote_mount(Path("/synthetic-local/library.so")) is False
 
 
 def test_find_impl_returns_existing_extension():
@@ -471,8 +473,12 @@ def test_copy_off_remote_copies_and_chmods(tmp_path):
     _backend._copy_off_remote(src, dst)
     assert dst.exists()
     assert dst.read_bytes() == b"binary blob"
-    # 0o755 set on the copy.
-    assert dst.stat().st_mode & 0o777 == 0o755
+    # Compare with this filesystem's interpretation of the requested mode.
+    # Network mounts may impose their own permissions rather than POSIX bits.
+    probe = dst.parent / "mode-probe"
+    probe.write_bytes(b"probe")
+    probe.chmod(0o755)
+    assert dst.stat().st_mode & 0o777 == probe.stat().st_mode & 0o777
 
 
 def test_maybe_calibrate_skips_when_env_set(monkeypatch):

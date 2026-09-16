@@ -32,6 +32,7 @@ def main():
                     'complete': measure(lambda: engine.label(image, **options), 15),
                     'prepare': measure(prepare, 15),
                     'recolor': measure(lambda: prepared.color(engine=engine), 15),
+                    'lookup': measure(lambda: prepared.color(return_lut=True, engine=engine), 15),
                     'snapshot_bytes': prepared.nbytes,
                 }
     args.output.parent.mkdir(parents=True, exist_ok=True)

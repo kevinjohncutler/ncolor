@@ -1,6 +1,8 @@
 """Failures and concurrent cache writes must preserve usable engine state."""
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
+from pathlib import Path
 import threading
 
 import numpy as np
@@ -173,3 +175,64 @@ def test_filtered_hard_contacts_can_remain_soft_preferences():
     engine.label(np.array([[1, 2]], np.int32), expand=False,
                  min_contact=2, soft_conn=1, soft_radius=1)
     assert engine._solver.get_last_soft_pairs().tolist() == [[1, 2]]
+
+
+@pytest.mark.parametrize('failure', [PermissionError, FileExistsError])
+@pytest.mark.parametrize('winner', [None, b'short', b'corrupt payload', b'complete binary'])
+def test_extension_publication_race_requires_complete_winner(tmp_path, monkeypatch, failure, winner):
+    src, dst = tmp_path / 'source.so', tmp_path / 'cache' / 'target.so'
+    src.write_bytes(b'complete binary')
+    dst.parent.mkdir()
+    if winner is not None:
+        dst.write_bytes(winner)
+    def collide(*args):
+        raise failure('concurrent publication')
+    monkeypatch.setattr(_backend.os, 'replace', collide)
+    monkeypatch.setattr(_backend.time, 'sleep', lambda _: None)
+    if winner == b'complete binary':
+        _backend._copy_off_remote(src, dst)
+        assert dst.read_bytes() == src.read_bytes()
+    else:
+        with pytest.raises(failure, match='concurrent publication'):
+            _backend._copy_off_remote(src, dst)
+    assert sorted(p.name for p in dst.parent.iterdir()) == ([] if winner is None else ['target.so'])
+
+
+@pytest.mark.parametrize('stale_target', [False, True])
+def test_extension_publication_uses_bytes_when_metadata_lags(tmp_path, monkeypatch, stale_target):
+    src, dst = tmp_path / 'source.so', tmp_path / 'target.so'
+    src.write_bytes(b'complete binary')
+    dst.write_bytes(src.read_bytes())
+    real_stat = Path.stat
+    def stale_stat(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        is_stale = (path == dst) if stale_target else path.name.startswith('.ncolor-')
+        if is_stale:
+            values = list(result)
+            values[6] = 0
+            return os.stat_result(values)
+        return result
+    def collide(*args):
+        raise FileExistsError('concurrent publication')
+    monkeypatch.setattr(Path, 'stat', stale_stat)
+    monkeypatch.setattr(_backend.os, 'replace', collide)
+    _backend._copy_off_remote(src, dst)
+    assert dst.read_bytes() == src.read_bytes()
+
+
+
+def test_extension_publication_waits_for_delayed_visibility(tmp_path, monkeypatch):
+    src, dst = tmp_path / 'source.so', tmp_path / 'target.so'
+    src.write_bytes(b'complete binary')
+    dst.write_bytes(b'')
+    def collide(*args):
+        raise FileExistsError('concurrent publication')
+    delays = []
+    def publish_after_delay(delay):
+        delays.append(delay)
+        dst.write_bytes(src.read_bytes())
+    monkeypatch.setattr(_backend.os, 'replace', collide)
+    monkeypatch.setattr(_backend.time, 'sleep', publish_after_delay)
+    _backend._copy_off_remote(src, dst)
+    assert delays == [0.05]
+    assert dst.read_bytes() == src.read_bytes()

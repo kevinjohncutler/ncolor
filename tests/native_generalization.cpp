@@ -393,6 +393,37 @@ static void check_feature_transfers() {
     assert(std::all_of(unused.begin(), unused.end(), [](int32_t v) { return v == -99; }));
 }
 
+static void check_retained_feature_layout() {
+    ForkJoinPool pool(4);
+    for (const auto& shape : std::vector<std::vector<int64_t>>{
+            {13, 17}, {5, 7, 9}, {1, 13, 1, 17}, {2, 50000}, {1, 17}}) {
+        const size_t total = std::accumulate(shape.begin(), shape.end(), size_t{1}, std::multiplies<size_t>());
+        std::vector<int32_t> input(total), restored(total), distances(total);
+        for (size_t i = 3; i < total; i += 37) input[i] = static_cast<int32_t>(i + 1);
+        for (bool clean : {false, true}) for (bool wrap : {false, true}) {
+            ExpandBuffers reference, retained;
+            std::vector<int64_t> layout;
+            if (clean) {
+                expand_labels_clean_inplace(input.data(), reference, shape, pool, 4, 2, wrap, true);
+                expand_labels_clean_inplace(input.data(), retained, shape, pool, 4, 2, wrap, true, &layout);
+            } else {
+                expand_labels_inplace(input.data(), reference, shape, pool, 4, wrap, true);
+                expand_labels_inplace(input.data(), retained, shape, pool, 4, wrap, true, &layout);
+            }
+            if (layout.size() > 1 && !retained.wide_distance()) {
+                const auto rows = layout.back();
+                batch_transpose(retained.lbl_T(), retained.dist_T(), restored.data(), distances.data(),
+                                1, total / rows, rows, pool, 4);
+                for (size_t i = 0; i < total; ++i)
+                    if (restored[i]) assert(distances[i] == reference.dist()[i]);
+            } else {
+                std::copy_n(retained.lbl(), total, restored.data());
+            }
+            assert(std::equal(restored.begin(), restored.end(), reference.lbl()));
+        }
+    }
+}
+
 static void check_parallel_components() {
     ForkJoinPool pool(4);
     for (const auto& shape : std::vector<std::vector<int64_t>>{
@@ -426,6 +457,11 @@ static void check_byte_formatting() {
         const auto count = format_labels_inplace(expected.data(), size, pool, 4);
         assert(format_byte_labels(input.data(), actual.data(), size, pool, 4) == count);
         assert(actual == expected);
+        std::vector<uint8_t> background(static_cast<size_t>(size));
+        bool negative = false;
+        assert((cast_with_bg<int8_t, true>(input.data(), actual.data(), background.data(),
+                                          size, pool, 4, &negative)));
+        assert(negative == (size > 0));
     }
 }
 
@@ -486,6 +522,7 @@ static void check_pool_exception_recovery() {
 int main() {
     check_byte_formatting();
     check_feature_transfers();
+    check_retained_feature_layout();
     check_parallel_components();
     check_dispatch_ranges();
     check_pool_exception_recovery();

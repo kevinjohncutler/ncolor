@@ -374,33 +374,42 @@ inline int32_t checked_cast_int32(InT v, bool& ok) {
 // keeping a typed pointer to the original input around).
 //
 // Returns false if any value was outside the int32 range (see above).
-template <typename InT>
+// Optional negative detection validates unformatted inputs during this same
+// pass; the normal formatting path has no per-pixel negative check.
+template <typename InT, bool CheckNegative = false>
 inline bool cast_with_bg(const InT* src, int32_t* dst, uint8_t* bg_mask,
                          int64_t total,
-                         ForkJoinPool& pool, int n_threads) {
+                         ForkJoinPool& pool, int n_threads, bool* has_negative = nullptr) {
+    if (has_negative) *has_negative = false;
     if (n_threads <= 1 || total < 500000) {
-        bool ok = true;
+        bool ok = true, negative = false;
         for (int64_t i = 0; i < total; ++i) {
             const InT v = src[i];
             dst[i] = detail::checked_cast_int32<InT>(v, ok);
             bg_mask[i] = (dst[i] == 0) ? uint8_t{1} : uint8_t{0};
+            if constexpr (CheckNegative) negative |= dst[i] < 0;
         }
+        if (has_negative) *has_negative = negative;
         return ok;
     }
     // A single shared flag, written only on failure, so the common path
     // never touches a contended cache line.
-    std::atomic<bool> any_bad{false};
+    std::atomic<bool> any_bad{false}, any_negative{false};
     dispatch_parallel(pool, static_cast<size_t>(total),
         static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD,
-        [src, dst, bg_mask, &any_bad](size_t i0, size_t i1) {
-            bool ok = true;
+        [src, dst, bg_mask, &any_bad, &any_negative](size_t i0, size_t i1) {
+            bool ok = true, negative = false;
             for (size_t i = i0; i < i1; ++i) {
                 const InT v = src[i];
                 dst[i] = detail::checked_cast_int32<InT>(v, ok);
                 bg_mask[i] = (dst[i] == 0) ? uint8_t{1} : uint8_t{0};
+                if constexpr (CheckNegative) negative |= dst[i] < 0;
             }
             if (!ok) any_bad.store(true, std::memory_order_relaxed);
+            if constexpr (CheckNegative)
+                if (negative) any_negative.store(true, std::memory_order_relaxed);
         });
+    if (has_negative) *has_negative = any_negative.load(std::memory_order_relaxed);
     return !any_bad.load(std::memory_order_relaxed);
 }
 

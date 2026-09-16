@@ -43,7 +43,8 @@ class PreparedLabels:
         Color target, search depth, and perceptual palette can change on
         each call. Topology and weight settings are fixed at preparation.
         Return flags and ``out`` follow :func:`label`; ``return_lut=True``
-        returns the label-to-color lookup table instead of the image.
+        returns the label-to-color lookup table instead of the image. This
+        skips image allocation and rendering unless ``out`` is supplied.
         """
         n, max_depth = _validate_coloring_budget(n, max_depth)
         palette = None if de_table is None else np.ascontiguousarray(de_table, dtype=np.float64)
@@ -51,7 +52,7 @@ class PreparedLabels:
             solver = current._solver
             image, used = solver.color_prepared(
                 self.__data, n_colors=n, max_depth=max_depth,
-                de_table=palette, out=out)
+                de_table=palette, out=out, render=not return_lut)
             result = solver.get_last_lut() if return_lut else image
             conflicts = solver.get_last_n_conflicts() if (check_conflicts or return_conflicts) else 0
         if check_conflicts and conflicts:
@@ -74,8 +75,9 @@ def prepare_labels(lab, *, conn=1, expand=True, format_input=True,
 
     All options have the same meaning as in :func:`label`. Preparation
     performs normalization, expansion, contact extraction, and graph
-    construction once, without solving a coloring. It retains a four-byte
-    label identifier per pixel plus the hard and soft graph data. Source
+    construction once, without solving a coloring. It retains a label
+    identifier per pixel plus the hard and soft graph data. Identifiers use
+    one, two, or four bytes according to label count. Source
     arrays and explicit edge lists are not retained by reference.
 
     >>> prepared = prepare_labels([[0, 1, 1], [2, 2, 0]])
