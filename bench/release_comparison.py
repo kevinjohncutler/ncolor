@@ -24,6 +24,19 @@ sys.path.append(sysconfig.get_path('purelib'))
 import numpy as np
 
 
+def cpu_model():
+    if platform.system() == 'Darwin':
+        return subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True).strip()
+    if platform.system() == 'Linux':
+        try:
+            for line in Path('/proc/cpuinfo').read_text().splitlines():
+                if line.startswith('model name'):
+                    return line.split(':', 1)[1].strip()
+        except OSError:
+            pass
+    return platform.processor() or platform.machine()
+
+
 def fingerprint(value):
     array = np.ascontiguousarray(value)
     return hashlib.sha256(str((array.shape, array.dtype.str)).encode() + array.tobytes()).hexdigest()
@@ -184,8 +197,7 @@ def run(args):
     metadata = dict(version=args.version, revision=args.revision, round=args.round,
                     threads=args.threads, repeats=args.repeats, warmups=4,
                     python=platform.python_version(), platform=platform.system(), machine=platform.machine(),
-                    cpu=(subprocess.check_output(['sysctl','-n','machdep.cpu.brand_string'],text=True).strip()
-                         if platform.system() == 'Darwin' else platform.processor() or platform.machine()),
+                    cpu=cpu_model(),
                     dependencies={p:importlib.metadata.version(p) for p in ['numpy','scipy','scikit-image','numba','fastremap']},
                     corpus={k:fingerprint(inputs[k]) for k in inputs.files})
     args.output.parent.mkdir(parents=True,exist_ok=True)
@@ -203,7 +215,7 @@ def report(args):
         data = json.loads(path.read_text())
         version = data['metadata']['version']
         meta = data['metadata']
-        signature = {key:meta[key] for key in ('cpu','python','dependencies','threads','repeats')}
+        signature = {key:meta[key] for key in ('cpu','platform','machine','python','dependencies','threads','repeats')}
         if environment is None: environment = signature
         assert environment == signature, 'benchmark environments differ'
         assert revisions.setdefault(version, meta['revision']) == meta['revision'], 'source revisions differ'

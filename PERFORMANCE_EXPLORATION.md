@@ -472,3 +472,11 @@ measurements, the historical version 1 foreground-formatting caveat,
 a dense thin-component case that remains slower than scikit-image, and
 draft README wording for release. Use those direct comparisons for release
 claims rather than multiplying the development-checkpoint ratios above.
+
+
+The Linux/x86-64 follow-up in that report now covers one, four, and 64
+workers on a 64-core AMD 3995WX. It confirms hardware-dependent gains and
+identifies new targets: validated casting, 3D coloring, native region
+properties, and dense thin diagonal components. Stage profiles with
+controlled core placement distinguish these from broad scheduling noise.
+Use the revised priority list there for the next optimization round.

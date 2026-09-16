@@ -5,7 +5,7 @@ with the unmodified tagged sources for 2.2.0 (`6858d805`) and 1.5.3
 (`07fb076c`). These are source-build comparisons, not downloaded wheel
 benchmarks. All builds and working copies remained on shared storage.
 
-## What the measurements establish
+## What the initial Mac measurements establish
 
 Default coloring options with four workers are 1.04x to 1.13x faster than
 2.2.0 on the measured two-dimensional cases; the three-dimensional case
@@ -197,8 +197,9 @@ entire table as equal-thread algorithmic speedups.
 
 ## Next work, in priority order
 
-1. Extend this benchmark to representative real segmentation volumes and
-   another architecture, then validate release wheels on supported platforms.
+1. Extend this benchmark to representative real segmentation volumes, then
+   validate release wheels on supported platforms.
+   The Linux source-build follow-up below now covers a second architecture.
    Freeze dependency versions and rerun against the actual release candidate
    before publishing README figures. Do not multiply development-checkpoint
    ratios to estimate a release comparison.
@@ -255,3 +256,138 @@ counts are under `bench/release_results/`. Four-worker aggregation is
 excluded from timing aggregation. The reporting tests reject mixed input
 corpora, environments, and revisions, and exclude invalid baseline outputs
 from speedup claims.
+
+
+## Linux/x86-64 follow-up on a 64-core AMD 3995WX
+
+The second platform is an AMD Ryzen PRO 3995WX with 64 physical cores and
+128 logical CPUs, Ubuntu 26.04, and GNU Compiler Collection (GCC) 15.2.0. The pyenv global interpreter
+is Python 3.12.11. Installed dependencies are NumPy 2.4.4, SciPy 1.17.1,
+scikit-image 0.26.0, Numba 0.65.1, and fastremap 1.18.0. Both native source
+versions were built with identical `-O3 -march=native` settings and the same
+additional flags listed above. Builds, inputs, logs, and results remained
+on shared storage.
+
+The identical saved corpus was reused and every input fingerprint matched
+the Mac suite. Each worker configuration has three independent rounds with
+four warmup calls and 15 timed calls. Version order alternated or rotated.
+No tests or builds ran concurrently with the benchmark. The Linux suite
+passed 1,055 tests with 12 skipped; the optional geometry dependency was
+not installed. The benchmark reporting tests also passed all nine checks.
+
+Keep the platforms separate. Python patch versions, numerical dependencies,
+compiler, operating system, and hardware all differ. These results establish
+within-platform release ratios, not the isolated causal effect of changing
+CPU architecture. Unpinned Linux timings were noisier than the Mac timings.
+For example, the current four-worker 3D default process medians were 21.220,
+18.393, and 18.262 ms, versus 17.433, 19.694, and 18.899 ms for 2.2.0.
+The first round alone suggested a regression that did not survive aggregation.
+
+### Default coloring: current versus 2.2.0
+
+| Input | Mac, 4 workers | Linux, 1 worker | Linux, 4 workers | Linux, 64 workers |
+|---|---|---|---|---|
+| Bundled logo | 1.08x | 0.97x | 1.05x | 0.89x |
+| Bundled synthetic 800 | 1.04x | 0.98x | 1.06x | 0.97x |
+| 1024 x 1024 boxes | 1.13x | 1.11x | 0.99x | 1.08x |
+| 2048 x 2048 boxes | 1.12x | 1.11x | 1.17x | 1.00x |
+| 96 x 96 x 96 boxes | 1.00x | 0.94x | 1.03x | 0.89x |
+
+Linux confirms that gains are workload- and worker-dependent. Four-worker
+matched standard-mode coloring versus 2.2.0 ranges from 0.67x to 1.34x.
+The small logo regresses to 0.67x and the 3D case to 0.84x, while larger
+2D cases improve. These regressions are retained in the results; the Mac
+headline cannot serve as a universal release claim.
+
+All tested current and 2.2.0 outputs have identical fingerprints across
+repeated rounds at each worker count. Foreground coverage, conflicts,
+component arrays, properties, and expansion tie validity were checked.
+The version 1 default-formatting bug remains excluded from speed ratios.
+
+### Utility and version 1 comparisons with four workers
+
+| Comparison | Mac range | Linux range |
+|---|---|---|
+| Matched coloring versus 1.5.3 | 6.93x to 22.61x | 3.42x to 18.18x |
+| Components versus 2.2.0 | 1.47x to 3.16x | 0.94x to 2.63x |
+| Components versus scikit-image | 0.85x to 5.41x | 0.59x to 5.16x |
+| Region properties versus scikit-image objects | 1.91x to 22.25x | 2.88x to 38.16x |
+| Expansion versus SciPy feature transform | 11.39x to 23.63x | 6.31x to 17.60x |
+| Expansion versus scikit-image | 13.40x to 25.95x | 7.25x to 22.89x |
+
+The dense 2 x 513 x 517 mask with full diagonal connectivity is only 0.59x
+as fast as scikit-image on Linux, versus 0.85x on the Mac. The sparse mask
+of that shape also slightly regresses versus 2.2.0 (0.94x). Region-property
+ratios against 2.2.0 range from 0.85x to 1.20x on Linux, despite larger
+advantages over scikit-image's per-region processing. Those native release
+regressions also deserve controlled follow-up rather than a blanket claim
+that every utility improved.
+
+### Scaling current code from four to 64 workers
+
+| Input, default coloring | 4-worker ms | 64-worker ms | Speedup from more workers |
+|---|---|---|---|
+| Bundled logo | 0.994 | 1.212 | 0.82x |
+| Bundled synthetic 800 | 10.156 | 5.007 | 2.03x |
+| 1024 x 1024 boxes | 7.139 | 2.519 | 2.83x |
+| 2048 x 2048 boxes | 30.039 | 11.211 | 2.68x |
+| 96 x 96 x 96 boxes | 18.393 | 5.361 | 3.43x |
+
+Larger default-coloring inputs improve 2.03x to 3.43x from the larger
+worker budget, but the small logo slows down. Component scaling is even
+more shape-dependent: large dense 2D masks improve over fourfold, while
+several thin or small 3D masks become slower. At 64 workers, the largest
+dense 2D component cases are about 10.4x faster than the serial 2.2.0
+utility. That is a many-core implementation result, not a 10.4x serial
+algorithm speedup. A single machine-wide worker setting is therefore an
+incomplete performance policy.
+
+### Stage diagnosis and placement control
+
+`bench/release_stages.py` uses the shipped stage timers through the public
+coloring wrapper. Three alternating rounds covered the logo, 1024 x 1024,
+and 96 x 96 x 96 cases. A second set restricted execution to four physical
+cores sharing one last-level cache. The affinity is recorded in each result.
+These instrumented stage measurements are diagnostic and are not mixed into
+the headline whole-call timings.
+
+| Matched-mode stage, pinned workers | 2.2.0 ms | Current ms |
+|---|---|---|
+| Logo casting | 0.013 | 0.073 |
+| 3D expansion | 4.458 | 4.131 |
+| 3D coloring | 0.619 | 0.984 |
+
+The logo's new negative-label validation corresponds to a measurable cast
+cost that persists with controlled placement. Preserve the validation, but
+investigate its reduction/vectorization under GCC. The 3D color-picker stage
+also grows while expansion gets faster. Under pinned placement the combined
+matched 3D stage totals are nearly unchanged; unrestricted placement makes
+the net regression larger. Placement therefore matters, but it does not
+explain away every added cost.
+
+### Revised optimization priorities
+
+1. Optimize the validated unformatted-label cast on x86 without weakening
+   rejection of negative identifiers. It is now a measured small-input cost.
+2. Profile the 3D picker and the native region-property regressions with
+   controlled placement and equivalent inputs; identify algorithm versus
+   compiler effects before changing behavior.
+3. Improve dense thin diagonal components, then investigate per-operation
+   worker budgets and cache-local scheduling. Simply using all cores helps
+   some workloads and hurts others.
+4. Continue the weighted retained-layout and sparse prepared-map experiments
+   after addressing these observed regressions.
+
+The second architecture check is now complete for these source builds.
+Representative real data and release-wheel validation remain necessary
+before advertising portable performance figures. Keep per-platform tables
+or clearly qualified ranges in the eventual README.
+
+All Linux raw runs and per-budget summaries are under
+`bench/release_results/linux_x86_64/workers_1`, `workers_4`, and `workers_64`.
+Stage samples and their aggregation are alongside those directories. Use
+the same release benchmark commands above on the Linux global interpreter,
+with Linux source paths and a separate output directory. To reproduce
+placement controls, invoke `bench/release_stages.py` through
+`taskset -c "$CPU_SET"`, selecting an allowed group of physical cores and
+recording their cache topology. No system-wide scheduling policy was changed.
