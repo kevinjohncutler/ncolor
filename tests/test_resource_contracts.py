@@ -83,7 +83,9 @@ def test_concurrent_extension_copies_finish_cleanly(tmp_path):
 
 
 def test_mount_detection_respects_path_components(tmp_path, monkeypatch):
+    from types import SimpleNamespace
     mount = tmp_path / 'share'
+    monkeypatch.setattr(_backend, 'os', SimpleNamespace(**{**vars(_backend.os), 'name': 'posix'}))
     monkeypatch.setattr(_backend.sys, 'platform', 'darwin')
     monkeypatch.setattr(_backend.subprocess, 'check_output',
                         lambda *args, **kwargs: f'server on {mount} (smbfs, rw)')

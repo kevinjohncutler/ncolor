@@ -14,7 +14,10 @@ import ncolor
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--iterations', type=int, default=100)
     args = parser.parse_args()
+    if args.iterations < 20:
+        parser.error('iterations must be at least 20')
     engine = ncolor.Engine(n_threads=4)
     rng = np.random.default_rng(764)
     mask = rng.random((2, 1024, 1024)) < 0.2
@@ -27,7 +30,7 @@ def main():
     results = {}
     for case in ('recolor', 'rebuild', 'components'):
         history = []
-        for _ in range(100):
+        for _ in range(args.iterations):
             if case == 'components':
                 result, count = engine.connected_components(mask)
                 assert count > 0
@@ -42,6 +45,7 @@ def main():
             history.append(process.memory_info().rss)
         results[case] = dict(resident_bytes=history,
                              final_window_range=max(history[-20:]) - min(history[-20:]))
+    results['iterations'] = args.iterations
     results['snapshot_bytes'] = snapshot.nbytes
     results['peak_bytes'] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == 'darwin' else 1024)
     args.output.parent.mkdir(parents=True, exist_ok=True)

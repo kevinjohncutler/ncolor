@@ -5,7 +5,7 @@
 
 # ncolor <img src="https://github.com/kevinjohncutler/ncolor/blob/main/logo.png?raw=true" width="400" title="bacteria" alt="bacteria" align="right" vspace = "0">
 
-Fast remapping of instance labels `1,2,3,...,M` to a smaller set of repeating, disjoint labels `1,2,...,N`. The [four color theorem](https://en.wikipedia.org/wiki/Four_color_theorem) guarantees `N ≤ 4` for any 2D segmentation. The picker will fall back to `N = 5` if a 4-coloring cannot be found within the time budget. Also works for 3D labels (`< 8` typically) and higher dimensions.
+Fast remapping of instance labels `1,2,3,...,M` to a smaller set of repeating, disjoint labels `1,2,...,N`. The [four color theorem](https://en.wikipedia.org/wiki/Four_color_theorem) guarantees `N <= 4` for planar adjacency graphs. Raster contacts can produce nonplanar graphs. The picker will fall back to `N = 5` if a 4-coloring cannot be found within the time budget. Also works for 3D labels (`< 8` typically) and higher dimensions.
 
 ## Install
 
@@ -57,8 +57,11 @@ Create a new snapshot when the geometry, expansion, connectivity, or weight
 settings change. Each coloring call can change the color target, search
 depth, and perceptual palette. `Engine.prepare_labels(...)` and
 `prepared.color(engine=engine)` provide explicit worker control. A snapshot
-retains one, two, or four bytes per pixel according to label count, plus its
-graph arrays. Release it when done. `prepared.color(return_lut=True)` skips
+uses one, two, or four bytes per pixel according to label count, plus its
+graph arrays. Large sparse images can instead store only foreground positions and
+labels. This reduces snapshot memory and repeated
+rendering time, with an extra cost during preparation. Release it when done.
+`prepared.color(return_lut=True)` skips
 image rendering when no output buffer is supplied.
 See [performance exploration](PERFORMANCE_EXPLORATION.md) for measured
 tradeoffs and experiments that were not promoted into the library.
@@ -99,14 +102,16 @@ colors = ncolor.color_graph(edges, n_vertices=len(nodes))   # 0-indexed pairs
 
 ## New in v2
 
-v2 is a complete C++ rewrite. Every stage of the pipeline including label expansion has been optimized, resulting in 7–12× speedups end-to-end. The new default expand removes 1-pixel bridges and spurs before the picker sees them, and an auto-soft constraint refines the hard 4-coloring via local search to differentiate near-adjacent cells. Together these break the K₅-shaped convergence clusters that forced the v1 numba pipeline up to `N = 5`. See [CHANGELOG.md](CHANGELOG.md) for the full list of changes and the migration table from v1.
+v2 is a complete C++ rewrite. Every stage of the pipeline including label expansion has been optimized, with end-to-end comparisons against versions 1.5.3 and 2.2.0 documented in
+[release benchmarks](RELEASE_BENCHMARKS.md). Performance depends on image
+shape, connectivity, worker count, and CPU. The new default expand removes 1-pixel bridges and spurs before the picker sees them, and an auto-soft constraint refines the hard 4-coloring via local search to differentiate near-adjacent cells. Together these break the K₅-shaped convergence clusters that forced the v1 numba pipeline up to `N = 5`. See [CHANGELOG.md](CHANGELOG.md) for the full list of changes and the migration table from v1.
 
 The rewrite also brings drop-in C++ replacements for the image-analysis and distance-transform calls the old pipeline relied on, with no extra install:
 
-| ncolor | replaces | typical speedup |
+| ncolor | replaces | scope |
 |---|---|---|
-| `ncolor.connected_components` | `skimage.measure.label` | 1.5–3× |
-| `ncolor.regionprops` | `skimage.measure.regionprops` (vectorized subset: area / bbox / centroid) | 1.5–3× |
+| `ncolor.connected_components` | `skimage.measure.label` | See the per-platform measurements linked below |
+| `ncolor.regionprops` | `skimage.measure.regionprops` (vectorized subset: area / bbox / centroid) | See the per-platform measurements linked below |
 | `ncolor.expand_labels` | `skimage.segmentation.expand_labels` + `scipy.ndimage.distance_transform_edt` | Parallel L1 / L2 expansion in any dimension; no extra dependency |
 | `ncolor.delete_spurs` | hand-rolled morphology / not in scikit-image | ND, parallel |
 
@@ -124,6 +129,10 @@ an unnecessary final distance transpose and an intermediate input copy.
 Distance-returning and distance-weighted calls retain the distances they
 need. See [PERFORMANCE_EXPLORATION.md](PERFORMANCE_EXPLORATION.md) for direct
 before/after comparisons, memory costs, and experiments that were not kept.
+[The latest optimization report](FINAL_OPTIMIZATIONS.md) covers weighted
+feature transforms, sparse prepared rendering, components, and platform
+validation. Historical release ratios remain labeled by their measured
+checkpoint; they are not multiplied by later development speedups.
 
 
 For C++ engine internals, file-by-file architecture, and threadpool design, see [ARCHITECTURE.md](ARCHITECTURE.md).

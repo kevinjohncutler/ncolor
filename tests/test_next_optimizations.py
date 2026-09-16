@@ -258,3 +258,66 @@ def test_thin_component_seams_match_independent_reference(conn, density):
     actual, actual_count = ncolor.Engine(n_threads=4).connected_components(image, conn=conn)
     assert actual_count == count
     np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize('shape', [(512, 768), (1, 512, 768), (768, 512, 1)])
+@pytest.mark.parametrize('mode', ['standard', 'clean'])
+@pytest.mark.parametrize('weight', [1, 2, 3, 4, 5, 6])
+def test_weighted_retained_layout_matches_original(shape, mode, weight):
+    image = np.zeros(shape, np.int32)
+    flat = image.reshape(512, 768) if shape[-1] != 1 else image.reshape(768, 512)
+    seeds = flat[8::41, 9::43]
+    seeds[:] = np.arange(1, seeds.size + 1).reshape(seeds.shape)
+    solver = ncolor.Engine(n_threads=4)._solver
+    options = dict(weight_objective=1, weight_mode=weight, expand_mode=mode, n_colors=16)
+    expected = solver.label(image, _retain_layout=False, **options)
+    actual = solver.label(image, **options)
+    np.testing.assert_array_equal(actual[0], expected[0])
+    assert actual[1] == expected[1]
+
+
+@pytest.mark.parametrize('clean_mask', [False, True])
+@pytest.mark.parametrize('mode', ['standard', 'clean'])
+def test_sparse_prepared_render_clears_reused_output(clean_mask, mode):
+    image = np.zeros((513, 517), np.int32)
+    image[8::53, 9::59] = np.arange(1, image[8::53, 9::59].size + 1).reshape(image[8::53, 9::59].shape)
+    engine = ncolor.Engine(n_threads=4)
+    options = dict(clean_mask=clean_mask, expand_mode=mode)
+    expected = engine.label(image, **options)
+    prepared = engine.prepare_labels(image, **options)
+    assert prepared.nbytes < image.size // 2
+    for value in (255, 17):
+        out = np.full(image.shape, value, np.uint8)
+        assert prepared.color(out=out, engine=engine) is out
+        np.testing.assert_array_equal(out, expected)
+    np.testing.assert_array_equal(prepared.color(return_lut=True, engine=engine),
+                                  engine.label(image, return_lut=True, **options))
+
+
+def test_full_2d_components_exhaustive_neighborhoods():
+    from skimage.measure import label
+    engine = ncolor.Engine(n_threads=1)
+    for bits in range(512):
+        image = ((bits >> np.arange(9)) & 1).reshape(3, 3).astype(bool)
+        actual, count = engine.connected_components(image, conn=2)
+        expected, expected_count = label(image, connectivity=2, return_num=True)
+        assert count == expected_count
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize('mode', ['standard', 'clean'])
+@pytest.mark.parametrize('wrap', [False, True])
+@pytest.mark.parametrize('weight', [1, 2, 3, 4])
+def test_weighted_retained_layout_irregular_contacts(mode, wrap, weight):
+    image = np.zeros((513, 521), np.int32)
+    rng = np.random.default_rng(271)
+    image.flat[rng.choice(image.size, 32, replace=False)] = np.arange(1, 33)
+    solver = ncolor.Engine(n_threads=4)._solver
+    palette = np.abs(np.arange(33)[:, None] - np.arange(33)[None, :]).astype(float)
+    options = dict(n_colors=32, weight_objective=-1, weight_mode=weight,
+                   expand_mode=mode, wrap=wrap, conn=2, connect_radius=2,
+                   min_contact=3, de_table=palette)
+    expected = solver.label(image, _retain_layout=False, **options)
+    actual = solver.label(image, **options)
+    np.testing.assert_array_equal(actual[0], expected[0])
+    assert actual[1] == expected[1]

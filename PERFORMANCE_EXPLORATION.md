@@ -489,3 +489,13 @@ negative-label validation, specialize ordinary coloring palettes without
 reducing the supported range, and reduce thin-volume component seam work.
 The report distinguishes regressions against ncolor 2.2.0 from remaining
 competitor gaps and from scheduling-dependent timing variation.
+
+
+## Cross-platform follow-up
+
+[The final-target report](FINAL_OPTIMIZATIONS.md) follows up on weighted
+retained layouts, sparse prepared rendering, dense thin components, worker
+thresholds, and higher-dimensional cleanup locality. It distinguishes
+integrated changes from rejected candidates and includes installed-wheel
+validation. The earlier future-work list above describes the state before
+that follow-up; use the new report for current decisions.

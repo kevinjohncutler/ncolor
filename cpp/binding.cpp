@@ -842,6 +842,8 @@ struct PreparedRaster {
     using RenderLabels = std::variant<std::vector<uint8_t>, std::vector<uint16_t>,
                                       std::vector<int32_t>>;
     RenderLabels render_labels;
+    std::vector<size_t> render_positions;
+    bool sparse_render = false;
     std::vector<int32_t> indptr, indices, src, dst;
     std::vector<int32_t> soft_indptr, soft_indices;
     std::vector<double> edge_weights;
@@ -858,7 +860,7 @@ struct PreparedRaster {
         const size_t raster_bytes = std::visit([](const auto& values) {
             return values.size() * sizeof(typename std::decay_t<decltype(values)>::value_type);
         }, render_labels);
-        return raster_bytes + sizeof(int64_t) * shape.size() + sizeof(int32_t) *
+        return raster_bytes + sizeof(size_t) * render_positions.size() + sizeof(int64_t) * shape.size() + sizeof(int32_t) *
             (indptr.size() + indices.size() + src.size() +
              dst.size() + soft_indptr.size() + soft_indices.size()) +
             sizeof(double) * edge_weights.size() + sizeof(float) * soft_weights.size();
@@ -1202,9 +1204,20 @@ public:
                 [](int64_t extent) { return extent > 1; }));
             // Retaining the final layout saves a full label transpose for
             // large 2D fields. Thin higher-dimensional cleanup loses locality
-            // in this layout; weighted and altered-mask calls keep their path.
+            // in this layout; order-sensitive floating reducers keep their path.
+            bool exact_weight_order = weight_mode <= 4;
+            if (weight_objective != 0 && weight_mode == 3) {
+                // Integer distance sums are order-independent while every
+                // possible partial sum remains exactly representable.
+                long double max_distance = 0;
+                for (int64_t extent : shape)
+                    max_distance += static_cast<long double>(extent - 1) * (extent - 1);
+                const int64_t neighbors = ncolor_cpp::detail::count_forward_neighbors(
+                    shape, conn, connect_radius);
+                exact_weight_order = 2 * max_distance * total * neighbors <= (uint64_t{1} << 53);
+            }
             const bool retained = retain_layout && expand && p == 2 && active_axes == 2
-                && total >= 262144 && !clean_mask && despur_iters == 0 && weight_objective == 0
+                && total >= 262144 && !clean_mask && despur_iters == 0 && (weight_objective == 0 || exact_weight_order)
                 && std::all_of(shape.begin(), shape.end(), [](int64_t extent) {
                     return extent == 1 || extent >= 128;
                 }) && !ncolor_cpp::l2_needs_wide_distance(shape);
@@ -1353,7 +1366,7 @@ public:
                 if (expand && expand_bufs_.wide_distance())
                     scan_weighted(expand_bufs_.dist64());
                 else
-                    scan_weighted(expand ? expand_bufs_.dist() : nullptr);
+                    scan_weighted(expand ? (retained ? expand_bufs_.dist_T() : expand_bufs_.dist()) : nullptr);
                 pair_primary.resize(pairs.size(), 0.0);
                 if (min_contact > 1) {
                     size_t kept = 0;
@@ -1696,15 +1709,31 @@ public:
                     snapshot.soft_indices = soft_indices_;
                     snapshot.soft_weights = soft_weights_;
                 }
-                snapshot.allocate_render(static_cast<size_t>(total), N);
+                size_t foreground = 0;
+                for (int64_t i = 0; i < total; ++i) {
+                    foreground += !bg_mask_[i] && lut_src[i] != 0;
+                    if (foreground > static_cast<size_t>(total) / 32) break;
+                }
+                snapshot.sparse_render = total >= 262144 && foreground <= static_cast<size_t>(total) / 32;
+                snapshot.allocate_render(snapshot.sparse_render ? foreground : static_cast<size_t>(total), N);
+                if (snapshot.sparse_render) snapshot.render_positions.reserve(foreground);
                 std::visit([&](auto& render_labels) {
                     using Label = typename std::decay_t<decltype(render_labels)>::value_type;
-                    ncolor_cpp::dispatch_parallel(pool_->pool, static_cast<size_t>(total),
-                        static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
-                        [&](size_t begin, size_t end) {
-                            for (size_t i = begin; i < end; ++i)
-                                render_labels[i] = bg_mask_[i] ? 0 : static_cast<Label>(lut_src[i]);
-                        });
+                    if (snapshot.sparse_render) {
+                        size_t j = 0;
+                        for (int64_t i = 0; i < total; ++i) {
+                            if (bg_mask_[i] || !lut_src[i]) continue;
+                            snapshot.render_positions.push_back(static_cast<size_t>(i));
+                            render_labels[j++] = static_cast<Label>(lut_src[i]);
+                        }
+                    } else {
+                        ncolor_cpp::dispatch_parallel(pool_->pool, static_cast<size_t>(total),
+                            static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
+                            [&](size_t begin, size_t end) {
+                                for (size_t i = begin; i < end; ++i)
+                                    render_labels[i] = bg_mask_[i] ? 0 : static_cast<Label>(lut_src[i]);
+                            });
+                    }
                 }, snapshot.render_labels);
             } else {
                 lut_.assign(static_cast<size_t>(N) + 1, 0);
@@ -1782,12 +1811,22 @@ public:
             }
             lut_.assign(static_cast<size_t>(N) + 1, 0);
             for (int32_t i = 0; i < N; ++i) lut_[i + 1] = colors_[i];
+            if (render_output && prepared.sparse_render) {
+                size_t total = 1;
+                for (int64_t extent : prepared.shape) total *= static_cast<size_t>(extent);
+                std::fill_n(output, total, uint8_t{0});
+            }
             if (render_output) std::visit([&](const auto& render_labels) {
                 ncolor_cpp::dispatch_parallel(pool_->pool, render_labels.size(),
                     static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
                     [&](size_t begin, size_t end) {
-                        for (size_t i = begin; i < end; ++i)
-                            output[i] = lut_[render_labels[i]];
+                        if (prepared.sparse_render) {
+                            for (size_t i = begin; i < end; ++i)
+                                output[prepared.render_positions[i]] = lut_[render_labels[i]];
+                        } else {
+                            for (size_t i = begin; i < end; ++i)
+                                output[i] = lut_[render_labels[i]];
+                        }
                     });
             }, prepared.render_labels);
         }
@@ -2213,7 +2252,7 @@ private:
 
     // Apply the color LUT to ``expanded[i]``: bg pixels (bg_mask_[i]==1)
     // get color 0; foreground pixels get ``lut_[expanded[i]]``. Parallel
-    // when total ≥ 8192. The bg pattern was captured by ``cast_with_bg``
+    // when total >= 8192. The bg pattern was captured by ``cast_with_bg``
     // at the start of label(); using a uint8 mask here keeps the inner
     // loop typeless wrt the original input dtype.
     // Apply LUT to fg pixels. bg pixels (bg_mask_[i] == 1) ALWAYS get

@@ -12,6 +12,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -587,12 +588,10 @@ def test_format_labels_clean_non_despur_secondary_dropped_silently():
 
 def test_on_remote_mount_windows_unc_path(monkeypatch):
     """On Windows, UNC paths (\\\\server\\share\\...) are flagged remote.
-    Uses ``PureWindowsPath`` (no OS restriction) so the test runs on
-    POSIX hosts too; ``Path(...)`` under monkeypatched ``os.name='nt'``
-    would try to instantiate ``WindowsPath`` and raise on Python <3.12
-    POSIX hosts."""
+    Uses ``PureWindowsPath`` across platforms and a module-local operating system
+    mock so pathlib and pytest retain the real host identity."""
     from pathlib import PureWindowsPath
-    monkeypatch.setattr(_backend.os, "name", "nt")
+    monkeypatch.setattr(_backend, "os", SimpleNamespace(**{**vars(_backend.os), "name": "nt"}))
     p = PureWindowsPath(r"\\server\share\foo")
     assert _backend._on_remote_mount(p) is True
 
@@ -602,21 +601,21 @@ def test_on_remote_mount_windows_local_drive(monkeypatch):
     Uses ``PureWindowsPath`` for the same cross-platform reason as
     the UNC test above."""
     from pathlib import PureWindowsPath
-    monkeypatch.setattr(_backend.os, "name", "nt")
+    monkeypatch.setattr(_backend, "os", SimpleNamespace(**{**vars(_backend.os), "name": "nt"}))
     p = PureWindowsPath("C:/Users/foo")
     # Local C: drive — anchor is "C:\\" (not "\\\\..."), so not remote.
     assert _backend._on_remote_mount(p) is False
 
 
 def test_on_remote_mount_linux_returns_false(monkeypatch, tmp_path):
-    monkeypatch.setattr(_backend.os, "name", "posix")
+    monkeypatch.setattr(_backend, "os", SimpleNamespace(**{**vars(_backend.os), "name": "posix"}))
     monkeypatch.setattr(_backend.sys, "platform", "linux")
     assert _backend._on_remote_mount(tmp_path) is False
 
 
 def test_on_remote_mount_darwin_smbfs(monkeypatch, tmp_path):
     """Darwin path: simulate a smbfs mount via a fake ``mount`` shell out."""
-    monkeypatch.setattr(_backend.os, "name", "posix")
+    monkeypatch.setattr(_backend, "os", SimpleNamespace(**{**vars(_backend.os), "name": "posix"}))
     monkeypatch.setattr(_backend.sys, "platform", "darwin")
     # Create a fake mounted dir we can pretend is on smbfs.
     fake_mount = tmp_path / "smb_share"
@@ -637,7 +636,7 @@ def test_on_remote_mount_darwin_smbfs(monkeypatch, tmp_path):
 
 def test_on_remote_mount_darwin_mount_call_fails(monkeypatch, tmp_path):
     """If ``mount`` shell-out fails the function falls back to False."""
-    monkeypatch.setattr(_backend.os, "name", "posix")
+    monkeypatch.setattr(_backend, "os", SimpleNamespace(**{**vars(_backend.os), "name": "posix"}))
     monkeypatch.setattr(_backend.sys, "platform", "darwin")
 
     def fail(*a, **kw):
@@ -947,7 +946,7 @@ def test_label_return_n_and_check_conflicts_combo():
 
 def test_on_remote_mount_darwin_afpfs(monkeypatch, tmp_path):
     """The AFP filesystem branch in the smbfs / nfs / afpfs match."""
-    monkeypatch.setattr(_backend.os, "name", "posix")
+    monkeypatch.setattr(_backend, "os", SimpleNamespace(**{**vars(_backend.os), "name": "posix"}))
     monkeypatch.setattr(_backend.sys, "platform", "darwin")
     fake_mount = tmp_path / "afp_share"
     fake_mount.mkdir()
