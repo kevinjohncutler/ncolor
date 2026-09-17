@@ -162,6 +162,10 @@ def run(args):
                 reference = measure.regionprops_table(image, properties=('area', 'bbox', 'centroid'))
                 def properties():
                     if ncolor is not None:
+                        # Module-level regionprops uses a full-width engine,
+                        # which would ignore the requested worker count.
+                        if engine is not None and hasattr(engine, 'regionprops'):
+                            return engine.regionprops(image)
                         return ncolor.regionprops(image)
                     regions = measure.regionprops(image)
                     return dict(area=np.array([r.area for r in regions]),

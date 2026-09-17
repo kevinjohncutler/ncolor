@@ -732,6 +732,99 @@ inline void regionprops_nd(const int32_t* labels, int32_t n_labels,
     }
 }
 
+// Region properties over contiguous pixel ranges scanned in parallel, each
+// into its own accumulators, then merged. Centroid sums stay exact: they
+// add integer coordinates, so any summation order gives the same double.
+// Results are identical to the serial kernel for any worker count.
+//
+// Each range needs its own table, so the worker count is also bounded by a
+// scratch budget: wide labelings fall back to fewer ranges, or to one.
+inline void regionprops_nd_parallel(const int32_t* labels, int32_t n_labels,
+                                    const std::vector<int64_t>& shape,
+                                    int64_t* areas,
+                                    int64_t* bbox_min, int64_t* bbox_max,
+                                    double* centroids_sum,
+                                    ForkJoinPool& pool, int n_threads) {
+    const int ndim = static_cast<int>(shape.size());
+    int64_t total = 1;
+    for (int64_t d : shape) total *= d;
+    constexpr int64_t REGIONPROPS_SERIAL_THRESHOLD = 262144;
+    constexpr size_t REGIONPROPS_SCRATCH_BYTES = 64u << 20;
+    const size_t width = static_cast<size_t>(n_labels) * (1 + 2 * ndim + ndim);
+    const size_t affordable = width ? REGIONPROPS_SCRATCH_BYTES / (width * 8) : 1;
+    const size_t ranges = std::min<size_t>(
+        std::max<size_t>(1, std::min<size_t>(n_threads, affordable)),
+        static_cast<size_t>(std::max<int64_t>(1, total / REGIONPROPS_SERIAL_THRESHOLD)));
+    if (n_threads <= 1 || ranges < 2 || n_labels <= 0) {
+        regionprops_nd(labels, n_labels, shape, areas, bbox_min, bbox_max, centroids_sum);
+        return;
+    }
+    // One table per range: areas, bbox min, bbox max, centroid sums.
+    std::vector<std::vector<int64_t>> counts(ranges), lows(ranges), highs(ranges);
+    std::vector<std::vector<double>> sums(ranges);
+    dispatch_parallel(pool, ranges, ranges, [&](size_t lo, size_t hi) {
+        for (size_t r = lo; r < hi; ++r) {
+            auto& count = counts[r]; auto& low = lows[r];
+            auto& high = highs[r]; auto& sum = sums[r];
+            count.assign(static_cast<size_t>(n_labels), 0);
+            low.assign(width ? static_cast<size_t>(n_labels) * ndim : 0,
+                       std::numeric_limits<int64_t>::max());
+            high.assign(low.size(), std::numeric_limits<int64_t>::min());
+            sum.assign(low.size(), 0.0);
+            const int64_t begin = static_cast<int64_t>(total * r / ranges);
+            const int64_t end = static_cast<int64_t>(total * (r + 1) / ranges);
+            // Coordinates of the range's first pixel, from its flat index.
+            std::vector<int64_t> coords(ndim, 0);
+            int64_t rest = begin;
+            for (int d = ndim - 1; d >= 0; --d) {
+                coords[d] = rest % shape[d];
+                rest /= shape[d];
+            }
+            for (int64_t flat = begin; flat < end; ++flat) {
+                const int32_t lab = labels[flat];
+                if (lab > 0 && lab <= n_labels) {
+                    const size_t i = static_cast<size_t>(lab - 1);
+                    count[i] += 1;
+                    for (int d = 0; d < ndim; ++d) {
+                        const int64_t c = coords[d];
+                        if (c < low[i * ndim + d]) low[i * ndim + d] = c;
+                        if (c >= high[i * ndim + d]) high[i * ndim + d] = c + 1;
+                        sum[i * ndim + d] += static_cast<double>(c);
+                    }
+                }
+                for (int d = ndim - 1; d >= 0; --d) {
+                    if (++coords[d] < shape[d]) break;
+                    coords[d] = 0;
+                }
+            }
+        }
+    });
+    // Merge in label blocks so each worker owns a disjoint output slice.
+    dispatch_parallel(pool, static_cast<size_t>(n_labels),
+        static_cast<size_t>(n_threads) * DISPATCH_CHUNKS_PER_THREAD,
+        [&](size_t lo, size_t hi) {
+            for (size_t i = lo; i < hi; ++i) {
+                int64_t area = 0;
+                for (size_t r = 0; r < ranges; ++r) area += counts[r][i];
+                areas[i] = area;
+                for (int d = 0; d < ndim; ++d) {
+                    const size_t at = i * ndim + d;
+                    int64_t least = std::numeric_limits<int64_t>::max();
+                    int64_t most = std::numeric_limits<int64_t>::min();
+                    double sum = 0.0;
+                    for (size_t r = 0; r < ranges; ++r) {
+                        least = std::min(least, lows[r][at]);
+                        most = std::max(most, highs[r][at]);
+                        sum += sums[r][at];
+                    }
+                    bbox_min[at] = area ? least : 0;
+                    bbox_max[at] = area ? most : 0;
+                    centroids_sum[at] = sum;
+                }
+            }
+        });
+}
+
 }  // namespace ncolor_cpp
 
 #endif  // NCOLOR_CC_LABEL_HPP

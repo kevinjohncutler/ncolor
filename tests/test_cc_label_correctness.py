@@ -127,6 +127,40 @@ def test_regionprops_equivalence_3d(seed, D, n):
     np.testing.assert_allclose(cp["centroid"], sk_centroid, atol=1e-9, rtol=0)
 
 
+@pytest.mark.parametrize("shape", [(64, 64), (300, 301), (2, 200, 201), (7, 8, 9, 10)])
+def test_regionprops_is_independent_of_worker_count(shape):
+    """Every worker count reproduces the serial scan exactly.
+
+    Ranges are scanned into private accumulators and merged. Areas and
+    bounding boxes are integers, and the centroid sums add integer
+    coordinates, which stay exact in a double, so no worker count can
+    change the result.
+    """
+    from ncolor._backend import _impl
+
+    rng = np.random.default_rng(abs(hash(shape)) % 2**32)
+    labels = np.zeros(shape, np.int32)
+    flat = labels.reshape(-1)
+    chosen = rng.choice(flat.size, size=flat.size // 2, replace=False)
+    flat[chosen] = rng.integers(1, max(4, flat.size // 500), chosen.size)
+
+    serial = _impl.regionprops(labels, 0)
+    for n_threads in (1, 2, 3, 4, 8):
+        got = ncolor.Engine(n_threads=n_threads).regionprops(labels)
+        for key, expected in serial.items():
+            assert np.array_equal(got[key], expected), (shape, n_threads, key)
+
+
+def test_regionprops_labels_absent_from_the_image():
+    """A label with no pixels keeps a zero area and a zeroed bounding box."""
+    labels = np.array([[0, 1, 0], [0, 0, 0], [3, 0, 3]], np.int32)
+    props = ncolor.Engine(n_threads=4).regionprops(labels, n_labels=5)
+    assert props["area"].tolist() == [1, 0, 2, 0, 0]
+    for absent in (1, 3, 4):
+        assert props["bbox_min"][absent].tolist() == [0, 0]
+        assert props["bbox_max"][absent].tolist() == [0, 0]
+
+
 def test_cc_label_empty_input():
     """All-zero mask → no components."""
     m = np.zeros((64, 64), dtype=np.uint16)

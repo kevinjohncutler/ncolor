@@ -341,6 +341,68 @@ static py::tuple component_arrays(py::array input, int conn,
     } else return py::make_tuple(output, count);
 }
 
+// Shared region-property wrapper for standalone calls and engine pools.
+// Without a pool the scan is serial, as it has always been.
+static py::dict region_property_arrays(py::array labels, int n_labels_arg,
+                                       std::shared_ptr<PoolSlot> slot = nullptr,
+                                       int n_threads = 1) {
+    labels = checked_labels(labels, "regionprops");
+    const auto buf = labels.request();
+    const int ndim = static_cast<int>(buf.ndim);
+    std::vector<int64_t> shape(buf.shape.begin(), buf.shape.end());
+    const int32_t* lab_ptr = static_cast<const int32_t*>(buf.ptr);
+    int64_t total = 1;
+    for (int64_t d : shape) total *= d;
+    // Auto-detect n_labels if the caller passed 0.
+    int32_t n_labels = n_labels_arg;
+    if (n_labels <= 0) {
+        for (int64_t i = 0; i < total; ++i) {
+            if (lab_ptr[i] > n_labels) n_labels = lab_ptr[i];
+        }
+    }
+    py::array_t<int64_t> areas({static_cast<py::ssize_t>(n_labels)});
+    py::array_t<int64_t> bbox_min({static_cast<py::ssize_t>(n_labels),
+                                   static_cast<py::ssize_t>(ndim)});
+    py::array_t<int64_t> bbox_max({static_cast<py::ssize_t>(n_labels),
+                                   static_cast<py::ssize_t>(ndim)});
+    py::array_t<double>  centroid({static_cast<py::ssize_t>(n_labels),
+                                   static_cast<py::ssize_t>(ndim)});
+    // Grab raw pointers BEFORE releasing the GIL — buffer_info()
+    // calls into Python's buffer protocol.
+    int64_t* areas_ptr    = static_cast<int64_t*>(areas.request().ptr);
+    int64_t* bbox_min_ptr = static_cast<int64_t*>(bbox_min.request().ptr);
+    int64_t* bbox_max_ptr = static_cast<int64_t*>(bbox_max.request().ptr);
+    double*  cent_ptr     = static_cast<double*>(centroid.request().ptr);
+    {
+        py::gil_scoped_release release;
+        std::unique_lock<std::mutex> lock;
+        if (slot) lock = std::unique_lock<std::mutex>(slot->mu);
+        if (slot) {
+            ncolor_cpp::regionprops_nd_parallel(
+                lab_ptr, n_labels, shape,
+                areas_ptr, bbox_min_ptr, bbox_max_ptr, cent_ptr,
+                slot->pool, n_threads);
+        } else {
+            ncolor_cpp::regionprops_nd(
+                lab_ptr, n_labels, shape,
+                areas_ptr, bbox_min_ptr, bbox_max_ptr, cent_ptr);
+        }
+        // centroid /= area
+        for (int32_t i = 0; i < n_labels; ++i) {
+            const double a = static_cast<double>(areas_ptr[i]);
+            if (a > 0.0) {
+                for (int d = 0; d < ndim; ++d) cent_ptr[i * ndim + d] /= a;
+            }
+        }
+    }
+    py::dict out;
+    out["area"]     = areas;
+    out["bbox_min"] = bbox_min;
+    out["bbox_max"] = bbox_max;
+    out["centroid"] = centroid;
+    return out;
+}
+
 static std::pair<py::array, int64_t> delete_spurs_labels_array(
         py::array labels_in, int threshold, int max_iters, int n_threads,
         bool remove_thin, std::shared_ptr<PoolSlot> slot = nullptr) {
@@ -415,6 +477,9 @@ public:
     }
     py::tuple components_per_label(py::array input, int conn) {
         return component_arrays<true>(input, conn, pool_, n_threads_);
+    }
+    py::dict regionprops(py::array labels, int n_labels) {
+        return region_property_arrays(labels, n_labels, pool_, n_threads_);
     }
 
     void release() {
@@ -2390,6 +2455,10 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("mask"), py::arg("conn") = 2)
         .def("components_per_label", &ExpandEngine::components_per_label,
              py::arg("labels"), py::arg("conn") = 2)
+        .def("regionprops", &ExpandEngine::regionprops,
+             py::arg("labels"), py::arg("n_labels") = 0,
+             "As the module-level regionprops, scanned on this engine's\n"
+             "workers. Results are identical for any worker count.")
         .def("delete_spurs_labels", &ExpandEngine::delete_spurs_labels,
              py::arg("labels"), py::arg("threshold") = 1,
              py::arg("max_iters") = 20, py::arg("remove_thin") = false)
@@ -2573,62 +2642,13 @@ PYBIND11_MODULE(_impl, m) {
           "format (int32, dense 1..N labels, 0 = bg).");
 
     m.def("regionprops",
-          [](py::array labels,
-             int n_labels_arg) -> py::dict {
-              labels = checked_labels(labels, "regionprops");
-              const auto buf = labels.request();
-              const int ndim = static_cast<int>(buf.ndim);
-              std::vector<int64_t> shape(ndim);
-              for (int d = 0; d < ndim; ++d) shape[d] = static_cast<int64_t>(buf.shape[d]);
-              const int32_t* lab_ptr = static_cast<const int32_t*>(buf.ptr);
-              int64_t total = 1;
-              for (int64_t d : shape) total *= d;
-              // Auto-detect n_labels if caller passed 0.
-              int32_t n_labels = n_labels_arg;
-              if (n_labels <= 0) {
-                  for (int64_t i = 0; i < total; ++i) {
-                      if (lab_ptr[i] > n_labels) n_labels = lab_ptr[i];
-                  }
-              }
-              py::array_t<int64_t> areas({static_cast<py::ssize_t>(n_labels)});
-              py::array_t<int64_t> bbox_min({static_cast<py::ssize_t>(n_labels),
-                                             static_cast<py::ssize_t>(ndim)});
-              py::array_t<int64_t> bbox_max({static_cast<py::ssize_t>(n_labels),
-                                             static_cast<py::ssize_t>(ndim)});
-              py::array_t<double>  centroid({static_cast<py::ssize_t>(n_labels),
-                                             static_cast<py::ssize_t>(ndim)});
-              // Grab raw pointers BEFORE releasing the GIL — buffer_info()
-              // calls into Python's buffer protocol.
-              int64_t* areas_ptr    = static_cast<int64_t*>(areas.request().ptr);
-              int64_t* bbox_min_ptr = static_cast<int64_t*>(bbox_min.request().ptr);
-              int64_t* bbox_max_ptr = static_cast<int64_t*>(bbox_max.request().ptr);
-              double*  cent_ptr     = static_cast<double*>(centroid.request().ptr);
-              {
-                  py::gil_scoped_release release;
-                  ncolor_cpp::regionprops_nd(
-                      lab_ptr, n_labels, shape,
-                      areas_ptr, bbox_min_ptr, bbox_max_ptr, cent_ptr);
-                  // centroid /= area
-                  for (int32_t i = 0; i < n_labels; ++i) {
-                      const double a = static_cast<double>(areas_ptr[i]);
-                      if (a > 0.0) {
-                          for (int d = 0; d < ndim; ++d) cent_ptr[i * ndim + d] /= a;
-                      }
-                  }
-              }
-              py::dict out;
-              out["area"]     = areas;
-              out["bbox_min"] = bbox_min;
-              out["bbox_max"] = bbox_max;
-              out["centroid"] = centroid;
-              return out;
-          },
+          [](py::array labels, int n_labels) { return region_property_arrays(labels, n_labels); },
           py::arg("labels"), py::arg("n_labels") = 0,
           "Region properties of a dense int32 1..N labeled image.\n"
           "Returns dict with keys 'area' (n_labels,), 'bbox_min'/'bbox_max'\n"
           "(n_labels, ndim), 'centroid' (n_labels, ndim). Pass n_labels=0\n"
           "to auto-detect from labels.max(). One raster pass; no per-component\n"
-          "Python objects.");
+          "Python objects. Serial; use ExpandEngine.regionprops for workers.");
 
     m.def("cc_label_per_label",
           [](py::array input, int conn) { return component_arrays<true>(input, conn); },

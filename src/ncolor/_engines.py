@@ -339,6 +339,11 @@ class Engine:
         from .color import connected_components
         return connected_components(mask, conn=conn, _engine=self)
 
+    def regionprops(self, labels, n_labels=0):
+        """As :func:`ncolor.regionprops`, using this engine's pool."""
+        from .color import regionprops
+        return regionprops(labels, n_labels=n_labels, _engine=self)
+
     def format_labels(self, labels, **kwargs):
         """As :func:`ncolor.format_labels`, on this engine."""
         from .format import format_labels as _format_labels

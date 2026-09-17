@@ -347,7 +347,7 @@ def connected_components(mask, conn=None, _engine=None):
         return engine._expand.connected_components(np.asarray(mask), conn=int(conn))
 
 
-def regionprops(labels, n_labels=0):
+def regionprops(labels, n_labels=0, _engine=None):
     """Region properties for a dense int32 1..N labeled image.
 
     Returns ``dict`` with vectorized numpy arrays:
@@ -359,9 +359,12 @@ def regionprops(labels, n_labels=0):
 
     Drop-in for the common subset of ``skimage.measure.regionprops``;
     returns vectorized arrays instead of per-region Python objects.
+
+    The scan runs on the engine's workers; results do not depend on the
+    worker count. Use :meth:`Engine.regionprops` to choose a budget.
     """
-    from ._backend import _impl as _b
-    return _b.regionprops(labels, int(n_labels))
+    with _use(_engine) as engine:
+        return engine._expand.regionprops(labels, int(n_labels))
 
 
 
