@@ -1,5 +1,8 @@
 # Cross-platform optimization follow-up
 
+Follow-up: [Snapshot preparation and rendering](SNAPSHOT_OPTIMIZATIONS.md)
+records the next round. The measurements below remain tied to this checkpoint.
+
 This round follows checkpoint `92c7c69`. Two changes are integrated into
 ordinary code paths: weighted contact extraction in retained feature-transform
 storage and sparse prepared render maps. No public option is required.

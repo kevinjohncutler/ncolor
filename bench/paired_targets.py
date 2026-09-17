@@ -11,7 +11,7 @@ from release_comparison import cpu_model, fingerprint
 import numpy as np
 
 
-def worker(source, sparse=False, render=False):
+def worker(source, sparse=False, render=False, case_filter=None, batch=1):
     sys.path.insert(0, str(source.resolve()))
     import ncolor
     assert Path(ncolor.__file__).resolve().is_relative_to(source.resolve())
@@ -33,7 +33,7 @@ def worker(source, sparse=False, render=False):
         for i, center in enumerate(rng.integers(4, min(shape)-4, (32, len(shape))), 1):
             image[tuple(slice(int(c-3), int(c+3)) for c in center)] = i
         for mode in ('standard', 'clean'):
-            for weight in ('min', 'count', 'mean_inv'):
+            for weight in ('min', 'max', 'count', 'mean_inv'):
                 calls[f'weighted/{shape}/{mode}/{weight}'] = (
                     lambda image=image, mode=mode, weight=weight: engine.label(
                         image, n=32, weight_objective=1, weight_mode=weight, expand_mode=mode))
@@ -50,12 +50,16 @@ def worker(source, sparse=False, render=False):
                     lambda prepared=prepared: prepared.color(n=32, engine=engine))
                 calls[f'prepare/{shape}/{fraction}'] = (
                     lambda image=image: np.asarray([engine.prepare_labels(image).n_labels], np.int32))
+    if case_filter:
+        calls = {key: value for key, value in calls.items() if any(part in key for part in case_filter)}
+        assert calls, "case filters matched no cases"
     print(json.dumps(list(calls)), flush=True)
     for request in sys.stdin:
         call = calls[json.loads(request)]
         start = time.perf_counter_ns()
-        result = call()
-        elapsed = (time.perf_counter_ns()-start)/1e6
+        for _ in range(batch):
+            result = call()
+        elapsed = (time.perf_counter_ns()-start)/1e6/batch
         print(json.dumps(dict(ms=elapsed, fingerprint=fingerprint(result))), flush=True)
 
 
@@ -67,17 +71,22 @@ def main():
     modes = p.add_mutually_exclusive_group()
     modes.add_argument('--render', action='store_true', help='recheck prepared rendering and preparation')
     modes.add_argument('--sparse', action='store_true', help='recheck one-percent foreground masks')
+    p.add_argument('--case', action='append', help='include matching case-name substrings')
+    p.add_argument('--batch', type=int, default=1, help='calls per timed sample')
+    p.add_argument('--settle-ms', type=float, default=0., help='pause outside timing between calls')
     p.add_argument('--worker', type=Path, help=argparse.SUPPRESS)
     a = p.parse_args()
+    if a.batch < 1 or not np.isfinite(a.settle_ms) or a.settle_ms < 0:
+        p.error("batch must be positive and settle-ms finite and nonnegative")
     if a.worker:
-        worker(a.worker, a.sparse, a.render)
+        worker(a.worker, a.sparse, a.render, a.case, a.batch)
         return
     if not (a.before and a.after and a.output): p.error('before, after, and output are required')
     children = []
     try:
         for source in (a.before, a.after):
             children.append(subprocess.Popen([sys.executable, '-u', '-S', __file__,
-                '--worker', str(source)]+(['--sparse'] if a.sparse else ['--render'] if a.render else []), stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True))
+                '--worker', str(source), '--batch', str(a.batch)]+(['--sparse'] if a.sparse else ['--render'] if a.render else []) + [item for value in a.case or [] for item in ('--case', value)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True))
         names = [json.loads(child.stdout.readline()) for child in children]
         assert names[0] == names[1]
         results = {}
@@ -90,13 +99,15 @@ def main():
                     child.stdin.write(json.dumps(name)+'\n')
                     child.stdin.flush()
                     result = json.loads(child.stdout.readline())
+                    if a.settle_ms:
+                        time.sleep(a.settle_ms/1000)
                     if expected is None: expected = result['fingerprint']
                     assert expected == result['fingerprint'], name
                     if rep >= 4: samples[index].append(result['ms'])
             results[name] = dict(before_ms=statistics.median(samples[0]),
                 after_ms=statistics.median(samples[1]), samples_ms=samples, fingerprint=expected)
         a.output.parent.mkdir(parents=True, exist_ok=True)
-        a.output.write_text(json.dumps(dict(cpu=cpu_model(), threads=4, sparse_probe=a.sparse, render_probe=a.render,
+        a.output.write_text(json.dumps(dict(cpu=cpu_model(), threads=4, batch=a.batch, settle_ms=a.settle_ms, sparse_probe=a.sparse, render_probe=a.render,
             affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None,
             results=results), indent=2)+'\n')
         print(a.output.resolve(), flush=True)

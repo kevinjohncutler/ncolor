@@ -1710,21 +1710,36 @@ public:
                     snapshot.soft_weights = soft_weights_;
                 }
                 size_t foreground = 0;
-                for (int64_t i = 0; i < total; ++i) {
-                    foreground += !bg_mask_[i] && lut_src[i] != 0;
-                    if (foreground > static_cast<size_t>(total) / 32) break;
+                if (total >= 262144 && N > 0) {
+                    // Check the limit between blocks so the inner reduction
+                    // can vectorize. Small snapshots always use dense storage.
+                    constexpr int64_t block = 4096;
+                    for (int64_t begin = 0; begin < total; begin += block) {
+                        const int64_t end = std::min(total, begin + block);
+                        for (int64_t i = begin; i < end; ++i)
+                            foreground += (bg_mask_[i] == 0) & (lut_src[i] != 0);
+                        if (foreground > static_cast<size_t>(total) / 32) break;
+                    }
                 }
-                snapshot.sparse_render = total >= 262144 && foreground <= static_cast<size_t>(total) / 32;
+                snapshot.sparse_render = N == 0 || (total >= 262144 && foreground <= static_cast<size_t>(total) / 32);
                 snapshot.allocate_render(snapshot.sparse_render ? foreground : static_cast<size_t>(total), N);
                 if (snapshot.sparse_render) snapshot.render_positions.reserve(foreground);
                 std::visit([&](auto& render_labels) {
                     using Label = typename std::decay_t<decltype(render_labels)>::value_type;
                     if (snapshot.sparse_render) {
-                        size_t j = 0;
-                        for (int64_t i = 0; i < total; ++i) {
-                            if (bg_mask_[i] || !lut_src[i]) continue;
-                            snapshot.render_positions.push_back(static_cast<size_t>(i));
-                            render_labels[j++] = static_cast<Label>(lut_src[i]);
+                        size_t j = 0, begin = 0;
+                        while (begin < static_cast<size_t>(total)) {
+                            // The byte mask uses zero for foreground. Let the
+                            // platform's byte search skip long background runs.
+                            const auto* hit = static_cast<const uint8_t*>(std::memchr(
+                                bg_mask_.data() + begin, 0, static_cast<size_t>(total) - begin));
+                            if (!hit) break;
+                            const size_t i = static_cast<size_t>(hit - bg_mask_.data());
+                            if (lut_src[i]) {
+                                snapshot.render_positions.push_back(i);
+                                render_labels[j++] = static_cast<Label>(lut_src[i]);
+                            }
+                            begin = i + 1;
                         }
                     } else {
                         ncolor_cpp::dispatch_parallel(pool_->pool, static_cast<size_t>(total),
@@ -1748,7 +1763,10 @@ public:
                 [](int64_t extent) { return extent > 1; }));
             snapshot.wrap = wrap;
             snapshot.weight_objective = weight_objective;
-            if (early_exit_empty) snapshot.allocate_render(static_cast<size_t>(total), 0);
+            if (early_exit_empty) {
+                snapshot.sparse_render = true;
+                snapshot.allocate_render(0, 0);
+            }
             snapshot.ready = true;
             *prepared = std::move(snapshot);
         }
@@ -1817,8 +1835,13 @@ public:
                 std::fill_n(output, total, uint8_t{0});
             }
             if (render_output) std::visit([&](const auto& render_labels) {
-                ncolor_cpp::dispatch_parallel(pool_->pool, render_labels.size(),
-                    static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD,
+                const size_t serial_limit = prepared.sparse_render ? 1024 : 8192;
+                const size_t chunks = n_threads_ <= 1 || render_labels.size() < serial_limit
+                    ? 0 : static_cast<size_t>(n_threads_) * ncolor_cpp::DISPATCH_CHUNKS_PER_THREAD;
+                // Zero chunks uses the dispatcher's direct-call path. Size
+                // sparse maps by foreground entries, not image extent.
+                // Scattered writes need parallelism sooner than dense writes.
+                ncolor_cpp::dispatch_parallel(pool_->pool, render_labels.size(), chunks,
                     [&](size_t begin, size_t end) {
                         if (prepared.sparse_render) {
                             for (size_t i = begin; i < end; ++i)

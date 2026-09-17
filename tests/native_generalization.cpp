@@ -542,6 +542,22 @@ static void check_dispatch_ranges() {
             }
         }
     }
+    // Failure in a single-chunk dispatch must not poison the next parallel pass.
+    for (bool with_scratch : {false, true}) {
+        bool caught = false;
+        try {
+            if (with_scratch)
+                dispatch_parallel_with_scratch(pool, 4, 17, 1, scratch,
+                    [](int&, size_t, size_t) { throw std::runtime_error("single chunk failure"); });
+            else dispatch_parallel(pool, 17, 1,
+                [](size_t, size_t) { throw std::runtime_error("single chunk failure"); });
+        } catch (const std::runtime_error&) { caught = true; }
+        assert(caught);
+        std::atomic<size_t> done{0};
+        dispatch_parallel(pool, 17, 8,
+            [&](size_t begin, size_t end) { done.fetch_add(end - begin); });
+        assert(done == 17);
+    }
     // The partition arithmetic must also work near size_t's limit,
     // without allocating or iterating over the logical item range.
     const size_t limit = std::numeric_limits<size_t>::max();

@@ -75,10 +75,11 @@ def prepare_labels(lab, *, conn=1, expand=True, format_input=True,
 
     All options have the same meaning as in :func:`label`. Preparation
     performs normalization, expansion, contact extraction, and graph
-    construction once, without solving a coloring. It retains a label
-    identifier per pixel plus the hard and soft graph data. Identifiers use
-    one, two, or four bytes according to label count. Source
-    arrays and explicit edge lists are not retained by reference.
+    construction once, without solving a coloring. It retains compact label
+    identifiers plus the hard and soft graph data. Large sparse snapshots
+    store only foreground positions and labels; empty snapshots need no
+    per-pixel map. Identifiers use one, two, or four bytes according to label
+    count. Source arrays and explicit edge lists are not retained by reference.
 
     >>> prepared = prepare_labels([[0, 1, 1], [2, 2, 0]])
     >>> image = prepared.color(n=4)

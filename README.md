@@ -59,8 +59,9 @@ depth, and perceptual palette. `Engine.prepare_labels(...)` and
 `prepared.color(engine=engine)` provide explicit worker control. A snapshot
 uses one, two, or four bytes per pixel according to label count, plus its
 graph arrays. Large sparse images can instead store only foreground positions and
-labels. This reduces snapshot memory and repeated
-rendering time, with an extra cost during preparation. Release it when done.
+labels. Empty snapshots retain no per-pixel map. Compact storage reduces
+snapshot memory and repeated rendering time, though preparation can cost
+more. Release it when done.
 `prepared.color(return_lut=True)` skips
 image rendering when no output buffer is supplied.
 See [performance exploration](PERFORMANCE_EXPLORATION.md) for measured
@@ -129,10 +130,11 @@ an unnecessary final distance transpose and an intermediate input copy.
 Distance-returning and distance-weighted calls retain the distances they
 need. See [PERFORMANCE_EXPLORATION.md](PERFORMANCE_EXPLORATION.md) for direct
 before/after comparisons, memory costs, and experiments that were not kept.
-[The latest optimization report](FINAL_OPTIMIZATIONS.md) covers weighted
-feature transforms, sparse prepared rendering, components, and platform
-validation. Historical release ratios remain labeled by their measured
-checkpoint; they are not multiplied by later development speedups.
+[The latest optimization report](SNAPSHOT_OPTIMIZATIONS.md) covers faster
+snapshot preparation, compact empty snapshots, and rendering small maps.
+[The preceding report](FINAL_OPTIMIZATIONS.md) covers weighted feature
+transforms, components, and platform validation. Historical release ratios
+remain labeled by their measured checkpoint; they are not multiplied by later development speedups.
 
 
 For C++ engine internals, file-by-file architecture, and threadpool design, see [ARCHITECTURE.md](ARCHITECTURE.md).

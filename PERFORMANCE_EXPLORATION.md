@@ -499,3 +499,11 @@ thresholds, and higher-dimensional cleanup locality. It distinguishes
 integrated changes from rejected candidates and includes installed-wheel
 validation. The earlier future-work list above describes the state before
 that follow-up; use the new report for current decisions.
+
+
+## Snapshot preparation follow-up
+
+[The next optimization round](SNAPSHOT_OPTIMIZATIONS.md) reduces preparation
+scans, removes pixel storage from empty snapshots, and avoids worker wakeups
+for small prepared render maps. It includes an isolated coloring-regression
+check and explains why the generic dispatch shortcut was not retained.
