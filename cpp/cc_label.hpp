@@ -126,16 +126,16 @@ static inline void cc_pass1_interior_inner_runtime(
 // boundary axis, take the per-pixel boundary-mask path.
 template <typename T>
 inline int32_t cc_label_nd(const T* input, int32_t* output,
-                           const std::vector<int64_t>& shape, int conn,
+                           const std::vector<int64_t>& input_shape, int conn,
                            CCStageTimes* times = nullptr) {
+    validate_neighborhood_ndim(static_cast<int>(input_shape.size()));
+    // Singleton axes do not affect connectivity. Drop them locally rather
+    // than recursing, which kept compilers from inlining this kernel.
+    std::vector<int64_t> shape;
+    for (int64_t n : input_shape)
+        if (n != 1 || input_shape.size() == 1) shape.push_back(n);
+    if (shape.empty()) shape.push_back(1);
     const int ndim = static_cast<int>(shape.size());
-    validate_neighborhood_ndim(ndim);
-    if (shape.size() > 1 && std::find(shape.begin(), shape.end(), 1) != shape.end()) {
-        std::vector<int64_t> active;
-        for (int64_t n : shape) if (n != 1) active.push_back(n);
-        if (active.empty()) active.push_back(1);
-        return cc_label_nd(input, output, active, conn, times);
-    }
     if (conn < 1) conn = 1;
     if (conn > ndim) conn = ndim;
     int64_t total = 1;
@@ -325,17 +325,16 @@ inline int32_t cc_label_nd(const T* input, int32_t* output,
 // rescanning the image.
 template <typename T>
 inline int32_t cc_label_per_label_nd(const T* input, int32_t* output,
-                                      const std::vector<int64_t>& shape,
+                                      const std::vector<int64_t>& input_shape,
                                       int conn,
                                       std::vector<T>& source_labels_out) {
+    validate_neighborhood_ndim(static_cast<int>(input_shape.size()));
+    // Singleton axes are dropped locally, as in cc_label_nd.
+    std::vector<int64_t> shape;
+    for (int64_t n : input_shape)
+        if (n != 1 || input_shape.size() == 1) shape.push_back(n);
+    if (shape.empty()) shape.push_back(1);
     const int ndim = static_cast<int>(shape.size());
-    validate_neighborhood_ndim(ndim);
-    if (shape.size() > 1 && std::find(shape.begin(), shape.end(), 1) != shape.end()) {
-        std::vector<int64_t> active;
-        for (int64_t n : shape) if (n != 1) active.push_back(n);
-        if (active.empty()) active.push_back(1);
-        return cc_label_per_label_nd(input, output, active, conn, source_labels_out);
-    }
     if (conn < 1) conn = 1;
     if (conn > ndim) conn = ndim;
     int64_t total = 1;
