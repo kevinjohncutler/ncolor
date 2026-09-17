@@ -40,8 +40,8 @@ stage checks restrict execution to four physical cores sharing a cache.
 coloring worker pool, 101 samples per round, and a single fixed CPU on Linux.
 These diagnostic measurements are separate from whole-call timing tables.
 
-Raw samples, checks, and environment metadata are under
-[`bench/regression_results/`](../regression_results/).
+Raw samples, checks, and environment metadata were written to
+`bench/regression_results/`, which is generated locally and not tracked.
 
 ## Results
 

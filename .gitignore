@@ -10,6 +10,7 @@ docs/
 _tmp_*
 bench_outputs/
 bench_outputs_old/
+bench/*_results/
 
 # Byte-compiled / optimized / DLL files
 !**/__pycache__/
