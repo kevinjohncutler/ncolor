@@ -82,16 +82,19 @@ def main(specs):
                              cell(ratio(s, key, image + "/scipy_feature", "external")),
                              cell(ratio(s, key, image + "/skimage_expand", "external"))])
         print(table(["Image", "CPU", "ncolor ms", "vs 2.2.0", "vs SciPy EDT", "vs scikit-image"], rows) + "\n")
-    print("### regionprops\n")
-    rows = []
-    for image, text in IMAGES.items():
-        for name, runs, _ in hosts:
-            s = runs[4]
-            key = image + "/properties"
-            rows.append([text, name, f"{s[key]['median_ms']['current']:.2f}",
-                         cell(ratio(s, key, key, "external")),
-                         cell(ratio(s, key, image + "/properties_table", "external"))])
-    print(table(["Image", "CPU", "ncolor ms", "vs regionprops", "vs regionprops_table"], rows) + "\n")
+    for workers in (4, 1):
+        print(f"### regionprops, {workers} worker{'s' if workers > 1 else ''}\n")
+        rows = []
+        for image, text in IMAGES.items():
+            for name, runs, _ in hosts:
+                s = runs[workers]
+                key = image + "/properties"
+                rows.append([text, name, f"{s[key]['median_ms']['current']:.2f}",
+                             cell(ratio(s, key, key, "2.2.0")),
+                             cell(ratio(s, key, key, "external")),
+                             cell(ratio(s, key, image + "/properties_table", "external"))])
+        print(table(["Image", "CPU", "ncolor ms", "vs 2.2.0", "vs regionprops",
+                     "vs regionprops_table"], rows) + "\n")
     print("### connected_components\n")
     rows = []
     names = sorted(k for k in hosts[0][1][4] if "/components_c" in k)

@@ -14,8 +14,8 @@ and versions follow [semantic versioning](https://semver.org/).
   adjacency graph once, so repeated `color()` calls with a different color
   target, search depth, or palette skip formatting, expansion, and
   adjacency search.
-- `Engine.connected_components` and `Engine.delete_spurs` give explicit
-  worker control for those operations.
+- `Engine.connected_components`, `Engine.regionprops`, and
+  `Engine.delete_spurs` give explicit worker control for those operations.
 
 ### Changed
 
@@ -42,13 +42,17 @@ and versions follow [semantic versioning](https://semver.org/).
 Measured against 2.2.0 on an Apple M5 Max and an AMD Ryzen 9 7950X; see
 BENCHMARKS.md for per-input times.
 
-- `label` with default settings: 0.96x to 1.18x the speed of 2.2.0 on 4
-  workers and 1.01x to 1.25x on one. The largest gains are on large,
+- `label` with default settings: 1.00x to 1.19x the speed of 2.2.0 on 4
+  workers and 1.00x to 1.21x on one. The largest gains are on large,
   sparse images.
-- `expand_labels`: 1.02x to 1.21x on one worker.
+- `expand_labels`: 1.02x to 1.18x on one worker.
 - `connected_components` splits large masks into slabs that are labeled in
-  parallel and merged: 1.6x to 3.1x faster on 4 workers, and 0.95x to 1.07x
+  parallel and merged: 1.6x to 3.1x faster on 4 workers, and 0.95x to 1.08x
   on one.
+- `regionprops` scans pixel ranges in parallel, which it never did before:
+  up to 4.1x faster than 2.2.0 on 4 workers, and up to 4.8x faster than the
+  serial scan at 8. Wide labelings use fewer workers to bound scratch
+  memory, and beyond roughly 600k labels in 2D the scan stays serial.
 - Thin-component seams, one-byte label formatting, and weighted feature
   transforms use new kernels.
 - Fixed slowdowns introduced during this cycle in soft-constraint search

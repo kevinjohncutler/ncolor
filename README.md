@@ -101,19 +101,21 @@ colors = ncolor.color_graph(edges, n_vertices=len(nodes))   # 0-indexed pairs
 
 ## New in v2
 
-v2 is a complete C++ rewrite. With matched settings, `label` runs 6.6x to 24.4x faster than 1.5.3 on 4 workers and 2.6x to 7.3x faster on one; with default settings it runs 0.96x to 1.18x the speed of 2.2.0 on 4 workers and 1.01x to 1.25x on one. These are ranges over five test images on an Apple M5 Max and an AMD Ryzen 9 7950X; see [BENCHMARKS.md](BENCHMARKS.md) for per-image times, methods, and how to reproduce them. The new default expand removes 1-pixel bridges and spurs before the picker sees them, and an auto-soft constraint refines the hard 4-coloring via local search to differentiate near-adjacent cells. Together these break the K₅-shaped convergence clusters that forced the v1 numba pipeline up to `N = 5`. See [CHANGELOG.md](CHANGELOG.md) for the full list of changes and the migration table from v1.
+v2 is a complete C++ rewrite. With matched settings, `label` runs 6.3x to 24.1x faster than 1.5.3 on 4 workers and 2.6x to 7.2x faster on one; with default settings it runs 1.00x to 1.19x the speed of 2.2.0 on 4 workers and 1.00x to 1.21x on one. These are ranges over five test images on an Apple M5 Max and an AMD Ryzen 9 7950X; see [BENCHMARKS.md](BENCHMARKS.md) for per-image times, methods, and how to reproduce them. The new default expand removes 1-pixel bridges and spurs before the picker sees them, and an auto-soft constraint refines the hard 4-coloring via local search to differentiate near-adjacent cells. Together these break the K₅-shaped convergence clusters that forced the v1 numba pipeline up to `N = 5`. See [CHANGELOG.md](CHANGELOG.md) for the full list of changes and the migration table from v1.
 
 The rewrite also brings drop-in C++ replacements for the image-analysis and distance-transform calls the old pipeline relied on, with no extra install:
 
 | ncolor | replaces | speed, 1 worker | speed, 4 workers |
 |---|---|---|---|
-| `ncolor.connected_components` | `skimage.measure.label` | 0.38x to 2.4x | 1.0x to 6.6x |
-| `ncolor.regionprops` | `skimage.measure.regionprops_table` (area, bbox, centroid) | 1.9x to 27.2x | same as 1 worker |
-| `ncolor.expand_labels` | `scipy.ndimage.distance_transform_edt` nearest-label fill | 2.6x to 7.2x | 7.0x to 25.4x |
-| `ncolor.expand_labels` | `skimage.segmentation.expand_labels` | 3.4x to 8.4x | 10.7x to 28.8x |
+| `ncolor.connected_components` | `skimage.measure.label` | 0.37x to 2.5x | 1.0x to 6.6x |
+| `ncolor.regionprops` | `skimage.measure.regionprops_table` (area, bbox, centroid) | 1.9x to 26.0x | 4.1x to 26.6x |
+| `ncolor.expand_labels` | `scipy.ndimage.distance_transform_edt` nearest-label fill | 2.6x to 7.1x | 6.9x to 24.8x |
+| `ncolor.expand_labels` | `skimage.segmentation.expand_labels` | 3.4x to 8.2x | 10.6x to 28.3x |
 | `ncolor.delete_spurs` | hand-rolled morphology, not in scikit-image | not compared | not compared |
 
-Speeds are ranges over the benchmark inputs on both machines, measured against SciPy 1.18.1 and scikit-image 0.26.0, which run these operations on one thread. `expand_labels` also supports L1 expansion in any dimension. On one thread, scikit-image labels dense masks at full connectivity faster than ncolor, down to 0.38x on a 70% filled 3D volume.
+Speeds are ranges over the benchmark inputs on both machines, measured against SciPy 1.18.1 and scikit-image 0.26.0, which run these operations on one thread. `expand_labels` also supports L1 expansion in any dimension. On one thread, scikit-image labels dense masks at full connectivity faster than ncolor, down to 0.37x on a 70% filled 3D volume.
+
+All of these run on the engine's workers, and `Engine(n_threads=...)` sets the budget per call. Results never depend on the worker count.
 
 Connected components is a separate utility and is also used by
 `format_labels(clean=True)` to split disconnected pieces of a label.

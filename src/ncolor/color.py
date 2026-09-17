@@ -362,6 +362,9 @@ def regionprops(labels, n_labels=0, _engine=None):
 
     The scan runs on the engine's workers; results do not depend on the
     worker count. Use :meth:`Engine.regionprops` to choose a budget.
+    Each worker accumulates into its own table, so a scratch budget of
+    64 MiB caps how many run: in 2D that is eight workers up to about
+    150k labels, falling to one beyond about 600k.
     """
     with _use(_engine) as engine:
         return engine._expand.regionprops(labels, int(n_labels))
