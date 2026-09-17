@@ -41,7 +41,7 @@ coloring worker pool, 101 samples per round, and a single fixed CPU on Linux.
 These diagnostic measurements are separate from whole-call timing tables.
 
 Raw samples, checks, and environment metadata are under
-[`bench/regression_results/`](bench/regression_results/).
+[`bench/regression_results/`](../regression_results/).
 
 ## Results
 

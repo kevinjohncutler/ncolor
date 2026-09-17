@@ -252,7 +252,7 @@ def test_unformatted_float_truncation_to_background():
 @pytest.mark.parametrize('conn', [1, 2, 3])
 @pytest.mark.parametrize('density', [0.01, 0.1, 0.7, 1.0])
 def test_thin_component_seams_match_independent_reference(conn, density):
-    from skimage.measure import label
+    label = pytest.importorskip("skimage.measure").label
     image = np.random.default_rng(919).random((2, 513, 517)) < density
     expected, count = label(image, connectivity=conn, return_num=True)
     actual, actual_count = ncolor.Engine(n_threads=4).connected_components(image, conn=conn)
@@ -295,7 +295,7 @@ def test_sparse_prepared_render_clears_reused_output(clean_mask, mode):
 
 
 def test_full_2d_components_exhaustive_neighborhoods():
-    from skimage.measure import label
+    label = pytest.importorskip("skimage.measure").label
     engine = ncolor.Engine(n_threads=1)
     for bits in range(512):
         image = ((bits >> np.arange(9)) & 1).reshape(3, 3).astype(bool)

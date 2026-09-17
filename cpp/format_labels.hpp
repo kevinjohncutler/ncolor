@@ -187,12 +187,12 @@ inline int32_t format_labels_inplace(int32_t* lbl, int64_t total,
     // Relaxed atomic flags make overlapping label writes well-defined.
     // Skip stores once marked to avoid repeatedly invalidating shared cache lines.
     std::vector<std::atomic<uint8_t>> present(static_cast<size_t>(max_lbl) + 1);
-    for (auto& flag : present) std::atomic_init(&flag, uint8_t{0});
-    auto mark = [&](size_t begin, size_t end) {
+    std::atomic<uint8_t>* const flags = present.data();
+    auto mark = [lbl, flags](size_t begin, size_t end) {
         for (size_t i = begin; i < end; ++i) {
             const int32_t v = lbl[i];
-            if (v > 0 && !present[v].load(std::memory_order_relaxed))
-                present[v].store(1, std::memory_order_relaxed);
+            if (v > 0 && !flags[v].load(std::memory_order_relaxed))
+                flags[v].store(1, std::memory_order_relaxed);
         }
     };
     if (n_threads <= 1 || total < detail::FORMAT_LABELS_SERIAL_THRESHOLD) {

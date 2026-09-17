@@ -5,6 +5,47 @@ All notable changes to ncolor are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [semantic versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `ncolor.prepare_labels` and `Engine.prepare_labels` return a
+  `PreparedLabels` snapshot that stores the formatted raster and its
+  adjacency graph once, so repeated `color()` calls with a different color
+  target, search depth, or palette skip formatting, expansion, and
+  adjacency search.
+- `Engine.connected_components` and `Engine.delete_spurs` give explicit
+  worker control for those operations.
+
+### Changed
+
+- `format_labels` honors `background=`. With `ignore=True`, source `0`
+  stays an ignore marker, `1` is background, and cells are numbered
+  from 2.
+- `n` outside 1 to 255 and `max_depth` below 1 raise `ValueError`. The
+  picker can expand its palette up to 255 colors.
+- `connected_components` defaults to `conn=min(2, ndim)` and runs on the
+  engine pool.
+- Binary `delete_spurs` treats any nonzero value as foreground.
+- Geometry labeling validates `tolerance` and `min_shared_length`. Edge
+  arrays accept boolean and integer-valued float dtypes.
+
+### Fixed
+
+- An exception raised in a worker thread propagates to the caller
+  instead of being lost.
+- Search deadlines use a monotonic clock.
+- A custom `de_table` is padded when the palette grows during escalation.
+
+### Performance
+
+Paired A/B against 2.2.0 on four hosts:
+
+- `connect` 1.88x faster, `expand_labels` 1.17x, `format_labels` 1.06x,
+  `label` 1.05x.
+- Binary connected components, thin-component seams, one-byte label
+  formatting, and weighted feature transforms use new kernels.
+
 ## [2.2.0] - 2026-09-10
 
 ### Fixed

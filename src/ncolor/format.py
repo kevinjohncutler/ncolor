@@ -176,7 +176,7 @@ def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
 
     * ``"cardinal"`` (default) — face neighbors only (2·ndim of them).
       Catches pixels sticking out of a flat boundary; matches the
-      the external-spur rule. Aggressive; fewer iterations to converge.
+      external-spur rule. Aggressive; fewer iterations to converge.
     * ``"total"`` — full-diagonal (3^ndim − 1 neighbors). Preserves
       diagonally connected features better than face-only connectivity.
       At the default threshold, a straight 1-voxel-wide line in 3D

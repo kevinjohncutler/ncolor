@@ -46,15 +46,27 @@ inline double soft_total_penalty(
     return total;
 }
 
-// Compute hard-conflict color mask for vertex u (bit c set if some hard
-// neighbor of u uses color c).
-inline std::bitset<256> hard_color_mask(
+// Hard-conflict color masks (bit c set if some hard neighbor of u uses
+// color c). Palettes below 64 colors use one machine word; wider ones use
+// a 256-bit set. The pass templates below take either representation.
+inline uint64_t hard_color_mask64(
+    int32_t u, const uint8_t* colors,
+    const int32_t* hard_indptr, const int32_t* hard_indices)
+{
+    uint64_t mask = 0u;
+    for (int32_t j = hard_indptr[u]; j < hard_indptr[u + 1]; ++j) {
+        mask |= uint64_t{1} << (colors[hard_indices[j]] & 63u);
+    }
+    return mask;
+}
+
+inline std::bitset<256> hard_color_mask256(
     int32_t u, const uint8_t* colors,
     const int32_t* hard_indptr, const int32_t* hard_indices)
 {
     std::bitset<256> mask;
     for (int32_t j = hard_indptr[u]; j < hard_indptr[u + 1]; ++j) {
-        mask.set(colors[hard_indices[j]]);
+        mask[colors[hard_indices[j]]] = true;
     }
     return mask;
 }
@@ -76,7 +88,8 @@ inline double soft_at_color(
 
 // One pass of single-vertex greedy first-improvement. Returns true if
 // any move was applied.
-inline bool single_vertex_pass(
+template <size_t PaletteSize>
+inline bool single_vertex_pass_impl(
     uint8_t* colors, int32_t N,
     const int32_t* hard_indptr, const int32_t* hard_indices,
     const int32_t* soft_indptr, const int32_t* soft_indices,
@@ -85,10 +98,25 @@ inline bool single_vertex_pass(
     double& penalty)
 {
     bool improved = false;
+    std::bitset<256> all256;
+    for (int c = 1; c <= n_colors; ++c) all256[c] = true;
+    const uint64_t all64 = n_colors >= 63 ? ~uint64_t{1}
+        : ((uint64_t{1} << (n_colors + 1)) - 1u) & ~uint64_t{1};
     for (int32_t u = 0; u < N; ++u) {
         const uint8_t cur_c = colors[u];
-        const auto hard_mask = hard_color_mask(u, colors,
-                                                     hard_indptr, hard_indices);
+        // Candidate colors exclude the current color and every hard
+        // neighbor's color. Skip before any soft work when none remain.
+        uint64_t valid64 = 0u;
+        std::bitset<256> valid256;
+        if (PaletteSize == 64) {
+            valid64 = all64 & ~hard_color_mask64(u, colors, hard_indptr, hard_indices)
+                & ~(uint64_t{1} << cur_c);
+            if (valid64 == 0u) continue;
+        } else {
+            valid256 = all256 & ~hard_color_mask256(u, colors, hard_indptr, hard_indices);
+            valid256[cur_c] = false;
+            if (valid256.none()) continue;
+        }
 
         const double cur_soft = soft_at_color(u, cur_c, colors,
                                                soft_indptr, soft_indices,
@@ -97,8 +125,7 @@ inline bool single_vertex_pass(
 
         double best_new = cur_soft;
         uint8_t best_c = cur_c;
-        for (int c = 1; c <= n_colors; ++c) {
-            if (c == cur_c || hard_mask.test(c)) continue;
+        auto consider = [&](int c) {
             const double new_soft = soft_at_color(u, c, colors,
                                                     soft_indptr, soft_indices,
                                                     soft_weights);
@@ -106,6 +133,11 @@ inline bool single_vertex_pass(
                 best_new = new_soft;
                 best_c = (uint8_t)c;
             }
+        };
+        if (PaletteSize == 64) {
+            for (uint64_t mask = valid64; mask; mask &= mask - 1) consider(ctz_u64(mask));
+        } else {
+            for (int c = 1; c <= n_colors; ++c) if (valid256[c]) consider(c);
         }
         if (best_c != cur_c) {
             colors[u] = best_c;
@@ -114,6 +146,21 @@ inline bool single_vertex_pass(
         }
     }
     return improved;
+}
+
+inline bool single_vertex_pass(
+    uint8_t* colors, int32_t N,
+    const int32_t* hard_indptr, const int32_t* hard_indices,
+    const int32_t* soft_indptr, const int32_t* soft_indices,
+    const float* soft_weights,
+    int n_colors,
+    double& penalty)
+{
+    if (n_colors < 64)
+        return single_vertex_pass_impl<64>(colors, N, hard_indptr, hard_indices,
+            soft_indptr, soft_indices, soft_weights, n_colors, penalty);
+    return single_vertex_pass_impl<256>(colors, N, hard_indptr, hard_indices,
+        soft_indptr, soft_indices, soft_weights, n_colors, penalty);
 }
 
 // One pass of Kempe-chain swap attempts. For each stuck vertex u (soft

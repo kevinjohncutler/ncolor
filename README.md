@@ -58,14 +58,14 @@ settings change. Each coloring call can change the color target, search
 depth, and perceptual palette. `Engine.prepare_labels(...)` and
 `prepared.color(engine=engine)` provide explicit worker control. A snapshot
 uses one, two, or four bytes per pixel according to label count, plus its
-graph arrays. Large sparse images can instead store only foreground positions and
-labels. Empty snapshots retain no per-pixel map. Compact storage reduces
-snapshot memory and repeated rendering time, though preparation can cost
-more. Release it when done.
-`prepared.color(return_lut=True)` skips
-image rendering when no output buffer is supplied.
-See [performance exploration](PERFORMANCE_EXPLORATION.md) for measured
-tradeoffs and experiments that were not promoted into the library.
+graph arrays. Large sparse images can instead store only foreground
+positions and labels. Empty snapshots retain no per-pixel map. Compact
+storage reduces snapshot memory and repeated rendering time, though
+preparation can cost more. The snapshot's memory is freed when the object is
+deleted (`del prepared`). `prepared.color(return_lut=True)` skips image
+rendering when no output buffer is supplied. See
+[performance exploration](bench/reports/PERFORMANCE_EXPLORATION.md) for
+measured tradeoffs and experiments that were not promoted into the library.
 
 ## Vector geometry (GeoDataFrames, GeoJSON)
 
@@ -104,7 +104,7 @@ colors = ncolor.color_graph(edges, n_vertices=len(nodes))   # 0-indexed pairs
 ## New in v2
 
 v2 is a complete C++ rewrite. Every stage of the pipeline including label expansion has been optimized, with end-to-end comparisons against versions 1.5.3 and 2.2.0 documented in
-[release benchmarks](RELEASE_BENCHMARKS.md). Performance depends on image
+[release benchmarks](bench/reports/RELEASE_BENCHMARKS.md). Performance depends on image
 shape, connectivity, worker count, and CPU. The new default expand removes 1-pixel bridges and spurs before the picker sees them, and an auto-soft constraint refines the hard 4-coloring via local search to differentiate near-adjacent cells. Together these break the K₅-shaped convergence clusters that forced the v1 numba pipeline up to `N = 5`. See [CHANGELOG.md](CHANGELOG.md) for the full list of changes and the migration table from v1.
 
 The rewrite also brings drop-in C++ replacements for the image-analysis and distance-transform calls the old pipeline relied on, with no extra install:
@@ -128,11 +128,11 @@ budget. Component IDs retain the serial scan order.
 The latest measured optimizations preserve label propagation while avoiding
 an unnecessary final distance transpose and an intermediate input copy.
 Distance-returning and distance-weighted calls retain the distances they
-need. See [PERFORMANCE_EXPLORATION.md](PERFORMANCE_EXPLORATION.md) for direct
+need. See [PERFORMANCE_EXPLORATION.md](bench/reports/PERFORMANCE_EXPLORATION.md) for direct
 before/after comparisons, memory costs, and experiments that were not kept.
-[The latest optimization report](SNAPSHOT_OPTIMIZATIONS.md) covers faster
+[The latest optimization report](bench/reports/SNAPSHOT_OPTIMIZATIONS.md) covers faster
 snapshot preparation, compact empty snapshots, and rendering small maps.
-[The preceding report](FINAL_OPTIMIZATIONS.md) covers weighted feature
+[The preceding report](bench/reports/FINAL_OPTIMIZATIONS.md) covers weighted feature
 transforms, components, and platform validation. Historical release ratios
 remain labeled by their measured checkpoint; they are not multiplied by later development speedups.
 
