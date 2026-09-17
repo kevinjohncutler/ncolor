@@ -344,3 +344,27 @@ def test_delete_spurs_closed_loop_unchanged():
     b = _ref_delete_spurs(mask, hole_threshold=1)
     assert np.array_equal(a, b)
     assert np.array_equal(a, mask)
+
+
+@pytest.mark.parametrize("shape,fill", [((128, 129), 0.3), ((2, 200, 201), 0.5),
+                                        ((32, 33, 34), 0.7), ((8, 9, 10, 11), 0.3)])
+@pytest.mark.parametrize("mode", ["cardinal", "total"])
+def test_binary_cleanup_is_independent_of_worker_count(shape, fill, mode):
+    """Workers split both phases, and neither depends on their order.
+
+    Hole filling is a reduction over background components, and a
+    pruning round counts every candidate against the state the previous
+    round left behind, so the pixels removed in a round are the same set
+    whatever order they are visited in.
+    """
+    import ncolor
+
+    rng = np.random.default_rng(abs(hash((shape, mode))) % 2**32)
+    mask = rng.random(shape) < fill
+    expected = None
+    for n_threads in (1, 2, 4, 8):
+        got = ncolor.Engine(n_threads=n_threads).delete_spurs(mask, mode=mode)
+        if expected is None:
+            expected = got
+        assert np.array_equal(got, expected), (shape, mode, n_threads)
+    assert np.array_equal(expected, delete_spurs(mask, mode=mode))

@@ -208,7 +208,6 @@ def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
             kind = "binary"
         else:
             kind = "labels"
-    from ._backend import _impl as _b
     if kind == "binary":
         if mode not in ("cardinal", "total"):
             raise ValueError(
@@ -219,8 +218,9 @@ def delete_spurs(arr, hole_threshold=5, *, mode="cardinal",
         arr_u8 = (arr != 0).astype(np.uint8)
         conn_kind = 1 if mode == "cardinal" else arr_u8.ndim
         thr = int(threshold) if threshold is not None else -1
-        return _b.delete_spurs(arr_u8, int(hole_threshold), int(conn_kind),
-                                thr, int(max_iter))
+        with _use(_engine) as engine:
+            return engine._expand.delete_spurs(
+                arr_u8, int(hole_threshold), int(conn_kind), thr, int(max_iter))
     # kind == "labels". Spur removal keeps label identities, so a value
     # outside int32 is an error here rather than a reason to renumber.
     arr32 = arr if arr.dtype == np.int32 else _to_int32_labels(arr, allow_compact=False)

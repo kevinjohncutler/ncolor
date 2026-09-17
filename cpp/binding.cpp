@@ -403,6 +403,48 @@ static py::dict region_property_arrays(py::array labels, int n_labels_arg,
     return out;
 }
 
+// Shared binary spur cleanup for standalone calls and engine pools.
+static py::array binary_spurs_array(py::array mask, int hole_threshold, int conn_kind,
+                                    int threshold, int max_iter,
+                                    std::shared_ptr<PoolSlot> slot = nullptr,
+                                    int n_threads = 1) {
+    if (!(mask.flags() & py::array::c_style)) {
+        mask = py::array::ensure(mask, py::array::c_style);
+    }
+    const auto buf = mask.request();
+    const int ndim = static_cast<int>(buf.ndim);
+    ncolor_cpp::validate_neighborhood_ndim(ndim);
+    if (ndim < 2) throw std::invalid_argument(
+        "delete_spurs requires an array of ndim >= 2");
+    std::vector<int64_t> shape(buf.shape.begin(), buf.shape.end());
+    std::vector<py::ssize_t> out_shape(buf.shape.begin(), buf.shape.end());
+    py::array_t<bool> out(out_shape);
+    bool* out_ptr = static_cast<bool*>(out.request().ptr);
+    const void* src_ptr = buf.ptr;
+    // numpy ``bool`` has format '?' and itemsize 1 — share the uint8
+    // codepath since the memory layout is identical.
+    std::string fmt = buf.format;
+    if (fmt == "?") fmt = "B";
+    {
+        py::gil_scoped_release release;
+        std::unique_lock<std::mutex> lock;
+        if (slot) lock = std::unique_lock<std::mutex>(slot->mu);
+        dispatch_int_dtype(fmt, buf.itemsize, "delete_spurs", [&](auto* tag) {
+            using T = std::remove_pointer_t<decltype(tag)>;
+            const auto* src = static_cast<const T*>(src_ptr);
+            if (slot) {
+                ncolor_cpp::delete_spurs_nd<T>(src, out_ptr, shape, hole_threshold,
+                                               conn_kind, threshold, max_iter,
+                                               slot->pool, n_threads);
+            } else {
+                ncolor_cpp::delete_spurs_nd<T>(src, out_ptr, shape, hole_threshold,
+                                               conn_kind, threshold, max_iter);
+            }
+        });
+    }
+    return out;
+}
+
 static std::pair<py::array, int64_t> delete_spurs_labels_array(
         py::array labels_in, int threshold, int max_iters, int n_threads,
         bool remove_thin, std::shared_ptr<PoolSlot> slot = nullptr) {
@@ -480,6 +522,11 @@ public:
     }
     py::dict regionprops(py::array labels, int n_labels) {
         return region_property_arrays(labels, n_labels, pool_, n_threads_);
+    }
+    py::array delete_spurs(py::array mask, int hole_threshold, int conn_kind,
+                           int threshold, int max_iter) {
+        return binary_spurs_array(mask, hole_threshold, conn_kind, threshold,
+                                  max_iter, pool_, n_threads_);
     }
 
     void release() {
@@ -2459,6 +2506,12 @@ PYBIND11_MODULE(_impl, m) {
              py::arg("labels"), py::arg("n_labels") = 0,
              "As the module-level regionprops, scanned on this engine's\n"
              "workers. Results are identical for any worker count.")
+        .def("delete_spurs", &ExpandEngine::delete_spurs,
+             py::arg("mask"), py::arg("hole_threshold") = 5,
+             py::arg("conn_kind") = 1, py::arg("threshold") = -1,
+             py::arg("max_iter") = -1,
+             "As the module-level delete_spurs, on this engine's workers.\n"
+             "Results are identical for any worker count.")
         .def("delete_spurs_labels", &ExpandEngine::delete_spurs_labels,
              py::arg("labels"), py::arg("threshold") = 1,
              py::arg("max_iters") = 20, py::arg("remove_thin") = false)
@@ -2661,54 +2714,21 @@ PYBIND11_MODULE(_impl, m) {
     m.def("delete_spurs",
           [](py::array mask, int hole_threshold, int conn_kind,
              int threshold, int max_iter) {
-              if (!(mask.flags() & py::array::c_style)) {
-                  mask = py::array::ensure(mask, py::array::c_style);
-              }
-              const auto buf = mask.request();
-              const int ndim = static_cast<int>(buf.ndim);
-              ncolor_cpp::validate_neighborhood_ndim(ndim);
-              if (ndim < 2) throw std::invalid_argument(
-                  "delete_spurs requires an array of ndim >= 2");
-
-              std::vector<int64_t> shape(ndim);
-              std::vector<py::ssize_t> out_shape(ndim);
-              for (int d = 0; d < ndim; ++d) {
-                  shape[d]     = static_cast<int64_t>(buf.shape[d]);
-                  out_shape[d] = static_cast<py::ssize_t>(buf.shape[d]);
-              }
-              py::array_t<bool> out(out_shape);
-              bool* out_ptr = static_cast<bool*>(out.request().ptr);
-              const void* src_ptr = buf.ptr;
-
-              // numpy ``bool`` has format '?' and itemsize 1 — share the
-              // uint8 codepath since the memory layout is identical.
-              std::string fmt = buf.format;
-              if (fmt == "?") fmt = "B";
-
-              {
-                  py::gil_scoped_release release;
-                  dispatch_int_dtype(fmt, buf.itemsize, "delete_spurs",
-                      [&](auto* tag) {
-                          using T = std::remove_pointer_t<decltype(tag)>;
-                          ncolor_cpp::delete_spurs_nd<T>(
-                              static_cast<const T*>(src_ptr),
-                              out_ptr, shape, hole_threshold,
-                              conn_kind, threshold, max_iter);
-                      });
-              }
-              return out;
+              return binary_spurs_array(mask, hole_threshold, conn_kind,
+                                        threshold, max_iter);
           },
           py::arg("mask"), py::arg("hole_threshold") = 5,
           py::arg("conn_kind") = 1, py::arg("threshold") = -1,
           py::arg("max_iter") = -1,
-          "N-D skeleton/boundary cleanup: fill bg holes ≤ hole_threshold\n"
+          "N-D skeleton/boundary cleanup: fill bg holes \u2264 hole_threshold\n"
           "pixels (face-connected), then iteratively strip pixels whose\n"
           "fg-neighbor count under the chosen connectivity is below\n"
-          "``threshold`` (default ndim). ``conn_kind`` = 1 → cardinal\n"
+          "``threshold`` (default ndim). ``conn_kind`` = 1 \u2192 cardinal\n"
           "(face only, external-spur rule, fewer iters);\n"
-          "ndim → full diagonal (preserves 1-voxel skeletons). Isolated\n"
+          "ndim \u2192 full diagonal (preserves 1-voxel skeletons). Isolated\n"
           "pixels (count == 0) are always preserved. ``max_iter`` < 0\n"
-          "runs to convergence.");
+          "runs to convergence. Serial; use ExpandEngine.delete_spurs for\n"
+          "workers.");
 
     m.def("delete_spurs_labels",
           [](py::array labels_in, int threshold, int max_iters, int n_threads,
