@@ -39,12 +39,20 @@ and versions follow [semantic versioning](https://semver.org/).
 
 ### Performance
 
-Paired A/B against 2.2.0 on four hosts:
+Measured against 2.2.0 on an Apple M5 Max and an AMD Ryzen 9 7950X; see
+BENCHMARKS.md for per-input times.
 
-- `connect` 1.88x faster, `expand_labels` 1.17x, `format_labels` 1.06x,
-  `label` 1.05x.
-- Binary connected components, thin-component seams, one-byte label
-  formatting, and weighted feature transforms use new kernels.
+- `label` with default settings: 0.96x to 1.18x the speed of 2.2.0 on 4
+  workers and 1.01x to 1.25x on one. The largest gains are on large,
+  sparse images.
+- `expand_labels`: 1.02x to 1.21x on one worker.
+- `connected_components` splits large masks into slabs that are labeled in
+  parallel and merged: 1.6x to 3.1x faster on 4 workers, and 0.95x to 1.07x
+  on one.
+- Thin-component seams, one-byte label formatting, and weighted feature
+  transforms use new kernels.
+- Fixed slowdowns introduced during this cycle in soft-constraint search
+  and in formatting labels with sparse IDs.
 
 ## [2.2.0] - 2026-09-10
 

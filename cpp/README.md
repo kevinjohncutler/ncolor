@@ -52,5 +52,5 @@ build honors:
 | `NCOLOR_NO_CALIBRATE=1` | skip the post-build SMT calibration (CI, cross builds) |
 
 A build needs `pybind11` and a C++17 compiler; the resulting module is
-loaded by `ncolor/_backend/__init__.py`, which also handles the
+loaded by `src/ncolor/_backend/__init__.py`, which also handles the
 network-mounted-source case described in ARCHITECTURE.md.
