@@ -11,6 +11,9 @@ jobs:
   test:
     name: Test ${{ matrix.os }} Py ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
+    # A hung test should fail the job in minutes, not sit on a runner for
+    # hours. The suite takes about three minutes on every platform.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -40,7 +43,7 @@ jobs:
           NCOLOR_MARCH_NATIVE: "0"
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --upgrade build pytest pytest-cov
+          python -m pip install --upgrade build pytest pytest-cov pytest-timeout
           python -m pip install -e .
 
       - name: Install optional test deps
@@ -52,7 +55,9 @@ jobs:
         run: python -m pip install scipy scikit-image fastremap shapely geopandas
 
       - name: Run tests
-        run: pytest -q --cov=ncolor --cov-report=xml --junitxml=junit.xml
+        # timeout-method=thread dumps the stack of whatever is stuck, which
+        # is what a hang on a runner we cannot attach to has to tell us.
+        run: pytest -q --cov=ncolor --cov-report=xml --junitxml=junit.xml --timeout=300 --timeout-method=thread
 
       - name: Upload coverage + junit
         # One cell is enough; keep it on the ceiling Python so the

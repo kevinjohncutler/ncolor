@@ -21,6 +21,9 @@ jobs:
   build_wheels:
     name: ${{ matrix.cell.os }} ${{ matrix.cell.archs_linux }}${{ matrix.cell.archs_windows }}${{ matrix.cell.archs_macos }} · ${{ matrix.python }}
     runs-on: ${{ matrix.cell.os }}
+    # Building and smoke-testing one cell takes a few minutes; a hang
+    # should not hold a runner for hours.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       # 6 archs × 5 Pythons = 30 parallel jobs. Each builds ONE wheel
