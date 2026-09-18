@@ -298,6 +298,20 @@ static std::shared_ptr<PoolSlot> resolve_pool(int n_threads, int pool_group) {
     return fresh;
 }
 
+// Pools for module-level calls, which have no engine to belong to. The
+// process owns them: a thread-owned pool would be destroyed while its
+// thread exits, and joining worker threads from that teardown is not
+// safe on every platform. Group zero also shares with default engines.
+// One entry per distinct thread count, which is a handful at most.
+static std::shared_ptr<PoolSlot> module_pool(int n_threads) {
+    static std::mutex mu;
+    static std::map<int, std::shared_ptr<PoolSlot>> pools;
+    std::lock_guard<std::mutex> lock(mu);
+    auto& slot = pools[n_threads];
+    if (!slot) slot = resolve_pool(n_threads, 0);
+    return slot;
+}
+
 // Shared component wrapper for standalone calls and engine-owned pools.
 template <bool PerLabel>
 static py::tuple component_arrays(py::array input, int conn,
@@ -468,15 +482,7 @@ static std::pair<py::array, int64_t> delete_spurs_labels_array(
     const int nt = buf.size >= 8192 && max_iters != 0
         ? std::max(1, n_threads) : 1;
     if (nt > 1 && !slot) {
-        // Retain only the last requested pool per calling thread.
-        // Group zero also shares with default engines when present.
-        static thread_local std::shared_ptr<PoolSlot> cached;
-        static thread_local int cached_threads = 0;
-        if (!cached || cached_threads != nt) {
-            cached = resolve_pool(nt, 0);
-            cached_threads = nt;
-        }
-        slot = cached;
+        slot = module_pool(nt);
     }
     void* out_ptr = out.mutable_data();
     {
