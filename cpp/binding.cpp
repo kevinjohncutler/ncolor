@@ -1013,7 +1013,7 @@ public:
         drop_(colors_); drop_(lut_); drop_(lut_lbl_); drop_(orig_labels_);
         drop_(despur_face_count_);
         drop_(fp_ht_buf_); drop_(fp_primary_buf_); drop_(fp_counts_buf_);
-        drop_(fp_soft_ht_buf_); drop_(fused_soft_pairs_);
+        drop_(fp_dual_ht_bufs_); drop_(fused_soft_pairs_);
         drop_(last_stages_);
         drop_(picker_scratch_.per_attempt_colors_);
         drop_(picker_scratch_.per_attempt_ok_);
@@ -1543,32 +1543,21 @@ public:
                 const int64_t n_fwd_soft = ncolor_cpp::detail::
                     count_forward_neighbors(graph_shape, soft_conn, soft_radius);
                 const int64_t n_fwd_delta = std::max<int64_t>(1, n_fwd_soft - n_fwd_base);
-                uint64_t base_ht_size = initial_ht_size_(0, n_fwd_base, n_labels);
-                uint64_t soft_ht_size = initial_ht_size_(0, n_fwd_delta, n_labels);
-                for (;;) {
-                    const int full =
-                        ncolor_cpp::find_pairs_dual_nd_unpadded<int32_t>(
-                            expanded, graph_shape, conn, connect_radius,
-                            soft_conn, soft_radius,
-                            base_ht_size, soft_ht_size,
-                            n_threads_, pool_->pool, wrap,
-                            pairs, fused_soft_pairs_,
-                            /*base_ht_scratch=*/&fp_ht_buf_,
-                            /*soft_ht_scratch=*/&fp_soft_ht_buf_);
-                    if (full == 0) break;
-                    bool can_retry = true;
-                    if ((full & 1) != 0) {
-                        if (base_ht_size >= HT_SIZE_CAP) can_retry = false;
-                        else base_ht_size <<= 1;
-                    }
-                    if ((full & 2) != 0) {
-                        if (soft_ht_size >= HT_SIZE_CAP) can_retry = false;
-                        else soft_ht_size <<= 1;
-                    }
-                    if (!can_retry)
-                        throw std::overflow_error(
-                            "Solver.label: adjacency table exceeded safety cap");
-                }
+                // The sizes are hints: each thread starts at its share and
+                // its tables grow as they fill (see GrowTable in
+                // connect.hpp). Count only axes longer than one, so a
+                // retained layout that drops unit axes starts from the same
+                // sizes, and so orders the pairs, exactly as the original
+                // layout does.
+                int graph_ndim = 0;
+                for (int64_t extent : graph_shape) graph_ndim += extent > 1;
+                ncolor_cpp::find_pairs_dual_nd_unpadded<int32_t>(
+                    expanded, graph_shape, conn, connect_radius,
+                    soft_conn, soft_radius,
+                    initial_ht_size_(graph_ndim, n_fwd_base, n_labels),
+                    initial_ht_size_(graph_ndim, n_fwd_delta, n_labels),
+                    n_threads_, pool_->pool, wrap,
+                    pairs, fused_soft_pairs_, &fp_dual_ht_bufs_);
             } else if (soft_conn > 0 && soft_radius > 0 &&
                        (soft_conn > conn || soft_radius > connect_radius) &&
                        max_label > 0) {
@@ -2479,10 +2468,10 @@ private:
     // empty / unused when weight_objective==0 (the default).
     std::vector<double>   fp_primary_buf_;
     std::vector<int32_t>  fp_counts_buf_;
-    // Second per-thread HT buffer for the dual base+soft find_pairs path
-    // (auto-build of soft_extra_edges). Empty / unused when soft_conn or
-    // soft_radius is 0.
-    std::vector<uint64_t> fp_soft_ht_buf_;
+    // Per-thread growable tables (base and soft for each band) for the
+    // fused base+soft find_pairs path (auto-build of soft_extra_edges).
+    // Empty / unused when soft_conn or soft_radius is 0.
+    std::vector<std::vector<uint64_t>> fp_dual_ht_bufs_;
     // Soft (delta-only) pair list captured by the fused base+soft scan in
     // label(). Consumed by the soft_local_search post-pass without a
     // second pixel walk. Cleared on every non-soft label() call.

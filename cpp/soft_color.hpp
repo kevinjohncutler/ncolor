@@ -203,6 +203,36 @@ inline bool kempe_chain_pass(
     if ((int32_t)visited_stamp.size() < N) visited_stamp.assign(N, 0);
     bool improved = false;
 
+    // A {cur_c, b} Kempe chain is a connected component, so every member
+    // reaches the same chain and the same flip delta. The delta is exactly
+    // the same, not merely close: the soft weights are whole numbers, so
+    // the walk order, which sets the order of the sum, cannot change it.
+    // Once a component is rejected (too large, or not improving), its
+    // other members skip that color pair until a flip changes any color.
+    // rejected[v] holds v's rejected partner colors, valid while
+    // rejected_epoch[v] == epoch. In 3D, 85% of chain walks hit the size
+    // cap, and each such component used to be walked again from every
+    // stuck member.
+    const bool track_rejected = n_colors < 64;
+    std::vector<uint64_t> rejected;
+    std::vector<int32_t> rejected_epoch;
+    int32_t epoch = 1;
+    if (track_rejected) {
+        rejected.assign((size_t)N, 0);
+        rejected_epoch.assign((size_t)N, 0);
+    }
+    auto reject_chain = [&](uint8_t cur_c, int b) {
+        if (!track_rejected) return;
+        for (int32_t v : bfs_queue) {
+            const int other = colors[v] == cur_c ? b : cur_c;
+            if (rejected_epoch[v] != epoch) {
+                rejected_epoch[v] = epoch;
+                rejected[v] = 0;
+            }
+            rejected[v] |= uint64_t{1} << other;
+        }
+    };
+
     const int32_t n_iter = stuck_worklist
         ? (int32_t)stuck_worklist->size() : N;
     for (int32_t i = 0; i < n_iter; ++i) {
@@ -214,6 +244,8 @@ inline bool kempe_chain_pass(
         // Try each target color b != cur_c.
         for (int b = 1; b <= n_colors; ++b) {
             if (b == cur_c) continue;
+            if (track_rejected && rejected_epoch[u] == epoch &&
+                ((rejected[u] >> b) & 1)) continue;
             // BFS the Kempe chain of u in colors {cur_c, b} via hard edges.
             // Mark visited with stamp_counter to avoid clearing.
             ++stamp_counter;
@@ -246,7 +278,10 @@ inline bool kempe_chain_pass(
                     }
                 }
             }
-            if (chain_too_large) continue;  // skip this (cur_c, b) target
+            if (chain_too_large) {  // skip this (cur_c, b) target
+                reject_chain(cur_c, b);
+                continue;
+            }
 
             // Compute soft delta if we flip the chain. For each vertex in
             // chain, its color flips; recompute its soft contribution at
@@ -288,8 +323,10 @@ inline bool kempe_chain_pass(
                 }
                 penalty += delta;
                 improved = true;
+                ++epoch;
                 break;  // u changed; move on to next u
             }
+            reject_chain(cur_c, b);
         }
     }
     return improved;

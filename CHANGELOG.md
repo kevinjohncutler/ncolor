@@ -57,6 +57,28 @@ BENCHMARKS.md for per-input times.
   transforms use new kernels.
 - Fixed slowdowns introduced during this cycle in soft-constraint search
   and in formatting labels with sparse IDs.
+- The combined hard and soft adjacency scan in `label` sized its tables
+  once for the whole image and gave every worker a full copy. Cells
+  packed like tissue in 3D have about 7 edges each, more than the hard
+  table held, so it filled, every new edge searched all of it, and the
+  scan reran. Tables now start at each worker's share and double when
+  half full, so neither the overflow nor the cost of copies sized for the
+  worst case remains. Output is identical. A 192 x 192 x 192 volume of
+  10,900 cells labels in 346 ms instead of 1564 ms on an i9-9900K (4.5x)
+  and 230 ms instead of 1683 ms on an M1 Ultra (7.3x); 65,536 small
+  tiles in 123 ms instead of 234 ms (1.9x).
+- The adjacency scan skips a table insert that repeats the previous key:
+  4% to 24% faster on dense 2D and 3D images.
+- x86 builds keep jumps inside 32-byte blocks when the compiler supports
+  it. On Skylake-derived Intel cores (through Comet Lake) the microcode
+  fix for the JCC erratum runs any loop whose jump crosses such a
+  boundary from the slow legacy decoder, so code layout alone could cost
+  a kernel 20%. The skip above measured 0.79x on sparse 2D images on an
+  i9-9900K until aligned.
+- Soft-constraint search remembers Kempe chains it has already rejected
+  until a color changes, since every member of a chain reaches the same
+  chain. Output is unchanged, and the search is 1.2x to 1.7x faster on
+  the densely packed 2D and 3D images measured.
 
 ## [2.2.0] - 2026-09-10
 

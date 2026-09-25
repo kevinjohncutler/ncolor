@@ -49,6 +49,20 @@ def voronoi(H, n, seed):
     return (np.argmin(d, axis=-1) + 1).astype(np.int32)
 
 
+def voronoi3d(H, n, seed):
+    """Densely packed 3D cells, as in tissue: about 14 neighbors per
+    cell, so the adjacency tables hold far more pairs per label than in
+    2D. The cell counts used below put 6 slots per cell just under a
+    power of two, where the fused scan's tables used to overflow."""
+    from scipy import ndimage as ndi
+    rng = np.random.default_rng(seed)
+    seeds = np.zeros((H,) * 3, np.int32)
+    seeds[tuple(rng.integers(0, H, (3, n)))] = np.arange(1, n + 1)
+    _, ind = ndi.distance_transform_edt(seeds == 0, return_indices=True)
+    m = seeds[tuple(ind)]
+    return np.searchsorted(np.unique(m), m).astype(np.int32) + 1
+
+
 def filaments(H, n, seed):
     """Long thin objects, as bacteria or neurites: high perimeter per
     area, so many adjacencies per cell."""
@@ -119,6 +133,8 @@ def build():
     c["boxes3d_64"] = boxes((64,) * 3, 120, 0, 3, 8)
     c["boxes3d_128"] = boxes((128,) * 3, 700, 0, 3, 10)
     c["boxes3d_192"] = boxes((192,) * 3, 1800, 1, 3, 12)
+    c["voronoi3d_128"] = voronoi3d(128, 2700, 0)
+    c["voronoi3d_192"] = voronoi3d(192, 10900, 1)
     fx = REPO / "test_files" / "synthetic_800.npz"
     if fx.exists():
         c["fixture_800"] = np.load(fx)["labels"].astype(np.int32)

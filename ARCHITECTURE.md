@@ -184,6 +184,26 @@ A few choices that aren't obvious from the code itself:
     radius of 2 but not beyond (a chain through a third label), so the
     driver disables the skip for `soft_radius > 2`. For a cell interior
     this is 4 reads instead of 12 in 2D and 9 instead of 33 in 3D.
+14. **The fused scan's tables grow.** How many distinct pairs an image
+    holds is not known before the scan: a few per cell when sparse,
+    about 7 when cells are packed like tissue in 3D. A size fixed in
+    advance fails one way or the other. Too small, the table filled and
+    every new pair searched all of it (3 s on a 256^3 volume). Sized for
+    the dense case, every worker cleared and merged a copy that large
+    (on 64 threads, 10% slower on a sparse 3D image). Each worker's
+    table therefore starts at its share of an estimate and is kept at
+    most half full: an insert past that is refused, and the line is
+    scanned again once the table has doubled. A merge grows its
+    destination to fit both inputs first, so it never overflows.
+15. **x86 jumps stay inside 32-byte blocks.** On Skylake-derived Intel
+    cores (through Comet Lake) the microcode fix for the JCC erratum
+    runs any loop whose jump crosses or ends on a 32-byte boundary from
+    the legacy decoder. An edit elsewhere in the translation unit can
+    move a hot loop onto a boundary: a one-line change to the adjacency
+    scan measured 0.79x on sparse images on an i9-9900K for that reason
+    alone, and was faster everywhere once aligned. `setup.py` adds the
+    alignment option wherever the compiler accepts it for the target
+    (a driver flag in Clang, an assembler flag in GCC).
 
 ### Scaling pattern across image sizes
 

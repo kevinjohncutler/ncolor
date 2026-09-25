@@ -174,6 +174,44 @@ native_ext = Extension(
 )
 
 
+def _branch_alignment_flag(compiler):
+    """The flag that keeps x86 jumps inside 32-byte blocks, or None.
+
+    Skylake-derived Intel cores (Skylake through Comet Lake, including the
+    i9-9900K) carry a microcode fix for the JCC erratum that stops caching
+    decoded instructions for any jump that crosses or ends on a 32-byte
+    boundary. A hot loop that lands there runs from the legacy decoder, so
+    an unrelated edit that shifts code layout can slow a kernel by 20%:
+    a one-line change to the adjacency scan measured 0.79x on sparse
+    images on an i9 and was faster everywhere once aligned. Clang spells
+    the option as a driver flag and GCC passes it to the assembler; arm64,
+    universal2 and older assemblers reject both, so the flag is used only
+    where the real compiler accepts it for the real target.
+    """
+    import tempfile  # noqa: PLC0415
+    for flag in ("-mbranches-within-32B-boundaries",
+                 "-Wa,-mbranches-within-32B-boundaries"):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "probe.cpp")
+            with open(src, "w") as fh:
+                fh.write("int probe(int x) { return x + 1; }\n")
+            # A rejected flag is the expected answer on most targets, so
+            # keep the compiler's error message out of the build log.
+            saved = os.dup(2)
+            with open(os.devnull, "w") as null:
+                os.dup2(null.fileno(), 2)
+            try:
+                compiler.compile([src], output_dir=tmp,
+                                 extra_postargs=extra_compile_args + [flag])
+            except Exception:  # noqa: BLE001
+                continue
+            finally:
+                os.dup2(saved, 2)
+                os.close(saved)
+            return flag
+    return None
+
+
 class build_ext(_build_ext):
     """build_ext + post-build SMT calibration.
 
@@ -189,6 +227,14 @@ class build_ext(_build_ext):
     isolation). Set the env var ``NCOLOR_NO_CALIBRATE=1`` to disable
     entirely (CI / cross-compilation).
     """
+
+    def build_extensions(self):
+        if self.compiler.compiler_type == "unix":
+            flag = _branch_alignment_flag(self.compiler)
+            if flag:
+                for ext in self.extensions:
+                    ext.extra_compile_args.append(flag)
+        super().build_extensions()
 
     def run(self):
         super().run()

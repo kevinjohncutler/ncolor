@@ -362,6 +362,77 @@ static inline void scan_inner_axis_fast(
     }
 }
 
+// A per-thread adjacency table for the fused scan that grows as it
+// fills. How many distinct pairs a band holds is not known in advance:
+// a sparse image has a few per cell, densely packed 3D cells about 7.
+// A fixed size either overflows on the dense case (a full table made
+// every miss walk all of it, then the whole scan reran) or, sized for
+// it, is cleared and merged once per thread on the sparse case (on 64
+// threads, a table 4x too large made a sparse 3D label 10% slower).
+// So each table starts small and stays at most half full: an insert
+// that would pass the limit is refused, and the driver rescans that
+// line once the table has doubled. Half load also keeps probes short.
+struct GrowTable {
+    std::vector<uint64_t>* buf = nullptr;  // backing storage, >= mask + 1
+    uint64_t* h = nullptr;
+    uint64_t mask = 0;
+    uint64_t occ = 0;
+    uint64_t limit = 0;  // occ == limit + 1 marks a refused insert
+
+    void reset(std::vector<uint64_t>* storage, uint64_t size) {
+        buf = storage;
+        if (buf->size() < size) buf->resize(size);
+        h = buf->data();
+        mask = size - 1;
+        limit = size / 2;
+        occ = 0;
+        std::fill_n(h, size, HT_EMPTY);
+    }
+    bool refused() const { return occ > limit; }
+    void insert(uint64_t key);
+    // Rehash into the smallest power of two holding ``need`` keys at no
+    // more than half load. Recounts occ, which clears a refusal.
+    void grow(uint64_t need) {
+        const uint64_t old_size = mask + 1;
+        uint64_t size = old_size;
+        while (size / 2 < need) size <<= 1;
+        std::vector<uint64_t> old(h, h + old_size);
+        reset(buf, size);
+        for (uint64_t key : old)
+            if (key != HT_EMPTY) insert(key);
+    }
+};
+
+// Insert ``key`` unless present. A new key at the limit is refused:
+// nothing is stored and occ becomes limit + 1. Terminates because the
+// table always has an empty slot (occ <= limit = size / 2).
+inline void grow_table_insert(uint64_t* h, uint64_t mask, uint64_t& occ,
+                              uint64_t limit, uint64_t key) {
+    uint64_t i = (key * HT_HASH_MUL) & mask;
+    for (;;) {
+        const uint64_t v = h[i];
+        if (v == key) return;
+        if (v == HT_EMPTY) {
+            if (occ >= limit) { occ = limit + 1; return; }
+            h[i] = key;
+            ++occ;
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+}
+inline void GrowTable::insert(uint64_t key) {
+    grow_table_insert(h, mask, occ, limit, key);
+}
+
+// Unordered pair key: the smaller label in the high word.
+template <typename T>
+inline uint64_t pair_key(T vi, T vj) {
+    const T lo = vi < vj ? vi : vj;
+    const T hi = vi < vj ? vj : vi;
+    return (static_cast<uint64_t>(lo) << 32) | static_cast<uint32_t>(hi);
+}
+
 // Dual-emit per-pixel inner-axis scan. ``vi`` is loaded ONCE per pixel,
 // then BOTH the base offsets (0..N_BASE-1) and the delta offsets
 // (N_BASE..N_BASE+N_DELTA-1) are checked in the same iteration. Loads of
@@ -379,16 +450,28 @@ static inline void scan_inner_axis_fast(
 // makes the two routes equivalent). Exact for soft radius <= 2; the
 // driver disables the skip (n_delta_near == n_delta) beyond that. For
 // a cell interior this replaces 12 reads by 4 in 2D and 33 by 9 in 3D.
+//
+// The table state is copied into locals for the line, so the compiler
+// can keep it in registers across the stores into the table.
 template <typename T, int N_BASE, int N_DELTA>
 static inline void scan_inner_axis_dual_fast(
         const T* row, int64_t x_start, int64_t x_end,
         const int64_t* nb_flat, int n_delta_near,
-        uint64_t* ht_base, uint64_t base_mask,
-        uint64_t* ht_soft, uint64_t soft_mask) {
+        GrowTable& tb, GrowTable& ts) {
     int64_t nb_b[N_BASE];
     int64_t nb_s[N_DELTA];
     for (int i = 0; i < N_BASE;  ++i) nb_b[i] = nb_flat[i];
     for (int i = 0; i < N_DELTA; ++i) nb_s[i] = nb_flat[N_BASE + i];
+    uint64_t* const hb = tb.h;
+    uint64_t* const hs = ts.h;
+    const uint64_t mb = tb.mask, lb = tb.limit;
+    const uint64_t ms = ts.mask, ls = ts.limit;
+    uint64_t ob = tb.occ, os = ts.occ;
+    // The last key each table received. A boundary pixel reaches the
+    // same neighbor cell through several offsets, and the next pixel
+    // along the line usually reaches it again, so most keys repeat the
+    // previous one; skipping those saves a hash probe apiece.
+    uint64_t last_b = HT_EMPTY, last_s = HT_EMPTY;
     for (int64_t x = x_start; x < x_end; ++x) {
         const T vi = row[x];
         if (vi == 0) continue;
@@ -402,10 +485,10 @@ static inline void scan_inner_axis_dual_fast(
             if (vj == vi) continue;
             all_same = false;
             if (vj == 0) continue;
-            const T lo = vi < vj ? vi : vj;
-            const T hi = vi < vj ? vj : vi;
-            ht_insert(ht_base, base_mask,
-                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint32_t>(hi));
+            const uint64_t key = pair_key(vi, vj);
+            if (key == last_b) continue;
+            last_b = key;
+            grow_table_insert(hb, mb, ob, lb, key);
         }
 #if defined(__GNUC__) || defined(__clang__)
 #  pragma GCC unroll 16
@@ -416,12 +499,14 @@ static inline void scan_inner_axis_dual_fast(
             if (vj == vi) continue;
             all_same = false;
             if (vj == 0) continue;
-            const T lo = vi < vj ? vi : vj;
-            const T hi = vi < vj ? vj : vi;
-            ht_insert(ht_soft, soft_mask,
-                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint32_t>(hi));
+            const uint64_t key = pair_key(vi, vj);
+            if (key == last_s) continue;
+            last_s = key;
+            grow_table_insert(hs, ms, os, ls, key);
         }
     }
+    tb.occ = ob;
+    ts.occ = os;
 }
 
 // Runtime-N variant for (N_BASE, N_DELTA) combinations not in the
@@ -430,8 +515,13 @@ template <typename T>
 static inline void scan_inner_axis_dual_runtime(
         const T* row, int64_t x_start, int64_t x_end,
         int n_base, int n_delta, const int64_t* nb_flat, int n_delta_near,
-        uint64_t* ht_base, uint64_t base_mask,
-        uint64_t* ht_soft, uint64_t soft_mask) {
+        GrowTable& tb, GrowTable& ts) {
+    uint64_t* const hb = tb.h;
+    uint64_t* const hs = ts.h;
+    const uint64_t mb = tb.mask, lb = tb.limit;
+    const uint64_t ms = ts.mask, ls = ts.limit;
+    uint64_t ob = tb.occ, os = ts.occ;
+    uint64_t last_b = HT_EMPTY, last_s = HT_EMPTY;
     for (int64_t x = x_start; x < x_end; ++x) {
         const T vi = row[x];
         if (vi == 0) continue;
@@ -442,10 +532,10 @@ static inline void scan_inner_axis_dual_runtime(
             if (vj == vi) continue;
             all_same = false;
             if (vj == 0) continue;
-            const T lo = vi < vj ? vi : vj;
-            const T hi = vi < vj ? vj : vi;
-            ht_insert(ht_base, base_mask,
-                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint32_t>(hi));
+            const uint64_t key = pair_key(vi, vj);
+            if (key == last_b) continue;
+            last_b = key;
+            grow_table_insert(hb, mb, ob, lb, key);
         }
         for (int k = 0; k < n_delta; ++k) {
             if (k == n_delta_near && all_same) break;
@@ -453,12 +543,14 @@ static inline void scan_inner_axis_dual_runtime(
             if (vj == vi) continue;
             all_same = false;
             if (vj == 0) continue;
-            const T lo = vi < vj ? vi : vj;
-            const T hi = vi < vj ? vj : vi;
-            ht_insert(ht_soft, soft_mask,
-                       (static_cast<uint64_t>(lo) << 32) | static_cast<uint32_t>(hi));
+            const uint64_t key = pair_key(vi, vj);
+            if (key == last_s) continue;
+            last_s = key;
+            grow_table_insert(hs, ms, os, ls, key);
         }
     }
+    tb.occ = ob;
+    ts.occ = os;
 }
 
 // Dispatch table for common (N_BASE, N_DELTA) pairings.
@@ -466,8 +558,7 @@ template <typename T>
 static inline void scan_inner_axis_dual_dispatch(
         const T* row, int64_t x_start, int64_t x_end,
         int n_base, int n_delta, const int64_t* nb_flat, int n_delta_near,
-        uint64_t* ht_base, uint64_t base_mask,
-        uint64_t* ht_soft, uint64_t soft_mask) {
+        GrowTable& tb, GrowTable& ts) {
     // 2D conn=1 r=1 base (N_BASE=2) is the dominant case; delta sizes
     // 2/10 cover conn=1 r=2 or conn=2 r=1, and the default conn=2 r=2.
     // N_BASE=4, N_DELTA=8 covers a 2D conn=2 r=1 base widened to r=2.
@@ -476,23 +567,23 @@ static inline void scan_inner_axis_dual_dispatch(
     // The last count is 27, not 30: 30 is the size of the whole soft
     // kernel, including the 3 offsets already partitioned into the base.
     if (n_base == 2 && n_delta == 2)
-        scan_inner_axis_dual_fast<T, 2, 2>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 2, 2>(row, x_start, x_end, nb_flat, n_delta_near, tb, ts);
     else if (n_base == 2 && n_delta == 8)
-        scan_inner_axis_dual_fast<T, 2, 8>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 2, 8>(row, x_start, x_end, nb_flat, n_delta_near, tb, ts);
     else if (n_base == 2 && n_delta == 10)
-        scan_inner_axis_dual_fast<T, 2, 10>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 2, 10>(row, x_start, x_end, nb_flat, n_delta_near, tb, ts);
     else if (n_base == 4 && n_delta == 8)
-        scan_inner_axis_dual_fast<T, 4, 8>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 4, 8>(row, x_start, x_end, nb_flat, n_delta_near, tb, ts);
     else if (n_base == 3 && n_delta == 3)
-        scan_inner_axis_dual_fast<T, 3, 3>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 3, 3>(row, x_start, x_end, nb_flat, n_delta_near, tb, ts);
     else if (n_base == 3 && n_delta == 6)
-        scan_inner_axis_dual_fast<T, 3, 6>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 3, 6>(row, x_start, x_end, nb_flat, n_delta_near, tb, ts);
     else if (n_base == 3 && n_delta == 27)
-        scan_inner_axis_dual_fast<T, 3, 27>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 3, 27>(row, x_start, x_end, nb_flat, n_delta_near, tb, ts);
     else if (n_base == 3 && n_delta == 30)
-        scan_inner_axis_dual_fast<T, 3, 30>(row, x_start, x_end, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_fast<T, 3, 30>(row, x_start, x_end, nb_flat, n_delta_near, tb, ts);
     else
-        scan_inner_axis_dual_runtime<T>(row, x_start, x_end, n_base, n_delta, nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
+        scan_inner_axis_dual_runtime<T>(row, x_start, x_end, n_base, n_delta, nb_flat, n_delta_near, tb, ts);
 }
 
 // Runtime-N_NBS fallback for cases that don't hit the dispatch table
@@ -951,25 +1042,24 @@ inline void build_forward_neighbors_dual(
 
 }  // namespace detail
 
-// Band scan emitting to two hashtables. Offsets 0..n_base-1 emit to
-// ht_base, n_base..n_nbs-1 emit to ht_soft. Mode=Off only; weighted
-// reducers are not supported on the dual path (not needed for soft).
+// Band scan emitting to two growable tables. Offsets 0..n_base-1 emit
+// to tb, n_base..n_nbs-1 to ts. A line during which either table
+// refused an insert is scanned again after the table grows; inserts are
+// idempotent, so the repeat only adds what was refused. Mode=Off only;
+// weighted reducers are not supported on the dual path (not needed for
+// soft).
 template <typename T, bool Wrap = false>
 inline void scan_band_unpadded_dual(
         const T* lbl, const std::vector<int64_t>& shape,
         const int64_t* strides, const int64_t* nb_flat,
         const int8_t* nb_dc, int n_base, int n_nbs, int n_delta_near,
         int64_t line_start, int64_t line_end,
-        uint64_t* ht_base, uint64_t* ht_soft,
-        uint64_t base_mask, uint64_t soft_mask,
-        int radius) {
+        GrowTable& tb, GrowTable& ts, int radius) {
     const int ndim = static_cast<int>(shape.size());
     const int n_delta = n_nbs - n_base;
-    auto emit = [](uint64_t* h, uint64_t mask, T vi, T vj) {
+    auto emit = [](GrowTable& t, T vi, T vj) {
         if (vj == 0 || vj == vi) return;
-        const uint64_t lo = static_cast<uint64_t>(vi < vj ? vi : vj);
-        const uint64_t hi = static_cast<uint32_t>(vi < vj ? vj : vi);
-        ht_insert(h, mask, (lo << 32) | hi);
+        t.insert(pair_key(vi, vj));
     };
     // Same interior skip as the fast inner loop (see
     // scan_inner_axis_dual_fast); an out-of-bounds near neighbor counts
@@ -982,9 +1072,7 @@ inline void scan_band_unpadded_dual(
         for (int k = 0; k < n_nbs; ++k) {
             if (k == n_near && all_same) break;
             const int8_t* dc = nb_dc + k * ndim;
-            const bool is_base = (k < n_base);
-            uint64_t* h = is_base ? ht_base : ht_soft;
-            const uint64_t mask = is_base ? base_mask : soft_mask;
+            GrowTable& t = k < n_base ? tb : ts;
             if constexpr (Wrap) {
                 int64_t neigh_flat = 0;
                 for (int d = 0; d < ndim; ++d) {
@@ -997,7 +1085,7 @@ inline void scan_band_unpadded_dual(
                 }
                 const T vj = lbl[neigh_flat];
                 if (vj != vi) all_same = false;
-                emit(h, mask, vi, vj);
+                emit(t, vi, vj);
             } else {
                 bool valid = true;
                 uint64_t m = bnd_mask;
@@ -1010,7 +1098,7 @@ inline void scan_band_unpadded_dual(
                 if (valid) {
                     const T vj = lbl[flat + nb_flat[k]];
                     if (vj != vi) all_same = false;
-                    emit(h, mask, vi, vj);
+                    emit(t, vi, vj);
                 } else {
                     all_same = false;
                 }
@@ -1028,7 +1116,7 @@ inline void scan_band_unpadded_dual(
         coords[d] = q % shape[d];
         q /= shape[d];
     }
-    for (int64_t line = line_start; line < line_end; ++line) {
+    auto scan_line = [&](int64_t line) {
         uint64_t outer_bnd = 0;
         for (int d = 0; d < inner; ++d) {
             if (coords[d] < radius || coords[d] >= shape[d] - radius)
@@ -1042,32 +1130,38 @@ inline void scan_band_unpadded_dual(
                 coords[inner] = x;
                 scan_pixel_checked(coords, bnd, row_base + x);
             }
-        } else {
-            for (int64_t x = 0; x < radius; ++x) {
-                coords[inner] = x;
-                scan_pixel_checked(coords, inner_bit, row_base + x);
-            }
-            // Fast inner-axis interval: single per-pixel walk that
-            // checks base offsets AND delta offsets in one loop body
-            // (vi loaded once, both inner sub-loops fully unrolled).
-            // Saves one full pixel walk vs two separate dispatch calls.
-            if (n_base > 0 && n_delta > 0) {
-                scan_inner_axis_dual_dispatch<T>(
-                    lbl + row_base, radius, W - radius, n_base, n_delta,
-                    nb_flat, n_delta_near, ht_base, base_mask, ht_soft, soft_mask);
-            } else if (n_base > 0) {
-                scan_inner_axis_dispatch<T>(
-                    lbl + row_base, radius, W - radius, n_base,
-                    nb_flat, ht_base, base_mask);
-            } else if (n_delta > 0) {
-                scan_inner_axis_dispatch<T>(
-                    lbl + row_base, radius, W - radius, n_delta,
-                    nb_flat, ht_soft, soft_mask);
-            }
-            for (int64_t x = W - radius; x < W; ++x) {
-                coords[inner] = x;
-                scan_pixel_checked(coords, inner_bit, row_base + x);
-            }
+            return;
+        }
+        for (int64_t x = 0; x < radius; ++x) {
+            coords[inner] = x;
+            scan_pixel_checked(coords, inner_bit, row_base + x);
+        }
+        // Fast inner-axis interval: single per-pixel walk that checks
+        // base offsets AND delta offsets in one loop body (vi loaded
+        // once, both inner sub-loops fully unrolled).
+        if (n_base > 0 && n_delta > 0) {
+            scan_inner_axis_dual_dispatch<T>(
+                lbl + row_base, radius, W - radius, n_base, n_delta,
+                nb_flat, n_delta_near, tb, ts);
+        } else if (n_base > 0 || n_delta > 0) {
+            // One of the two kernels is empty (the soft kernel adds no
+            // offsets, or no base was requested); the runtime loop
+            // handles either count being zero.
+            scan_inner_axis_dual_runtime<T>(
+                lbl + row_base, radius, W - radius, n_base, n_delta,
+                nb_flat, n_delta_near, tb, ts);
+        }
+        for (int64_t x = W - radius; x < W; ++x) {
+            coords[inner] = x;
+            scan_pixel_checked(coords, inner_bit, row_base + x);
+        }
+    };
+    for (int64_t line = line_start; line < line_end; ++line) {
+        for (;;) {
+            scan_line(line);
+            if (!tb.refused() && !ts.refused()) break;
+            if (tb.refused()) tb.grow(tb.limit + 1);
+            if (ts.refused()) ts.grow(ts.limit + 1);
         }
         int d = inner - 1;
         while (d >= 0 && ++coords[d] >= shape[d]) {
@@ -1077,18 +1171,30 @@ inline void scan_band_unpadded_dual(
     }
 }
 
+// Merge every key of ``src`` into ``dst``, first growing ``dst`` so the
+// union fits at no more than half load.
+inline void grow_table_merge(const GrowTable& src, GrowTable& dst) {
+    if (dst.limit < dst.occ + src.occ) dst.grow(dst.occ + src.occ);
+    for (uint64_t i = 0; i <= src.mask; ++i) {
+        const uint64_t key = src.h[i];
+        if (key != HT_EMPTY) dst.insert(key);
+    }
+}
+
 // Driver: same parallel structure as find_pairs_unpadded_impl but with
-// two hashtables per thread. Mode=Off only.
+// two growable tables per thread. ``base_hint`` and ``soft_hint`` are
+// the expected table sizes for the whole image; each thread starts at
+// its share, and the tables grow as needed, so the hints affect speed
+// only. ``scratch`` keeps the per-thread storage between calls.
 template <typename T, bool Wrap = false>
-inline int find_pairs_dual_unpadded_impl(
+inline void find_pairs_dual_unpadded_impl(
         const T* lbl, const std::vector<int64_t>& shape,
         int base_conn, int base_radius, int soft_conn, int soft_radius,
-        uint64_t base_ht_size, uint64_t soft_ht_size,
+        uint64_t base_hint, uint64_t soft_hint,
         int n_threads, ForkJoinPool& pool,
         std::vector<std::pair<int32_t, int32_t>>& out_base,
         std::vector<std::pair<int32_t, int32_t>>& out_soft,
-        std::vector<uint64_t>* base_ht_scratch,
-        std::vector<uint64_t>* soft_ht_scratch) {
+        std::vector<std::vector<uint64_t>>* scratch) {
     out_base.clear();
     out_soft.clear();
     if (n_threads < 1) n_threads = 1;
@@ -1101,7 +1207,7 @@ inline int find_pairs_dual_unpadded_impl(
         shape, base_conn, base_radius, soft_conn, soft_radius,
         strides, nb_flat, nb_dc, n_base, &n_delta_near);
     const int n_nbs = static_cast<int>(nb_flat.size());
-    if (n_nbs == 0) return 0;
+    if (n_nbs == 0) return;
     // The interior skip (scan_inner_axis_dual_fast) is exact only up to
     // soft radius 2: beyond that a far pair's witness chain can pass
     // through a third label. NCOLOR_NO_INTERIOR_SKIP=1 disables it for
@@ -1109,132 +1215,118 @@ inline int find_pairs_dual_unpadded_impl(
     static const bool no_skip = std::getenv("NCOLOR_NO_INTERIOR_SKIP") != nullptr;
     if (no_skip || soft_radius > 2) n_delta_near = n_nbs - n_base;
     const int radius = std::max(1, soft_radius);
-    const uint64_t base_mask = base_ht_size - 1;
-    const uint64_t soft_mask = soft_ht_size - 1;
-
-    const size_t base_total = (size_t)n_threads * base_ht_size;
-    const size_t soft_total = (size_t)n_threads * soft_ht_size;
-    std::vector<uint64_t> base_local, soft_local;
-    uint64_t* base_hts;
-    uint64_t* soft_hts;
-    if (base_ht_scratch) {
-        if (base_ht_scratch->size() < base_total) base_ht_scratch->resize(base_total);
-        base_hts = base_ht_scratch->data();
-    } else { base_local.resize(base_total); base_hts = base_local.data(); }
-    if (soft_ht_scratch) {
-        if (soft_ht_scratch->size() < soft_total) soft_ht_scratch->resize(soft_total);
-        soft_hts = soft_ht_scratch->data();
-    } else { soft_local.resize(soft_total); soft_hts = soft_local.data(); }
 
     int64_t n_lines = 1;
     for (size_t d = 0; d + 1 < shape.size(); ++d) n_lines *= shape[d];
-    if (n_threads == 1 || n_lines < 2) {
-        std::fill_n(base_hts, base_ht_size, HT_EMPTY);
-        std::fill_n(soft_hts, soft_ht_size, HT_EMPTY);
+    const int n_bands = (n_threads == 1 || n_lines < 2) ? 1 : n_threads;
+
+    std::vector<std::vector<uint64_t>> local;
+    std::vector<std::vector<uint64_t>>& store = scratch ? *scratch : local;
+    if (store.size() < 2 * static_cast<size_t>(n_bands)) store.resize(2 * n_bands);
+    auto share = [&](uint64_t hint) {
+        constexpr uint64_t MIN_TABLE = 1024;
+        uint64_t size = MIN_TABLE;
+        while (size < hint / static_cast<uint64_t>(n_bands)) size <<= 1;
+        return size;
+    };
+    const uint64_t base0 = share(base_hint), soft0 = share(soft_hint);
+    std::vector<GrowTable> tb(n_bands), ts(n_bands);
+
+    if (n_bands == 1) {
+        tb[0].reset(&store[0], base0);
+        ts[0].reset(&store[1], soft0);
         scan_band_unpadded_dual<T, Wrap>(
             lbl, shape, strides.data(), nb_flat.data(),
             nb_dc.data(), n_base, n_nbs, n_delta_near, 0, n_lines,
-            base_hts, soft_hts, base_mask, soft_mask, radius);
+            tb[0], ts[0], radius);
     } else {
         std::atomic<int> next{0};
-        const int64_t per = (n_lines + n_threads - 1) / n_threads;
+        const int64_t per = (n_lines + n_bands - 1) / n_bands;
         pool.parallel([&]() {
             int t;
-            while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_threads) {
-                uint64_t* hb = base_hts + (size_t)t * base_ht_size;
-                uint64_t* hs = soft_hts + (size_t)t * soft_ht_size;
-                std::fill_n(hb, base_ht_size, HT_EMPTY);
-                std::fill_n(hs, soft_ht_size, HT_EMPTY);
+            while ((t = next.fetch_add(1, std::memory_order_relaxed)) < n_bands) {
+                tb[t].reset(&store[2 * t], base0);
+                ts[t].reset(&store[2 * t + 1], soft0);
                 const int64_t line0 = (int64_t)t * per;
                 const int64_t line1 = std::min(line0 + per, n_lines);
                 if (line0 < line1) {
                     scan_band_unpadded_dual<T, Wrap>(
                         lbl, shape, strides.data(), nb_flat.data(),
                         nb_dc.data(), n_base, n_nbs, n_delta_near, line0, line1,
-                        hb, hs, base_mask, soft_mask, radius);
+                        tb[t], ts[t], radius);
                 }
             }
         });
-        // Tree-merge each HT family separately.
+        // Tree-merge each table family separately. A merge reads only
+        // the source table, which is sized to its own band's keys.
         int stride = 1;
-        while (stride < n_threads) {
-            const int n_pairs = (n_threads + 2 * stride - 1) / (2 * stride);
+        while (stride < n_bands) {
+            const int n_pairs = (n_bands + 2 * stride - 1) / (2 * stride);
             std::atomic<int> nx{0};
             pool.parallel([&]() {
                 int p;
                 while ((p = nx.fetch_add(1, std::memory_order_relaxed)) < n_pairs) {
                     const int dst = p * 2 * stride;
                     const int src = dst + stride;
-                    if (src >= n_threads) continue;
-                    ht_merge(base_hts + (size_t)src * base_ht_size,
-                              base_hts + (size_t)dst * base_ht_size, base_ht_size);
-                    ht_merge(soft_hts + (size_t)src * soft_ht_size,
-                              soft_hts + (size_t)dst * soft_ht_size, soft_ht_size);
+                    if (src >= n_bands) continue;
+                    grow_table_merge(tb[src], tb[dst]);
+                    grow_table_merge(ts[src], ts[dst]);
                 }
             });
             stride *= 2;
         }
     }
-    out_base.reserve(64);
-    for (uint64_t h = 0; h < base_ht_size; ++h) {
-        const uint64_t key = base_hts[h];
+    const GrowTable& root_b = tb[0];
+    const GrowTable& root_s = ts[0];
+    out_base.reserve(root_b.occ);
+    for (uint64_t h = 0; h <= root_b.mask; ++h) {
+        const uint64_t key = root_b.h[h];
         if (key == HT_EMPTY) continue;
         out_base.emplace_back((int32_t)(key >> 32),
                                (int32_t)(key & 0xFFFFFFFFull));
     }
-    out_soft.reserve(64);
-    uint64_t soft_occupancy = 0;
-    for (uint64_t h = 0; h < soft_ht_size; ++h) {
-        const uint64_t key = soft_hts[h];
+    out_soft.reserve(root_s.occ);
+    for (uint64_t h = 0; h <= root_s.mask; ++h) {
+        const uint64_t key = root_s.h[h];
         if (key == HT_EMPTY) continue;
-        ++soft_occupancy;
         // A soft pair that is also a hard pair can never be violated; it
         // only distorts the soft weights. Dropping it also makes the soft
         // set independent of the interior skip above, which may or may
         // not have seen such a pair through a far offset.
-        const uint64_t hb = ht_probe(base_hts, base_mask, key);
-        if (hb <= base_mask && base_hts[hb] == key) continue;
+        const uint64_t hb = ht_probe(root_b.h, root_b.mask, key);
+        if (hb <= root_b.mask && root_b.h[hb] == key) continue;
         out_soft.emplace_back((int32_t)(key >> 32),
                                (int32_t)(key & 0xFFFFFFFFull));
     }
-    // A completely full private table can drop later unseen keys. If any
-    // private table filled, its complete key set also fills the fixed-size
-    // root during the union merge, so root occupancy detects both scan-time
-    // and merge-time overflow. Report each family independently; the caller
-    // doubles only the table(s) that filled and reruns the fused scan.
-    int full_mask = 0;
-    if (out_base.size() == base_ht_size) full_mask |= 1;
-    if (soft_occupancy == soft_ht_size) full_mask |= 2;
-    return full_mask;
 }
 
-// Public entry — wraps Wrap dispatch.
+// Public entry: wraps the Wrap dispatch. The hints are expected table
+// sizes for the whole image; see find_pairs_dual_unpadded_impl.
 template <typename T>
-inline int find_pairs_dual_nd_unpadded(
+inline void find_pairs_dual_nd_unpadded(
         const T* lbl, const std::vector<int64_t>& shape,
         int base_conn, int base_radius, int soft_conn, int soft_radius,
-        uint64_t base_ht_size, uint64_t soft_ht_size,
+        uint64_t base_hint, uint64_t soft_hint,
         int n_threads, ForkJoinPool& pool, bool wrap,
         std::vector<std::pair<int32_t, int32_t>>& out_base,
         std::vector<std::pair<int32_t, int32_t>>& out_soft,
-        std::vector<uint64_t>* base_ht_scratch = nullptr,
-        std::vector<uint64_t>* soft_ht_scratch = nullptr) {
+        std::vector<std::vector<uint64_t>>* scratch = nullptr) {
     out_base.clear();
     out_soft.clear();
     const int ndim = static_cast<int>(shape.size());
     validate_neighborhood_ndim(ndim);
-    if (base_conn < 1 || base_conn > ndim) return 0;
-    if (soft_conn < 1 || soft_conn > ndim) return 0;
+    if (base_conn < 1 || base_conn > ndim) return;
+    if (soft_conn < 1 || soft_conn > ndim) return;
     if (wrap) {
-        return find_pairs_dual_unpadded_impl<T, true>(
+        find_pairs_dual_unpadded_impl<T, true>(
             lbl, shape, base_conn, base_radius, soft_conn, soft_radius,
-            base_ht_size, soft_ht_size, n_threads, pool,
-            out_base, out_soft, base_ht_scratch, soft_ht_scratch);
+            base_hint, soft_hint, n_threads, pool,
+            out_base, out_soft, scratch);
     } else {
-        return find_pairs_dual_unpadded_impl<T, false>(
+        find_pairs_dual_unpadded_impl<T, false>(
             lbl, shape, base_conn, base_radius, soft_conn, soft_radius,
-            base_ht_size, soft_ht_size, n_threads, pool,
-            out_base, out_soft, base_ht_scratch, soft_ht_scratch);
+            base_hint, soft_hint, n_threads, pool,
+            out_base, out_soft, scratch);
     }
 }
 

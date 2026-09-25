@@ -592,6 +592,54 @@ static void check_pool_exception_recovery() {
     }
 }
 
+// The fused scan's per-thread tables start small and grow. Hints of 1
+// start every table at the floor, and a volume of 4096 distinct blocks
+// holds far more pairs than that, so tables must grow, including in the
+// middle of a line; the result must match a run whose tables never grow.
+static void check_growing_dual_tables(ForkJoinPool& pool) {
+    std::mt19937 rng(7);
+    for (const std::vector<int64_t>& shape : {std::vector<int64_t>{32, 32, 32},
+                                               std::vector<int64_t>{96, 80}}) {
+        int64_t total = 1;
+        for (int64_t e : shape) total *= e;
+        std::vector<int32_t> lbl(total);
+        std::vector<int32_t> ids(total);
+        for (int64_t i = 0; i < total; ++i) ids[i] = int32_t(i + 1);
+        std::shuffle(ids.begin(), ids.end(), rng);
+        for (int64_t i = 0; i < total; ++i) {
+            int64_t block = 0, rem = i, scale = 1;
+            for (int d = int(shape.size()) - 1; d >= 0; --d) {
+                block += (rem % shape[d]) / 2 * scale;
+                scale *= (shape[d] + 1) / 2;
+                rem /= shape[d];
+            }
+            lbl[i] = (rng() % 8 == 0) ? 0 : ids[block];
+        }
+        auto sorted = [](std::vector<std::pair<int32_t, int32_t>> v) {
+            std::sort(v.begin(), v.end());
+            return v;
+        };
+        for (bool wrap : {false, true}) {
+            std::vector<std::pair<int32_t, int32_t>> ref_b, ref_s;
+            find_pairs_dual_nd_unpadded<int32_t>(lbl.data(), shape, 1, 1, 2, 2,
+                uint64_t{1} << 22, uint64_t{1} << 22, 1, pool, wrap, ref_b, ref_s);
+            assert(ref_b.size() > 2048);
+            ref_b = sorted(ref_b);
+            ref_s = sorted(ref_s);
+            for (int threads : {1, 3, 8}) {
+                std::vector<std::vector<uint64_t>> scratch;
+                for (int repeat = 0; repeat < 2; ++repeat) {
+                    std::vector<std::pair<int32_t, int32_t>> b, s;
+                    find_pairs_dual_nd_unpadded<int32_t>(lbl.data(), shape, 1, 1, 2, 2,
+                        1, 1, threads, pool, wrap, b, s, &scratch);
+                    assert(sorted(b) == ref_b);
+                    assert(sorted(s) == ref_s);
+                }
+            }
+        }
+    }
+}
+
 int main() {
     check_byte_formatting();
     check_cast_sign_reduction<int32_t>();
@@ -616,6 +664,7 @@ int main() {
     check_l1_allocations();
     ForkJoinPool pool(2);
     check_wide_clean(pool);
+    check_growing_dual_tables(pool);
     check_weights<ReduceMode::Min>(pool);
     check_weights<ReduceMode::Max>(pool);
     check_weights<ReduceMode::Mean>(pool);
