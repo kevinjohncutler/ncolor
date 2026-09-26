@@ -19,11 +19,14 @@ def test_native_generalization(tmp_path):
     # The threadpool parks workers on WaitOnAddress. MSVC picks the import
     # library up from a pragma in the header; the GNU driver needs it named.
     libraries = ['-lsynchronization'] if os.name == 'nt' else []
+    # The compile takes about 15 s with GCC but ran past 120 s once on a
+    # slow Windows CI runner. Both limits together stay under the 300 s
+    # per-test timeout CI applies.
     build = subprocess.run(
         compiler + ['-std=c++17', '-O2', '-pthread', '-I', str(root / 'cpp'),
                     str(root / 'tests/native_generalization.cpp'), '-o', str(executable)]
         + libraries,
-        capture_output=True, text=True, timeout=120)
+        capture_output=True, text=True, timeout=240)
     assert build.returncode == 0, build.stdout + build.stderr
-    result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=60)
+    result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=50)
     assert result.returncode == 0, result.stdout + result.stderr
