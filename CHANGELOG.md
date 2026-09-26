@@ -74,7 +74,8 @@ BENCHMARKS.md for per-input times.
   fix for the JCC erratum runs any loop whose jump crosses such a
   boundary from the slow legacy decoder, so code layout alone could cost
   a kernel 20%. The skip above measured 0.79x on sparse 2D images on an
-  i9-9900K until aligned.
+  i9-9900K until aligned. Windows x86 builds get MSVC's equivalent,
+  `/QIntel-jcc-erratum`: 1.035x on an i7-7820HQ (Kaby Lake), nothing slower.
 - The color picker computes the exact clique number of the adjacency
   graph and starts at that many colors, since no smaller count can
   work. The bound used to be a dense N x N bit matrix, limited to 8000
