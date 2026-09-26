@@ -243,12 +243,64 @@ static void check_clique_bounds() {
         assert(clique_lower_bound(count, indptr.data(), indices.data()) ==
                (family == 0 ? count : 2));
     }
-    BKState state;
-    state.deadline_ns = 1;
-    state.visited_nodes = 256;
-    // Budget polling depends on visited nodes, not recursion depth.
-    state.bk(1, nullptr, 1);
-    assert(state.deadline_hit);
+    // Random graphs up to 14 vertices against subset enumeration, dense
+    // enough that neighborhoods overlap in many ways.
+    std::mt19937 rng(11);
+    for (int trial = 0; trial < 400; ++trial) {
+        const int count = 6 + trial % 9;
+        const unsigned density = 30 + trial % 50;
+        std::vector<std::vector<bool>> adjacent(count, std::vector<bool>(count));
+        for (int u = 0; u < count; ++u) for (int v = u + 1; v < count; ++v)
+            adjacent[u][v] = adjacent[v][u] = rng() % 100 < density;
+        std::vector<int32_t> indptr{0}, indices;
+        for (int u = 0; u < count; ++u) {
+            for (int v = 0; v < count; ++v) if (adjacent[u][v]) indices.push_back(v);
+            indptr.push_back(static_cast<int32_t>(indices.size()));
+        }
+        int exact = 0;
+        for (unsigned subset = 1; subset < (1u << count); ++subset) {
+            const int size = __builtin_popcount(subset);
+            if (size <= exact) continue;
+            bool clique = true;
+            for (int u = 0; u < count && clique; ++u) if ((subset >> u) & 1)
+                for (int v = u + 1; v < count; ++v)
+                    if (((subset >> v) & 1) && !adjacent[u][v]) { clique = false; break; }
+            if (clique) exact = size;
+        }
+        assert(clique_lower_bound(count, indptr.data(), indices.data()) == exact);
+        const int bounded = clique_lower_bound(count, indptr.data(), indices.data(), 3);
+        assert(bounded <= exact && bounded >= std::min(3, exact));
+        // Above the floor the answer stays exact; at or below it, any
+        // result must still be a real clique size.
+        for (int floor = 0; floor <= count; ++floor) {
+            const int floored = clique_lower_bound(count, indptr.data(), indices.data(), 0, 0, floor);
+            assert(floored <= exact);
+            if (exact > floor) assert(floored == exact);
+        }
+    }
+    // A sparse graph far larger than an N x N matrix allows: a ring
+    // lattice (clique number 3) with a 7-clique planted at the end.
+    {
+        constexpr int32_t count = 30000;
+        std::vector<std::vector<int32_t>> nbrs(count);
+        auto link = [&](int32_t a, int32_t b) { nbrs[a].push_back(b); nbrs[b].push_back(a); };
+        for (int32_t u = 0; u < count; ++u) {
+            link(u, (u + 1) % count);
+            link(u, (u + 2) % count);
+        }
+        for (int32_t a = count - 7; a < count; ++a)
+            for (int32_t b = a + 3; b < count; ++b) link(a, b);
+        std::vector<int32_t> indptr{0}, indices;
+        for (auto& row : nbrs) {
+            indices.insert(indices.end(), row.begin(), row.end());
+            indptr.push_back(static_cast<int32_t>(indices.size()));
+        }
+        assert(clique_lower_bound(count, indptr.data(), indices.data()) == 7);
+        assert(clique_lower_bound(count, indptr.data(), indices.data(), 5) >= 5);
+        assert(clique_lower_bound(count, indptr.data(), indices.data(), 0, 1) == 1);
+        assert(clique_lower_bound(count, indptr.data(), indices.data(), 0, 0, 4) == 7);
+        assert(clique_lower_bound(count, indptr.data(), indices.data(), 0, 0, 7) <= 7);
+    }
 }
 
 static void check_compact_palette_equivalence() {

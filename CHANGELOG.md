@@ -75,6 +75,19 @@ BENCHMARKS.md for per-input times.
   boundary from the slow legacy decoder, so code layout alone could cost
   a kernel 20%. The skip above measured 0.79x on sparse 2D images on an
   i9-9900K until aligned.
+- The color picker computes the exact clique number of the adjacency
+  graph and starts at that many colors, since no smaller count can
+  work. The bound used to be a dense N x N bit matrix, limited to 8000
+  cells and stopped at one more than the requested count, so larger
+  graphs failed a full attempt at every count below it: about 80 ms at
+  4 colors for 20,000 cells packed like tissue in 3D, whose clique
+  number is 6. The search now works one small neighborhood at a time,
+  has no size limit, and skips graphs with no clique larger than the
+  requested count almost for free. `label` is 1.08x to 1.14x faster on
+  a 192 x 192 x 192 volume of 10,900 cells and 1.08x to 1.11x on
+  filaments. The number of colors is unchanged on every input measured;
+  3 of 22 benchmark images now receive a different, equally valid
+  coloring because the successful attempt runs with a different seed.
 - Soft-constraint search remembers Kempe chains it has already rejected
   until a color changes, since every member of a chain reaches the same
   chain. Output is unchanged, and the search is 1.2x to 1.7x faster on

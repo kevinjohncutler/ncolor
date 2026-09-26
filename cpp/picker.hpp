@@ -143,52 +143,31 @@ inline int pick_coloring(int32_t N, int32_t M, int n_colors,
     int cur_n = n_colors;
     bool ok = false;
     static const bool dbg_solve = std::getenv("NCOLOR_SOLVE_DEBUG") != nullptr;
-    // ω(G) lower bound: χ(G) ≥ ω(G). If a clique larger than the
-    // user's target k exists, the graph requires ≥ ω colors and
-    // we'd otherwise burn ~200 ms per (race+tabu-restart+
-    // bb_dsatur+HEA) round each time we increment cur_n on the
-    // way up to ω. Bron-Kerbosch with a tight deadline (10 ms)
-    // returns a valid lower bound even on partial searches —
-    // worst case: no time saved when ω ≤ n_colors (the common
-    // case). Skipped for N > 20000 (memory) and for the weighted
-    // path (perceptual objective is orthogonal to clique
+    // ω(G) lower bound: χ(G) ≥ ω(G), so every count below the clique
+    // number is doomed, and each doomed count costs a full race (plus
+    // a tabu restart at the first depth) before the picker moves on:
+    // about 80 ms at 4 colors for 20000 cells packed like tissue in 3D,
+    // whose clique number is 6. The search runs on one small
+    // neighborhood at a time (see clique_lb.hpp) and looks only for
+    // cliques larger than cur_n, so it is exact where that matters,
+    // nearly free on graphs that have none, and has no size limit. The
+    // deadline only guards against pathological graphs; any clique
+    // found by then is still a valid bound. Skipped for the weighted
+    // path (the perceptual objective is orthogonal to clique
     // structure).
     const bool wobj_active_for_clique = weight_obj != 0 && edge_weights != nullptr;
-    // Clique-lower-bound: detect K_{k+1} (or larger) in the graph
-    // to skip doomed cur_n=k attempts. For typical cell-adjacency
-    // graphs ω = target (no K_5), so CLB returns "no adjustment"
-    // — pure overhead. But on dense or higher-connectivity inputs
-    // (conn=2, connect_radius=2) K_5 is common and CLB saves the
-    // ~200 ms the picker would otherwise burn at cur_n=n_colors.
-    //
-    // Two regimes:
-    //   • N ≤ 1500: 2 ms deadline, classic behavior. CLB rarely
-    //     fires but is cheap when it does.
-    //   • N > 1500: 5 ms deadline, max_N up to 8000. Bron-Kerbosch
-    //     on dense graphs >8k vertices has a memory/time profile
-    //     that loses to slot-race failure detection. Below 8k,
-    //     the early-out at target+1 finds K_5 in <2 ms on real
-    //     cell-adjacency graphs (verified mm 2k² L1 r=2: ~1 ms
-    //     to detect K_5, vs the 200 ms the picker otherwise burns
-    //     on n=4 attempts before bumping).
-    static constexpr int32_t CLB_TIGHT_N = 1500;
-    static constexpr int32_t CLB_MAX_N   = 8000;
-    if (!wobj_active_for_clique && N >= 5 && N <= CLB_MAX_N) {
+    if (!wobj_active_for_clique && N >= 5) {
         const auto clb_t0 = std::chrono::steady_clock::now();
-        const int64_t budget_ns = (N <= CLB_TIGHT_N)
-            ? (2LL * 1000LL * 1000LL)
-            : (5LL * 1000LL * 1000LL);
-        const int64_t clb_deadline_ns =
-            steady_time_ns(clb_t0) + budget_ns;
+        constexpr int64_t CLB_BUDGET_NS = 5LL * 1000LL * 1000LL;
         const int omega = ncolor_cpp::clique_lower_bound(
             N, indptr_.data(), indices_.data(),
-            /*target=*/n_colors + 1, clb_deadline_ns);
+            /*target=*/0, steady_time_ns(clb_t0) + CLB_BUDGET_NS,
+            /*floor=*/cur_n);
         if (dbg_solve) {
             const double clb_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - clb_t0).count();
             std::fprintf(stderr,
-                "[clique-lb] N=%d ω≥%d (target=%d) %.1fms\n",
-                N, omega, n_colors + 1, clb_ms);
+                "[clique-lb] N=%d ω≥%d %.1fms\n", N, omega, clb_ms);
         }
         if (omega > cur_n) cur_n = std::min(omega, 255);  // χ ≥ ω, so skip doomed cur_n values
     }

@@ -1,22 +1,31 @@
-// Clique-number lower bound via Bron-Kerbosch with pivoting and a
-// wall-clock deadline.
+// Clique-number lower bound for sparse graphs, with a wall-clock deadline.
 //
-// χ(G) ≥ ω(G) (chromatic ≥ clique number). When ω is high we can skip
-// directly to cur_n = max(user_n_colors, ω) instead of bumping by 1
-// at each depth iteration. For 2D conn=2 segmentations ω is usually
-// 4-5; for 3D ω can be 5-8+ depending on packing.
+// χ(G) ≥ ω(G) (chromatic ≥ clique number), so the picker can start at
+// max(n_colors, ω) instead of failing its way up one count at a time.
+// For 2D conn=2 segmentations ω is usually 4-5; for cells packed like
+// tissue in 3D it is about 6.
 //
-// Partial searches are still useful: any clique found is a valid
-// lower bound on ω. The deadline lets us early-terminate without
-// completing the search. Returns the LARGEST clique discovered so far.
+// Every clique is found at its lowest-numbered vertex, among that
+// vertex's higher-numbered neighbors, and a cell graph has only a few
+// of those per vertex (about 7 for cells packed like tissue in 3D). So
+// the search runs on one small neighborhood at a time, as bit masks,
+// and never builds anything of size N². The earlier version kept an
+// N x N bit matrix (50 MB at 20000 vertices), which limited it to
+// graphs of at most 8000 vertices, fewer than the cells in a 256^3
+// volume, and those graphs paid for the full failed attempts at every
+// count below ω.
 //
-// Bit-packed adjacency for O(N²/64) memory; gate by N to avoid blowing
-// memory on huge graphs.
+// Partial searches are still useful: any clique found is a valid lower
+// bound. Returns the largest clique found before the deadline or, when
+// ``target`` > 0, as soon as one of at least that size is found. Only
+// cliques larger than ``floor`` are searched for, since a caller that
+// will try ``floor`` colors anyway learns nothing from smaller ones; on
+// a graph whose clique number is at most ``floor``, most neighborhoods
+// are then too small to need a search at all.
 
 #pragma once
 
 #include <algorithm>
-#include <chrono>
 #include <cstdint>
 #include <vector>
 
@@ -26,191 +35,146 @@
 
 namespace ncolor_cpp {
 
-// Bit-set helpers over a vector<uint64_t> view of length words.
-namespace bk_detail {
+namespace clique_detail {
 
-inline int popcount_bits(const uint64_t* a, int words) {
+inline int popcount_words(const uint64_t* a, int words) {
     int c = 0;
     for (int i = 0; i < words; ++i) c += popcount_u64(a[i]);
     return c;
 }
 
-inline void bit_set(uint64_t* a, int i) {
-    a[i >> 6] |= (1ULL << (i & 63));
-}
-
-inline void bit_clear(uint64_t* a, int i) {
-    a[i >> 6] &= ~(1ULL << (i & 63));
-}
-
-// dst = a AND b
-inline void bit_and(uint64_t* dst, const uint64_t* a, const uint64_t* b, int words) {
-    for (int i = 0; i < words; ++i) dst[i] = a[i] & b[i];
-}
-
-// dst = a AND NOT b
-inline void bit_andn(uint64_t* dst, const uint64_t* a, const uint64_t* b, int words) {
-    for (int i = 0; i < words; ++i) dst[i] = a[i] & ~b[i];
-}
-
-// Iterate set bits of `a` via ctz_u64 on each word.
-// Calls fn(int bit) for each set bit; fn may return true to abort.
-template <typename F>
-inline void for_each_bit(const uint64_t* a, int words, F&& fn) {
-    for (int wi = 0; wi < words; ++wi) {
-        uint64_t w = a[wi];
-        while (w) {
-            const int b = ctz_u64(w);
-            w &= w - 1;
-            if (fn(wi * 64 + b)) return;
-        }
-    }
-}
-
-}  // namespace bk_detail
-
-// Bron-Kerbosch state holder. Reused across recursive calls via a
-// pre-allocated scratch buffer of (depth × words_per_row) uint64s.
-struct BKState {
-    int words;                            // words_per_row = (N + 63) / 64
-    const uint64_t* adj;                  // N rows × words uint64
-    int best_clique = 0;                  // largest clique found so far
-    int64_t deadline_ns = 0;              // 0 = no wall cap
+// Branch and bound for the largest clique of one small graph, stored as
+// ``d`` rows of ``words`` 64-bit masks. Candidate sets live in a stack
+// of rows, one per depth, so the recursion allocates nothing.
+struct LocalSearch {
+    int words = 1;
+    const uint64_t* adj = nullptr;  // d rows x words
+    int best = 1;
+    int floor = 0;   // cliques of this size or smaller are not sought
+    int target = 0;
+    int64_t deadline_ns = 0;
     bool deadline_hit = false;
-    int target = 0;                       // if best_clique >= target, stop
+    uint64_t nodes = 0;
+    std::vector<uint64_t> cand;     // candidates at each depth
+    std::vector<uint64_t> todo;     // branch set at each depth
 
-    // Scratch buffers: depth × words. Avoid reallocation in recursion.
-    std::vector<uint64_t> scratch;        // size = N * words (max depth N)
-    uint64_t visited_nodes = 0;
-
-    bool past_deadline() {
-        if (deadline_ns == 0) return false;
-        const auto now = steady_time_ns();
-        return now > deadline_ns;
+    bool stop() {
+        if (deadline_hit || (target > 0 && best >= target)) return true;
+        // Poll the clock on the first node and every 256 after.
+        if ((nodes++ & 0xff) == 0 && deadline_ns != 0 &&
+            steady_time_ns() > deadline_ns) {
+            deadline_hit = true;
+            return true;
+        }
+        return false;
     }
 
-    void bk(int R_size, uint64_t* P, int depth) {
-        if (deadline_hit) return;
-        if (best_clique >= target && target > 0) return;
-        // Check the first entry, then every 256 search nodes, even in
-        // shallow searches that never reach depth 256.
-        if ((visited_nodes++ & 0xff) == 0 && past_deadline()) {
-            deadline_hit = true;
+    // Extend a clique of ``r`` vertices by the candidates at ``depth``.
+    void expand(int r, int depth) {
+        if (stop()) return;
+        uint64_t* P = &cand[static_cast<size_t>(depth) * words];
+        const int count = popcount_words(P, words);
+        if (count == 0) {
+            best = std::max(best, r);
             return;
         }
-
-        // Update best with current R if P is empty.
-        const int Pcount = bk_detail::popcount_bits(P, words);
-        if (Pcount == 0) {
-            if (R_size > best_clique) {
-                best_clique = R_size;
+        if (r + count <= std::max(best, floor)) return;
+        // Pivot on the candidate with the most candidate neighbors, so
+        // only vertices outside its neighborhood need a branch.
+        int pivot = -1, pivot_deg = -1;
+        for (int w = 0; w < words; ++w) {
+            for (uint64_t m = P[w]; m; m &= m - 1) {
+                const int u = w * 64 + ctz_u64(m);
+                const uint64_t* row = adj + static_cast<size_t>(u) * words;
+                int deg = 0;
+                for (int k = 0; k < words; ++k) deg += popcount_u64(P[k] & row[k]);
+                if (deg > pivot_deg) { pivot_deg = deg; pivot = u; }
             }
-            return;
         }
-        // Prune: if R_size + Pcount <= best_clique, can't extend.
-        if (R_size + Pcount <= best_clique) return;
-
-        // Pivot: first vertex of P. Only candidate partitioning is needed
-        // for a size bound, so no excluded-vertex set is maintained. The "most
-        // neighbors in P" pivot would be a tighter bound but the loop
-        // to find it costs more than it saves on our sparse graphs.
-        int pivot = -1;
-        bk_detail::for_each_bit(P, words, [&](int v) {
-            pivot = v;
-            return true;
-        });
-
-        // candidates = P \ N(pivot). Recurse on each candidate v:
-        //   bk(R union {v}, P intersect N(v))
-        // Keep the candidate bitset in scratch at this depth.
-        uint64_t* cand = &scratch[(size_t)depth * words];
-        if (pivot >= 0) {
-            bk_detail::bit_andn(cand, P, adj + (size_t)pivot * words, words);
-        } else {
-            std::copy(P, P + words, cand);
+        uint64_t* T = &todo[static_cast<size_t>(depth) * words];
+        const uint64_t* prow = adj + static_cast<size_t>(pivot) * words;
+        for (int k = 0; k < words; ++k) T[k] = P[k] & ~prow[k];
+        uint64_t* next = &cand[static_cast<size_t>(depth + 1) * words];
+        for (int w = 0; w < words; ++w) {
+            while (T[w]) {
+                const int b = ctz_u64(T[w]);
+                T[w] &= T[w] - 1;
+                const int v = w * 64 + b;
+                const uint64_t* vrow = adj + static_cast<size_t>(v) * words;
+                for (int k = 0; k < words; ++k) next[k] = P[k] & vrow[k];
+                expand(r + 1, depth + 1);
+                if (deadline_hit || (target > 0 && best >= target)) return;
+                P[w] &= ~(uint64_t{1} << b);
+                if (r + popcount_words(P, words) <= std::max(best, floor)) return;
+            }
         }
-
-        // For each v in cand, recurse.
-        bk_detail::for_each_bit(cand, words, [&](int v) -> bool {
-            if (deadline_hit) return true;
-            // P_new = P ∩ adj(v)
-            std::vector<uint64_t> P_new(words);
-            bk_detail::bit_and(P_new.data(), P, adj + (size_t)v * words, words);
-            bk(R_size + 1, P_new.data(), depth + 1);
-            // Remove v from P for siblings.
-            bk_detail::bit_clear(P, v);
-            return false;
-        });
     }
 };
 
-// Compute a lower bound on the clique number ω(G).
-//
-// Returns the size of the largest clique found within deadline_ns.
-// If `target > 0`, abort early once a clique of size `target` is found
-// (useful when you only need to know "is ω >= k").
-//
-// `max_N`: skip if N exceeds this (returns 1, a trivial lower bound).
-// The adjacency bit-matrix is N²/64 bits; 3 MB at N=5128, 50 MB at
-// N=20000.
+}  // namespace clique_detail
+
+// Compute a lower bound on the clique number ω(G) of an undirected graph
+// in CSR form. Exact unless the deadline passes first. Entries out of
+// range, self loops and repeated entries are ignored.
 inline int clique_lower_bound(
     int32_t N,
     const int32_t* indptr,
     const int32_t* indices,
     int target = 0,
     int64_t deadline_ns = 0,
-    int32_t max_N = 20000)
+    int floor = 0)
 {
     if (N < 1) return 0;
     if (N == 1) return 1;
-    if (N > max_N) return 1;  // trivial bound; skip to avoid memory blow-up
+    if (deadline_ns != 0 && steady_time_ns() > deadline_ns) return 1;
 
-    const int words = (N + 63) / 64;
-    std::vector<uint64_t> adj((size_t)N * (size_t)words, 0);
-    for (int32_t u = 0; u < N; ++u) {
-        uint64_t* row = adj.data() + (size_t)u * (size_t)words;
-        const int32_t end = indptr[u + 1];
-        for (int32_t k = indptr[u]; k < end; ++k) {
-            const int32_t v = indices[k];
-            if (v >= 0 && v < N) bk_detail::bit_set(row, v);
-        }
-    }
-
-    BKState s;
-    s.words = words;
-    s.adj = adj.data();
-    s.deadline_ns = deadline_ns;
+    clique_detail::LocalSearch s;
     s.target = target;
-    s.best_clique = 1;  // singleton vertices are trivially clique-1
-    s.scratch.assign((size_t)N * (size_t)words, 0);
-
-    // Descending-degree vertex order: find big cliques early so the
-    // size prune kicks in sooner.
-    std::vector<int> order(N);
-    for (int i = 0; i < N; ++i) order[i] = i;
-    std::sort(order.begin(), order.end(), [&](int a, int b) {
-        return (indptr[a + 1] - indptr[a]) > (indptr[b + 1] - indptr[b]);
-    });
-
-    std::vector<uint64_t> P_root(words, 0);
-    for (int i = 0; i < N; ++i) bk_detail::bit_set(P_root.data(), i);
-
-    // Process each vertex as a singleton {v} with restricted candidates.
-    for (int v : order) {
-        if (s.deadline_hit) break;
-        if (s.target > 0 && s.best_clique >= s.target) break;
-
-        // P_v = P intersect adj(v)
-        std::vector<uint64_t> P_v(words);
-        bk_detail::bit_and(P_v.data(), P_root.data(), adj.data() + (size_t)v * words, words);
-
-        s.bk(1, P_v.data(), 1);
-
-        // Remove v from P for subsequent iterations.
-        bk_detail::bit_clear(P_root.data(), v);
+    s.floor = floor;
+    s.deadline_ns = deadline_ns;
+    std::vector<int32_t> slot(N, -1);   // local index of a higher neighbor
+    std::vector<int32_t> higher;
+    std::vector<uint64_t> adj;
+    for (int32_t v = 0; v < N; ++v) {
+        if (s.deadline_hit || (target > 0 && s.best >= target)) break;
+        // A neighborhood too small to hold a clique larger than the one
+        // already known (or the floor) needs no search. Counting first,
+        // repeats included, keeps that check free of any bookkeeping.
+        const int threshold = std::max(s.best, floor);
+        int32_t upper = 0;
+        for (int32_t k = indptr[v]; k < indptr[v + 1]; ++k) upper += indices[k] > v;
+        if (upper + 1 <= threshold) continue;
+        higher.clear();
+        for (int32_t k = indptr[v]; k < indptr[v + 1]; ++k) {
+            const int32_t u = indices[k];
+            if (u <= v || u >= N || slot[u] >= 0) continue;
+            slot[u] = static_cast<int32_t>(higher.size());
+            higher.push_back(u);
+        }
+        const int d = static_cast<int>(higher.size());
+        if (d + 1 > threshold) {
+            const int words = (d + 63) / 64;
+            adj.assign(static_cast<size_t>(d) * words, 0);
+            for (int a = 0; a < d; ++a) {
+                const int32_t u = higher[a];
+                uint64_t* row = adj.data() + static_cast<size_t>(a) * words;
+                for (int32_t k = indptr[u]; k < indptr[u + 1]; ++k) {
+                    const int32_t w = indices[k];
+                    if (w < 0 || w >= N || w == u) continue;
+                    const int32_t b = slot[w];
+                    if (b >= 0) row[b >> 6] |= uint64_t{1} << (b & 63);
+                }
+            }
+            s.words = words;
+            s.adj = adj.data();
+            s.cand.assign(static_cast<size_t>(d + 2) * words, 0);
+            s.todo.assign(static_cast<size_t>(d + 2) * words, 0);
+            for (int b = 0; b < d; ++b) s.cand[b >> 6] |= uint64_t{1} << (b & 63);
+            s.expand(1, 0);
+        }
+        for (int32_t u : higher) slot[u] = -1;
     }
-
-    return s.best_clique;
+    return s.best;
 }
 
 }  // namespace ncolor_cpp
