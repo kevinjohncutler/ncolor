@@ -18,6 +18,7 @@ IMAGES = {
     "labels_1024x1024": "sparse boxes, 1024 x 1024, 131 labels",
     "labels_2048x2048": "sparse boxes, 2048 x 2048, 523 labels",
     "labels_96x96x96": "boxes, 96 x 96 x 96, 50 labels",
+    "labels_dense_128x128x128": "packed cells, 128 x 128 x 128, 2694 labels",
 }
 MASKS = {
     "mask_1024x1024": "1024 x 1024",

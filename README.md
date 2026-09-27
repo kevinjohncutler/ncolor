@@ -34,10 +34,10 @@ Threading needs nothing special. A lone call uses every core; calls that overlap
 import concurrent.futures as cf, ncolor
 
 with cf.ThreadPoolExecutor(4) as pool:
-    colored = list(pool.map(ncolor.label, images))   # 1.4-3.5x faster than taking turns
+    colored = list(pool.map(ncolor.label, images))   # 1.4-3.1x faster than taking turns
 ```
 
-Nothing is calibrated or configured for this. With four threads labeling images from 512 by 512 to 4096 by 4096, overlapping calls ran 1.4x to 3.5x faster than taking turns on an Apple M5 Max and an AMD Ryzen 9 7950X ([benchmarks](BENCHMARKS.md)). `NCOLOR_MAX_ENGINES=1` turns it off and calls take turns on one pool as they always have. Engines are built only when calls actually overlap, so a single-threaded program holds one, and once the parallel phase is over calls go back to full width. At most `NCOLOR_MAX_ENGINES` (4) are created; each keeps the working set of the largest image it has seen, roughly 20 bytes per pixel. `ncolor.Engine` does the same by hand for callers who would rather size the threads themselves.
+Nothing is calibrated or configured for this. With four threads labeling images from 512 by 512 to 4096 by 4096, overlapping calls ran 1.4x to 3.1x faster than taking turns on an Apple M5 Max and an AMD Ryzen 9 7950X ([benchmarks](BENCHMARKS.md)). `NCOLOR_MAX_ENGINES=1` turns it off and calls take turns on one pool as they always have. Engines are built only when calls actually overlap, so a single-threaded program holds one, and once the parallel phase is over calls go back to full width. At most `NCOLOR_MAX_ENGINES` (4) are created; each keeps the working set of the largest image it has seen, roughly 20 bytes per pixel. `ncolor.Engine` does the same by hand for callers who would rather size the threads themselves.
 
 Any integer, bool or float label array is accepted; the cast to the engine's int32 runs in parallel inside the call. Labels beyond the int32 range are compacted automatically by `label` and `format_labels`. The engine keeps the scratch memory of the largest image it has processed until `release_buffers()` is called.
 
@@ -101,19 +101,19 @@ colors = ncolor.color_graph(edges, n_vertices=len(nodes))   # 0-indexed pairs
 
 ## New in v2
 
-v2 is a complete C++ rewrite. With matched settings, `label` runs 6.3x to 24.1x faster than 1.5.3 on 4 workers and 2.65x to 7.4x faster on one. These are ranges over five test images on an Apple M5 Max and an AMD Ryzen 9 7950X; see [BENCHMARKS.md](BENCHMARKS.md) for per-image times, methods, and how to reproduce them. The new default expand removes 1-pixel bridges and spurs before the picker sees them, and an auto-soft constraint refines the hard 4-coloring via local search to differentiate near-adjacent cells. Together these break the K₅-shaped convergence clusters that forced the v1 numba pipeline up to `N = 5`. See [CHANGELOG.md](CHANGELOG.md) for the full list of changes and the migration table from v1.
+v2 is a complete C++ rewrite. With matched settings, `label` runs 6.3x to 25.3x faster than 1.5.3 on 4 workers and 2.7x to 7.3x faster on one across 2D images and sparse 3D boxes, and 63x faster on 4 workers (18x on one) on a 128 x 128 x 128 volume of cells packed like tissue. These are measured on six test images on an Apple M5 Max and an AMD Ryzen 9 7950X; see [BENCHMARKS.md](BENCHMARKS.md) for per-image times, methods, and how to reproduce them. The new default expand removes 1-pixel bridges and spurs before the picker sees them, and an auto-soft constraint refines the hard 4-coloring via local search to differentiate near-adjacent cells. Together these break the K₅-shaped convergence clusters that forced the v1 numba pipeline up to `N = 5`. See [CHANGELOG.md](CHANGELOG.md) for the full list of changes and the migration table from v1.
 
 The rewrite also brings drop-in C++ replacements for the image-analysis and distance-transform calls the old pipeline relied on, with no extra install:
 
 | ncolor | replaces | speed, 1 worker | speed, 4 workers |
 |---|---|---|---|
-| `ncolor.connected_components` | `skimage.measure.label` | 0.38x to 2.4x | 0.92x to 6.4x |
-| `ncolor.regionprops` | `skimage.measure.regionprops_table` (area, bbox, centroid) | 1.95x to 27.8x | 4.7x to 27.8x |
-| `ncolor.expand_labels` | `scipy.ndimage.distance_transform_edt` nearest-label fill | 2.6x to 7.1x | 6.6x to 24.2x |
-| `ncolor.expand_labels` | `skimage.segmentation.expand_labels` | 3.4x to 8.3x | 10.0x to 27.9x |
+| `ncolor.connected_components` | `skimage.measure.label` | 0.39x to 2.4x | 0.96x to 6.5x |
+| `ncolor.regionprops` | `skimage.measure.regionprops_table` (area, bbox, centroid) | 1.9x to 27.8x | 5.4x to 34.5x |
+| `ncolor.expand_labels` | `scipy.ndimage.distance_transform_edt` nearest-label fill | 2.6x to 7.6x | 6.5x to 25.8x |
+| `ncolor.expand_labels` | `skimage.segmentation.expand_labels` | 3.5x to 8.5x | 9.9x to 29.2x |
 | `ncolor.delete_spurs` | hand-rolled morphology, not in scikit-image | not compared | not compared |
 
-Speeds are ranges over the benchmark inputs on both machines, measured against SciPy 1.18.1 and scikit-image 0.26.0, which run these operations on one thread. `expand_labels` also supports L1 expansion in any dimension. scikit-image's `measure.label` is faster on some dense masks: down to 0.38x on one thread on a 70% filled 3D volume at full connectivity, and 0.92x with four workers on the same volume.
+Speeds are ranges over the benchmark inputs on both machines, measured against SciPy 1.18.1 and scikit-image 0.26.0, which run these operations on one thread. `expand_labels` also supports L1 expansion in any dimension. scikit-image's `measure.label` is faster on some dense masks: down to 0.39x on one thread on a 70% filled 3D volume at full connectivity, and 0.96x with four workers on the same volume.
 
 All of these run on the engine's workers, and `Engine(n_threads=...)` sets the budget per call. Results never depend on the worker count.
 

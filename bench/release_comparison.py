@@ -66,6 +66,23 @@ def corpus(output):
     for shape in [(1024, 1024), (2048, 2048), (96, 96, 96), (2, 513, 517)]:
         for density in (.1, .7):
             arrays['mask_' + 'x'.join(map(str, shape)) + f'_{density}'] = rng.random(shape) < density
+    # Cells packed like tissue in 3D, about 14 neighbors each, separated by
+    # one-voxel boundaries as a segmentation would leave them (version 1
+    # needs background to tell cells from it). Built last from its own
+    # generator, so the inputs above stay identical to earlier corpora.
+    from scipy import ndimage
+    dense_rng = np.random.default_rng(2700)
+    shape = (128, 128, 128)
+    seeds = np.zeros(shape, np.int32)
+    seeds[tuple(dense_rng.integers(0, 128, (3, 2700)))] = np.arange(1, 2701)
+    nearest = ndimage.distance_transform_edt(seeds == 0, return_distances=False, return_indices=True)
+    dense = seeds[tuple(nearest)]
+    boundary = np.zeros(shape, bool)
+    for axis in range(3):
+        boundary |= dense != np.roll(dense, 1, axis)
+    dense[boundary] = 0
+    values = np.unique(dense[dense != 0])
+    arrays['labels_dense_128x128x128'] = np.where(dense == 0, 0, np.searchsorted(values, dense) + 1).astype(np.int32)
     output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(output, **arrays)
     print(output.resolve(), flush=True)
