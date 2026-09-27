@@ -39,8 +39,9 @@ and versions follow [semantic versioning](https://semver.org/).
 
 ### Performance
 
-Measured against 2.2.0 on an Apple M5 Max and an AMD Ryzen 9 7950X; see
-BENCHMARKS.md for per-input times.
+The first entries were measured against 2.2.0 on 2026-09-17 on an Apple M5
+Max and an AMD Ryzen 9 7950X; the entries after them give their own
+measurements. BENCHMARKS.md compares the current code with 1.5.3.
 
 - `label` with default settings: 1.00x to 1.19x the speed of 2.2.0 on 4
   workers and 1.00x to 1.21x on one. The largest gains are on large,

@@ -65,11 +65,9 @@ def main(specs):
             for name, runs, _ in hosts:
                 s = runs[workers]
                 rows.append([text, name, f"{s[image + '/default']['median_ms']['current']:.2f}",
-                             cell(ratio(s, image + "/default", image + "/default", "2.2.0")),
                              f"{s[image + '/matched']['median_ms']['current']:.2f}",
-                             cell(ratio(s, image + "/matched", image + "/matched", "2.2.0")),
                              cell(ratio(s, image + "/matched", image + "/matched", "1.5.3"))])
-        print(table(["Image", "CPU", "Default ms", "vs 2.2.0", "Matched ms", "vs 2.2.0", "vs 1.5.3"], rows) + "\n")
+        print(table(["Image", "CPU", "Default ms", "Matched ms", "vs 1.5.3"], rows) + "\n")
     for workers in (4, 1):
         print(f"### expand_labels, {workers} worker{'s' if workers > 1 else ''}\n")
         rows = []
@@ -78,10 +76,10 @@ def main(specs):
                 s = runs[workers]
                 key = image + "/expand"
                 rows.append([text, name, f"{s[key]['median_ms']['current']:.2f}",
-                             cell(ratio(s, key, key, "2.2.0")),
+                             cell(ratio(s, key, key, "1.5.3")),
                              cell(ratio(s, key, image + "/scipy_feature", "external")),
                              cell(ratio(s, key, image + "/skimage_expand", "external"))])
-        print(table(["Image", "CPU", "ncolor ms", "vs 2.2.0", "vs SciPy EDT", "vs scikit-image"], rows) + "\n")
+        print(table(["Image", "CPU", "ncolor ms", "vs 1.5.3", "vs SciPy EDT", "vs scikit-image"], rows) + "\n")
     for workers in (4, 1):
         print(f"### regionprops, {workers} worker{'s' if workers > 1 else ''}\n")
         rows = []
@@ -90,10 +88,9 @@ def main(specs):
                 s = runs[workers]
                 key = image + "/properties"
                 rows.append([text, name, f"{s[key]['median_ms']['current']:.2f}",
-                             cell(ratio(s, key, key, "2.2.0")),
                              cell(ratio(s, key, key, "external")),
                              cell(ratio(s, key, image + "/properties_table", "external"))])
-        print(table(["Image", "CPU", "ncolor ms", "vs 2.2.0", "vs regionprops",
+        print(table(["Image", "CPU", "ncolor ms", "vs regionprops",
                      "vs regionprops_table"], rows) + "\n")
     print("### connected_components\n")
     rows = []
@@ -105,11 +102,11 @@ def main(specs):
             four, one = runs[4], runs[1]
             rows.append([MASKS[stem], f"{float(density):.0%}", conn, name,
                          f"{four[key]['median_ms']['current']:.2f}",
-                         cell(ratio(four, key, key, "2.2.0")), cell(ratio(four, key, key, "external")),
+                         cell(ratio(four, key, key, "external")),
                          f"{one[key]['median_ms']['current']:.2f}",
-                         cell(ratio(one, key, key, "2.2.0")), cell(ratio(one, key, key, "external"))])
-    print(table(["Mask", "Fill", "Conn", "CPU", "4 workers ms", "vs 2.2.0", "vs scikit-image",
-                 "1 worker ms", "vs 2.2.0", "vs scikit-image"], rows) + "\n")
+                         cell(ratio(one, key, key, "external"))])
+    print(table(["Mask", "Fill", "Conn", "CPU", "4 workers ms", "vs scikit-image",
+                 "1 worker ms", "vs scikit-image"], rows) + "\n")
     print("### Four concurrent callers\n")
     rows = []
     pattern = re.compile(r"(\d+)\s+engines\s+([\d.]+) ms\s+turns\s+([\d.]+) ms\s+speedup ([\d.]+)x")
